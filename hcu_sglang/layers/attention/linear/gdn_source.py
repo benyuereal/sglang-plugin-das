@@ -311,6 +311,17 @@ def _gdn_hip_kernel_enabled() -> bool:
         return False
 
 
+def _gdn_hip_bplus_enabled() -> bool:
+    if not _is_hcu:
+        return False
+    try:
+        from hcu_sglang.layers.attention.linear import gdn_bplus
+
+        return gdn_bplus.enabled()
+    except Exception:
+        return False
+
+
 def forward_extend(
     self,
     layer: RadixLinearAttention,
@@ -510,6 +521,42 @@ def forward_extend(
                 "recurrent target_verify fallback requires intermediate_ssm, "
                 "which is not allocated under --enable-linear-replayssm-spec"
             )
+            if _gdn_hip_bplus_enabled():
+                from hcu_sglang.layers.attention.linear import (
+                    gdn_bplus,
+                    gdn_hip_bplus,
+                )
+
+                n = batch_size
+                if gdn_bplus.stash(
+                    self, layer, query, key, value, a, b, draft_token_num
+                ):
+                    flat = intermediate_state_cache.reshape(
+                        -1, *intermediate_state_cache.shape[2:]
+                    )
+                    snap_idx = intermediate_state_indices[:n].to(torch.int32)
+                    self._gdn_hip_snap_idx = snap_idx
+                    hip_out = query.new_empty(
+                        (1, query.shape[1], value.shape[2], value.shape[3])
+                    )
+                    gdn_hip_bplus.verify(
+                        query,
+                        key,
+                        value,
+                        a,
+                        b,
+                        layer.A_log,
+                        layer.dt_bias,
+                        query_start_loc[: n + 1],
+                        ssm_states,
+                        cache_indices[:n].to(torch.int32),
+                        flat,
+                        snap_idx,
+                        int(intermediate_state_cache.shape[1]),
+                        int(draft_token_num),
+                        hip_out,
+                    )
+                    return hip_out
             if _gdn_hip_kernel_enabled():
                 from hcu_sglang.layers.attention.linear import gdn_hip_bplus
 

@@ -152,7 +152,7 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
 
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
-           snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step):
+           snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step=None):
     """verify：全跑完的那一份快照写到第 ``(prev_step+1) % cache_steps`` 行。
 
     不能写死第 ``draft_token_num - 1`` 行：全接受之后提交指针就是它，下一拍
@@ -169,9 +169,13 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
     # （slot*D+prev，最大 ~slot_cnt*D），拿它索引 prev_step 会越界读；
     # 而且 CUDA graph 里没有边界检查，越界就是 VMFault。上界也 clamp 一次，
     # 这条路径宁可读成 0 也绝不越界。
-    safe = snap_idx.to(torch.int64).clamp(0, int(prev_step.numel()) - 1)
-    prev = prev_step.index_select(0, safe).to(torch.int32)
-    store_row = torch.remainder(prev + 1, int(cache_steps)).to(torch.int32)
+    if prev_step is None:
+        # No state handoff: write the full-accept row (draft_token_num - 1).
+        store_row = store
+    else:
+        safe = snap_idx.to(torch.int64).clamp(0, int(prev_step.numel()) - 1)
+        prev = prev_step.index_select(0, safe).to(torch.int32)
+        store_row = torch.remainder(prev + 1, int(cache_steps)).to(torch.int32)
     _call("gdn_recurrent_update_bplus", q, k, v, a, b, A_log, dt_bias,
           cu_seqlens, ssm_states, cache_indices, o, snap_flat, snap_idx,
           cache_steps, store, store_row, n, draft_token_num, v.shape[-2],

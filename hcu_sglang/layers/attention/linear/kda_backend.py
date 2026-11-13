@@ -1821,6 +1821,16 @@ class _HybridMethods:
             )
             return
 
+        _linear = getattr(self, "linear_attn_backend", None)
+        if _linear is not None:
+            from hcu_sglang.layers.attention.linear import gdn_bplus
+
+            gdn_bplus.compensate_from_stash(
+                _linear,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_caches,
+            )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
