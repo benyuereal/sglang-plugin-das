@@ -128,6 +128,8 @@ def flash_attn_with_kvcache(
             if max_seqlen_k is None and page_table is not None
             else max_seqlen_k
         )
+        if q_descale is None and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
         result = vllm_flash_attn_varlen_func(
             q=q,
             k=k_cache,

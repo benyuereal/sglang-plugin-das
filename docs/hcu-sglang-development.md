@@ -2885,3 +2885,24 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 开关：`SGLANG_GDN_HIP_KERNEL=1` + `GDN_HIP_SO`（或 `lib/gdn_bw_ship.so`）。
 - 已执行：`python3 ci/l0_gate.py` passed；`py_compile` passed；`lib/build_gdn.sh` 在 gfx938 上构建成功。
 - 未验证：真实服务 target-verify 的数值/吞吐 A/B；CUDA graph 捕获；多卡/PP；B+ 提交链（另开 PR）。
+
+## 2026-11-13 clean 0.5.22 性能栈（hbird / fp8 KV / 草稿头 fp8）
+
+状态：本地实现；c40/2k2k 实测；L0 passed。
+
+- hbird bf16 GEMM：plugin `register()` 显式调用 `hbird_sglang.install()`
+  （adapter 的 sitecustomize 先 import 了 unquant，hbird_site 的 _Finder 不再触发）；
+  `ModelRunner.load_model` 后 `prepare_model`；`LogitsProcessor._compute_lm_head`
+  的 hbird 快路径。实测 packed=256 linear、freed 45.31 GiB、skipped 48。
+- fp8 KV：`prepare_paged_mha_query` AROUND 钩子补 k/v descale；varlen fp8
+  prefix decode 补 q_descale（1.0）。修复 `For fp8 prefix decode, q/k/v descale
+  tensors must be provided`。
+- MTP 草稿头 fp8：`models/qwen3_5_mtp_fp8.py`，只替换 draft 模型的 `lm_head`
+  （target 的 bf16 head 不动），e4m3 + hbird fp8 整词表一次 launch。
+- 1-D mrope：clean 0.5.22 源应用上游 `fix/mrope-1d-fast-path`（逐位相同）。
+- c40 / 2k in / 2k out / TEMP=0：677.90 → 844.84 tok/s 聚合
+  （16.95 → 21.12 tok/s/req），Mean TPOT 52.80 → 40.98 ms，80/80 成功。
+  归因：hbird lm_head +5.0%、fp8 KV +2.0%、hbird linear +16.4%。
+- 未验证：GDN B+ 提交链、gemma/qk/rope/zba 融合核、prefill graph
+  （breakable prefill 在 HCU 报 CUDA error 35，暂关）、T=0.2 全量
+  HumanEval（adapter 的 flashinfer 树采样 JIT 缺口）。
