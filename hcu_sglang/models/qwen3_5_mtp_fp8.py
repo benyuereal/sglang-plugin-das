@@ -272,35 +272,17 @@ def _around_set_embed_and_head(original, self, embed, head):
     return out
 
 
-def _around_load_model(original, self, *args, **kwargs):
-    out = original(self, *args, **kwargs)
-    model = getattr(self, "model", None)
-    if model is not None and hasattr(model, "set_lm_head_from_target"):
-        try:
-            install(model)
-        except Exception:  # noqa: BLE001 - optional path
-            logger.warning(
-                "[mtp_draft_lmhead_fp8] install on load failed", exc_info=True
-            )
-    return out
-
-
 def register() -> bool:
     if not _mtp_lmhead_fp8_enabled():
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    base = "sglang.srt.models.qwen3_5_mtp.Qwen3_5MTP."
+    base = "sglang.srt.models.qwen3_5_mtp.Qwen3_5ForCausalLMMTP."
     HookRegistry.register(
         base + "set_lm_head_from_target", _around_set_lm_head, HookType.AROUND
     )
     HookRegistry.register(
         base + "set_embed_and_head", _around_set_embed_and_head, HookType.AROUND
-    )
-    HookRegistry.register(
-        "sglang.srt.model_executor.model_runner.ModelRunner.load_model",
-        _around_load_model,
-        HookType.AROUND,
     )
     logger.info("[mtp_draft_lmhead_fp8] draft head fp8 hooks registered")
     return True
