@@ -534,7 +534,26 @@ def forward_extend(
                     flat = intermediate_state_cache.reshape(
                         -1, *intermediate_state_cache.shape[2:]
                     )
-                    snap_idx = intermediate_state_indices[:n].to(torch.int32)
+                    if gdn_bplus.handoff_enabled():
+                        # Slot-indexed scratch rows: the committed row then has a
+                        # stable address, so commit only moves an int32 pointer.
+                        # Row stride is the allocated cache_steps, not the
+                        # runtime draft-token count (adaptive steps vary it).
+                        cache_steps = int(intermediate_state_cache.shape[1])
+                        slots = cache_indices[:n].to(torch.int32)
+                        snap_idx = slots
+                        prev = gdn_bplus.ensure_prev(
+                            self, slots, mamba_cache_params, cache_steps
+                        )
+                        gdn_bplus.remember_step(self, slots, prev, cache_steps)
+                        h0_src = flat
+                        h0_idx = gdn_bplus.h0_rows(slots, prev, cache_steps)
+                        prev_arg = getattr(self, "_gdn_hip_prev")
+                    else:
+                        snap_idx = intermediate_state_indices[:n].to(torch.int32)
+                        h0_src = ssm_states
+                        h0_idx = cache_indices[:n].to(torch.int32)
+                        prev_arg = None
                     self._gdn_hip_snap_idx = snap_idx
                     hip_out = query.new_empty(
                         (1, query.shape[1], value.shape[2], value.shape[3])
@@ -548,13 +567,14 @@ def forward_extend(
                         layer.A_log,
                         layer.dt_bias,
                         query_start_loc[: n + 1],
-                        ssm_states,
-                        cache_indices[:n].to(torch.int32),
+                        h0_src,
+                        h0_idx,
                         flat,
                         snap_idx,
                         int(intermediate_state_cache.shape[1]),
                         int(draft_token_num),
                         hip_out,
+                        prev_step=prev_arg,
                     )
                     return hip_out
             if _gdn_hip_kernel_enabled():
@@ -668,6 +688,14 @@ def forward_extend(
                 ssm_states,
                 forward_metadata,
                 h_track_buf=h_track_buf,
+            )
+
+        from hcu_sglang.layers.attention.linear import gdn_bplus
+
+        inter = mamba_cache_params.intermediate_ssm
+        if inter is not None:
+            gdn_bplus.seed_prev(
+                self, cache_indices, mamba_cache_params, int(inter.shape[1])
             )
 
     return core_attn_out

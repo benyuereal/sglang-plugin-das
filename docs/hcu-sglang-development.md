@@ -2906,3 +2906,35 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 未验证：GDN B+ 提交链、gemma/qk/rope/zba 融合核、prefill graph
   （breakable prefill 在 HCU 报 CUDA error 35，暂关）、T=0.2 全量
   HumanEval（adapter 的 flashinfer 树采样 JIT 缺口）。
+
+## 2026-11-14 c40 吞吐推进：scatter 调度开销、commit 去同步、handoff 实验
+
+状态：本地实现；c40/2k2k 实测；handoff 默认关（负收益）。
+
+- 上游（sglang 源，patch 见 clean-stack/patches/upstream/）：
+  - `mamba_state_scatter_triton.py`：`fused_mamba_state_scatter_with_mask` 的
+    BLOCK_SIZE 1024→16384（elem≥65536）。c40 trace 里该核一步 48 ms（1.47M CTA
+    的调度开销，6 GiB 拷贝只有 ~250 GB/s）；改后 9.2 ms/次。逐位对拍
+    （elem=40000/786432 两条路径 `torch.equal`）。
+  - 同文件：conv window scatter 连续化（CONTIG/ELEM + BLOCK 16384 + meta key），
+    548.5→169.7 µs/拍，逐位。
+- 插件：
+  - `gdn_bplus.stash` 记录 host int T，compensate 不再每步 `tdev.item()` 同步
+    （+0.7%：1137.36→1145.03）。
+  - `compensate_from_stash` 缓存每层 `layer_cache`/`flat`（持平，无回归）。
+  - **GDN state handoff（实验，默认关）**：`SGLANG_GDN_HIP_HANDOFF=1` +
+    `SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK=1`（仅 `--disable-radix-cache`）。
+    verify/compensate 直写 snapshot 行（`disable_state_update` 语义），
+    commit 只更新 int32 `prev_step`，conv 窗口照常 scatter；prefill 末尾把
+    temporal seed 到 `intermediate_ssm[slot,0]`。
+  - 验证：单请求 T=0 与基线逐字符相同；trace 里 ssm scatter 完全消失
+    （GPU 内核 9831→9087 ms/10 s）；但同卡 c40 A/B 1080.97 vs 1137.36
+    （**净亏 5%**）——commit 的 48 层 Python 循环/launch 串行化把 GPU 从满
+    变成等，scatter 的 GPU 时间原本盖住了这段 CPU 时间。默认关，不进产线。
+  - CPU trace（12.2 s，148 万事件）：Python self-time 前几名全是等待/锁/
+    graph replay，插件 Python 工作 <0.2%，差距不在插件 Python 开销。
+- 端到端：clean 基线 677.90 → **1145.03 tok/s 聚合**（28.63 tok/s/req），
+  Mean TPOT 52.80 → **29.92 ms**，TTFT 7881.6 ms，80/80 成功；产线 0.5.18
+  同口径 1256.78（91.1%）。
+- 未验证：handoff 在 radix 开启/PP>1/抢占场景；multi-layer compensate
+  （48 launch→1）尚未实现；T=0.2 全量 HumanEval。
