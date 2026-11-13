@@ -214,10 +214,14 @@ def install(model) -> bool:
         return False
     hbird_gemm, hbird_max_m = _mtp_hbird_draft_head(weight_fp8, weight_scale)
     chunk = _mtp_lmhead_fp8_chunk()
-    model.lm_head = _MTPDraftLMHeadFP8Proxy(
-        head,
-        _MTPDraftLMHeadFP8Method(
-            weight_fp8, weight_scale, chunk, hbird_gemm, hbird_max_m
+    object.__setattr__(
+        model,
+        "lm_head",
+        _MTPDraftLMHeadFP8Proxy(
+            head,
+            _MTPDraftLMHeadFP8Method(
+                weight_fp8, weight_scale, chunk, hbird_gemm, hbird_max_m
+            ),
         ),
     )
     model._mtp_fp8_installed = True
@@ -238,9 +242,19 @@ def install(model) -> bool:
     return True
 
 
+def _drop_proxy(model) -> None:
+    try:
+        if isinstance(getattr(model, "lm_head", None), _MTPDraftLMHeadFP8Proxy):
+            object.__delattr__(model, "lm_head")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _around_set_lm_head(original, self, target_lm_head):
     out = original(self, target_lm_head)
     try:
+        _drop_proxy(self)
+        self._mtp_fp8_installed = False
         install(self)
     except Exception:  # noqa: BLE001 - optional path
         logger.warning("[mtp_draft_lmhead_fp8] install failed", exc_info=True)
@@ -248,9 +262,10 @@ def _around_set_lm_head(original, self, target_lm_head):
 
 
 def _around_set_embed_and_head(original, self, embed, head):
+    _drop_proxy(self)
+    self._mtp_fp8_installed = False
     out = original(self, embed, head)
     try:
-        self._mtp_fp8_installed = False
         install(self)
     except Exception:  # noqa: BLE001
         logger.warning("[mtp_draft_lmhead_fp8] reinstall failed", exc_info=True)
