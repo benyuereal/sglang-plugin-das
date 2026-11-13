@@ -2874,3 +2874,14 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+
+## 2026-11-13 Qwen3.8 GDN HIP kernel-only verify
+
+状态：本地实现，L0 passed；GPU 端到端 A/B 待跑。
+
+- 范围：新增 `hcu_sglang/layers/attention/linear/gdn_hip_bplus.py`（手写 HIP 递推核的 ctypes 封装，含 `dt_bias`/`A_log` bf16->fp32 修复），并在 `gdn_source.forward_extend` 的 target-verify 回退分支接入 kernel-only 路径（`SGLANG_GDN_HIP_KERNEL=1`）。
+- 行为：verify 仍写全量 per-draft 快照，行距/槽号与上游 `kernel_dispatcher.target_verify` 一致；不启用 B+ 写省略，也不依赖 0.5.18 的 state handoff（0.5.22 无该机制）。
+- 文件：`gdn_source.py`（+322，新增 `forward_extend` 副本与分支）、`gdn_backend.py`（REPLACE 钩子转调 `gdn_source.forward_extend`）、`gdn_hip_bplus.py`（新）、`layers/attention/linear/lib/`（HIP 源 + `build_gdn.sh`）。
+- 开关：`SGLANG_GDN_HIP_KERNEL=1` + `GDN_HIP_SO`（或 `lib/gdn_bw_ship.so`）。
+- 已执行：`python3 ci/l0_gate.py` passed；`py_compile` passed；`lib/build_gdn.sh` 在 gfx938 上构建成功。
+- 未验证：真实服务 target-verify 的数值/吞吐 A/B；CUDA graph 捕获；多卡/PP；B+ 提交链（另开 PR）。

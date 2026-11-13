@@ -74,8 +74,11 @@ def replacement_forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kw
 
 
 def replacement_forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
-    original = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
-    return original(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+    from hcu_sglang.layers.attention.linear import gdn_source
+    if not gdn_source._is_hcu:
+        original = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
+        return original(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+    return gdn_source.forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
 
 
 def around_convolve_prefill(original, self, *args, **kwargs):

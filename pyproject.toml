@@ -25,7 +25,7 @@ include = ["hcu_sglang*"]
 exclude = ["hcu_sglang.__pycache__", "hcu_sglang.*.__pycache__"]
 
 [tool.setuptools.package-data]
-hcu_sglang = ["mem_cache/cpp_utils/*.cpp", "layers/attention/linear/csrc/*", "mem_cache/rust_tree_core/crate/**/*", "mem_cache/rust_tree_core/crate/.gitignore", "jit_overlay/**/*", "models/deepseek/current_v4/hcu_backend/csrc/*", "models/deepseek/current_v4/execution/aiter_intree_configs/**/*"]
+hcu_sglang = ["mem_cache/cpp_utils/*.cpp", "layers/attention/linear/csrc/*", "layers/attention/linear/lib/*", "mem_cache/rust_tree_core/crate/**/*", "mem_cache/rust_tree_core/crate/.gitignore", "jit_overlay/**/*", "models/deepseek/current_v4/hcu_backend/csrc/*", "models/deepseek/current_v4/execution/aiter_intree_configs/**/*"]
 
 [tool.setuptools.exclude-package-data]
 hcu_sglang = ["**/__pycache__/*", "**/*.pyc"]
