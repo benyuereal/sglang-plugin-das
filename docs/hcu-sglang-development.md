@@ -2938,3 +2938,15 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
   同口径 1256.78（91.1%）。
 - 未验证：handoff 在 radix 开启/PP>1/抢占场景；multi-layer compensate
   （48 launch→1）尚未实现；T=0.2 全量 HumanEval。
+
+## 2026-11-14 精度门（无投机 T=0.2）与健壮性修复
+
+- 健壮性：无投机部署下 mamba cache 是基础 `State`（无 `intermediate_ssm`），
+  `seed_prev`/prefill 分支无条件访问会崩（`AttributeError`）。两处改为
+  `getattr(..., "intermediate_ssm", None)`；spec 开/关均可启动。
+- 精度（evalscope predictions + 官方 postprocess/test，手动打分）：
+  **154/163 = 94.48%**，失败 [1,10,31,47,52,105,112,143,145]，#32 跑满
+  100900 token 未完成未计入（保守）。对照产线 ad0 161/164、ad1 163/164。
+- 口径差异：本次无投机（标准 T=0.2+spec 被 adapter 的 flashinfer 树采样 JIT
+  缺口阻塞）；he_full T=0.2 = 147/164（89.6%），T=0 贪心 48/164（退化，归档）。
+- 未验证：差距归因（hbird bf16 GEMM / fp8 KV / 无投机），需同机 A/B。

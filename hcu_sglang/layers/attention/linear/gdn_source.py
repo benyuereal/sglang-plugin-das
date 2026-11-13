@@ -692,7 +692,7 @@ def forward_extend(
 
         from hcu_sglang.layers.attention.linear import gdn_bplus
 
-        inter = mamba_cache_params.intermediate_ssm
+        inter = getattr(mamba_cache_params, "intermediate_ssm", None)
         if inter is not None:
             gdn_bplus.seed_prev(
                 self, cache_indices, mamba_cache_params, int(inter.shape[1])

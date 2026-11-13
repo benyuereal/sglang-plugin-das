@@ -83,7 +83,8 @@ def seed_prev(backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int
     if not handoff_enabled():
         return
     temporal = mamba_cache_params.temporal
-    inter = mamba_cache_params.intermediate_ssm
+    # Plain (non-speculative) mamba cache has no intermediate scratch.
+    inter = getattr(mamba_cache_params, "intermediate_ssm", None)
     if inter is None or temporal is None:
         return
     prev_buf = _slot_tensor(backend, slots, -1, int(temporal.shape[0]) + 3)
