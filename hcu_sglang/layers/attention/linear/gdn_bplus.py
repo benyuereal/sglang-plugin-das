@@ -145,8 +145,12 @@ def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) 
         prev = prev_buf.index_select(0, idx.clamp_min(0)).to(torch.int64)
         store_row = torch.remainder(prev + 1, cache_steps)
         keep = torch.where(last < T - 1, last, store_row).to(torch.int32)
-        valid = idx >= 0
-        prev_buf.index_copy_(0, idx[valid], keep[valid])
+        # Boolean-mask indexing (idx[valid]) synchronizes the device to size
+        # its output, which stalls the host behind the whole decode step.
+        # Route invalid slots to the buffer's discard row instead.
+        discard = torch.full_like(idx, prev_buf.numel() - 1)
+        put_idx = torch.where(idx >= 0, idx, discard)
+        prev_buf.index_copy_(0, put_idx, keep)
         global _HANDOFF_LOGGED
         if not _HANDOFF_LOGGED:
             _HANDOFF_LOGGED = True

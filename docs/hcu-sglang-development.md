@@ -2950,3 +2950,16 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 口径差异：本次无投机（标准 T=0.2+spec 被 adapter 的 flashinfer 树采样 JIT
   缺口阻塞）；he_full T=0.2 = 147/164（89.6%），T=0 贪心 48/164（退化，归档）。
 - 未验证：差距归因（hbird bf16 GEMM / fp8 KV / 无投机），需同机 A/B。
+
+## 2026-11-14 主机路径两处真修复（handoff）
+
+1. **commit_prev 的 boolean-mask 索引同步**：`prev_buf.index_copy_(0, idx[valid],
+   keep[valid])` 会为确定掩码输出长度做 device 同步，实测 **75 ms/步**；
+   改为把无效槽路由到 discard 行（全张量 where + 定长 index_copy_）后
+   **0.75 ms/步**。
+2. **seed_prev 只应在真正 prefill 执行**：MTP draft 的 extend 也走同一分支，
+   每迭代 4 次用目标模型的 40 个槽做整状态拷贝（~6 GiB/次）；
+   加 `is_extend_without_speculative()` 门控后 draft 不再 seed。
+- 同口径（40 请求单波）首轮：**1182.33 tok/s / TPOT 26.03 / TTFT 12.25s**。
+- 注意：测试时不能中途 kill bench（僵尸请求会让下一轮排队）；
+  聚合吞吐受尾部 accept 波动影响，**TPOT 是稳定指标**。

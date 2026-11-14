@@ -692,8 +692,11 @@ def forward_extend(
 
         from hcu_sglang.layers.attention.linear import gdn_bplus
 
+        # Real prefill only: the MTP draft extend also takes this branch, and
+        # seeding there copies the whole state (6 GiB per draft step) for slots
+        # that already have a live handoff row.
         inter = getattr(mamba_cache_params, "intermediate_ssm", None)
-        if inter is not None:
+        if inter is not None and forward_batch.forward_mode.is_extend_without_speculative():
             gdn_bplus.seed_prev(
                 self, cache_indices, mamba_cache_params, int(inter.shape[1])
             )
