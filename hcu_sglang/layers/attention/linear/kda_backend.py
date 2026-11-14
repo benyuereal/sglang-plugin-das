@@ -1826,10 +1826,7 @@ class _HybridMethods:
             from hcu_sglang.layers.attention.linear import gdn_bplus
 
             gdn_bplus.compensate_from_stash(
-                _linear,
-                state_indices_tensor,
-                last_correct_step_indices,
-                mamba_caches,
+                _linear, state_indices_tensor, last_correct_step_indices
             )
             # Handoff: verify/compensate already wrote the committed rows, so
             # only the pointer moves and the 6 GiB ssm copy is skipped.

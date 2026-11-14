@@ -27,6 +27,8 @@ class BplusState:
         "store_row",
         "cache_steps",
         "seed_scratch",
+        "ml_table",
+        "ml_key",
         "tdev",
         "max_slots",
         "logged",
@@ -44,6 +46,8 @@ class BplusState:
         self.store_row = None
         self.cache_steps = 0
         self.seed_scratch = None
+        self.ml_table = None
+        self.ml_key = None
         self.tdev = None
         self.max_slots = 0
         self.logged = False
@@ -76,6 +80,14 @@ def handoff_enabled() -> bool:
     return _HANDOFF_OK
 
 
+def _slot_ids(slots) -> torch.Tensor:
+    return slots.to(torch.int64).clamp_min(0)
+
+
+def _head_dims(*tensors) -> list[int]:
+    return [int(t.shape[2]) * int(t.shape[3]) for t in tensors]
+
+
 def _prev_buf(backend, slots, size: int) -> torch.Tensor:
     st = state(backend)
     if st.prev is None or int(st.prev.numel()) < size:
@@ -83,14 +95,12 @@ def _prev_buf(backend, slots, size: int) -> torch.Tensor:
     return st.prev
 
 
-def ensure_prev(backend, slots: torch.Tensor, mamba_cache_params, D: int):
+def ensure_prev(backend, slots: torch.Tensor, mamba_cache_params):
     """Return the committed step for this batch's slots."""
-    del D  # row stride belongs to seed_prev / h0_rows
     st = state(backend)
     size = int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK
     prev_buf = _prev_buf(backend, slots, size)
-    s64 = slots.to(torch.int64).clamp_min(0)
-    return prev_buf.index_select(0, s64).to(torch.int32)
+    return prev_buf.index_select(0, _slot_ids(slots)).to(torch.int32)
 
 
 def seed_prev(
@@ -105,7 +115,7 @@ def seed_prev(
         return
     st = state(backend)
     prev_buf = _prev_buf(backend, slots, int(temporal.shape[0]) + SLOT_BUFFER_SLACK)
-    s64 = slots.to(torch.int64).clamp_min(0)
+    s64 = _slot_ids(slots)
     flat = inter.reshape(-1, *inter.shape[2:])
     # One persistent scratch: a per-chunk temporary fragments the allocator.
     n = int(s64.numel())
@@ -132,7 +142,7 @@ def invalidate_prev(backend, slots: torch.Tensor) -> None:
     buf = state(backend).prev
     if buf is None:
         return
-    buf.index_fill_(0, slots.to(torch.int64).clamp_min(0), -1)
+    buf.index_fill_(0, _slot_ids(slots), -1)
 
 
 def remember_step(backend, slots: torch.Tensor, prev: torch.Tensor, cache_steps: int):
@@ -150,8 +160,8 @@ def remember_step(backend, slots: torch.Tensor, prev: torch.Tensor, cache_steps:
     return store_row
 
 
-def h0_rows(slots: torch.Tensor, prev: torch.Tensor, D: int) -> torch.Tensor:
-    rows = slots.to(torch.int64).clamp_min(0) * D + prev.to(torch.int64).clamp_min(0)
+def h0_rows(slots: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.Tensor:
+    rows = _slot_ids(slots) * row_stride + prev.to(torch.int64).clamp_min(0)
     return rows.to(torch.int32)
 
 
@@ -204,7 +214,7 @@ def _same_storage_in_order(tensors, offsets) -> bool:
 
 def _fused_qkv_view(q, k, v, n: int, T: int):
     """[n, T, W] view over one fused q|k|v buffer, or None when they are apart."""
-    qd, kd, vd = (int(t.shape[2]) * int(t.shape[3]) for t in (q, k, v))
+    qd, kd, vd = _head_dims(q, k, v)
     W = int(q.stride(1))
     if q.dtype != k.dtype or q.dtype != v.dtype:
         return None
@@ -239,7 +249,7 @@ def _stash_entries(backend):
     return st.stash
 
 
-def _ensure(backend, layer, q, k, v, a, b, D: int):
+def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
     ents = _stash_entries(backend)
     max_slots = _max_slots(backend)
     if max_slots <= 0:
@@ -248,10 +258,10 @@ def _ensure(backend, layer, q, k, v, a, b, D: int):
     lid = layer.layer_id
     ent = ents.get(lid)
     if ent is None or int(ent["rows"]) < rows:
+        st = state(backend)
+        st.ml_table = None  # layer pointers move with the reallocation
         dev = q.device
-        qd = int(q.shape[2]) * int(q.shape[3])
-        kd = int(k.shape[2]) * int(k.shape[3])
-        vd = int(v.shape[2]) * int(v.shape[3])
+        qd, kd, vd = _head_dims(q, k, v)
         qkv = torch.zeros((rows, qd + kd + vd), dtype=q.dtype, device=dev)
         ent = {
             "rows": rows,
@@ -288,7 +298,7 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         if T <= 0 or n <= 0:
             return False
         D = T
-        ent, max_slots = _ensure(backend, layer, q, k, v, a, b, D)
+        ent, max_slots = _ensure_layer_entry(backend, layer, q, k, v, a, b, D)
         if ent is None or n > max_slots:
             return False
         m = n * D
@@ -296,9 +306,8 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         if src is not None:
             ent["qkv"][:m].view(n, D, -1)[:, :T].copy_(src)
         else:
-            qd = int(q.shape[2]) * int(q.shape[3])
-            kd = int(k.shape[2]) * int(k.shape[3])
-            W = qd + kd + int(v.shape[2]) * int(v.shape[3])
+            qd, kd, vd = _head_dims(q, k, v)
+            W = qd + kd + vd
             dest = ent["qkv"][:m].view(n, D, W)
             dest[:, :T, :qd].copy_(q.reshape(n, T, -1))
             dest[:, :T, qd:qd + kd].copy_(k.reshape(n, T, -1))
@@ -314,9 +323,7 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         return False
 
 
-def compensate_from_stash(
-    backend, state_indices, last_correct, mamba_caches=None
-) -> bool:
+def compensate_from_stash(backend, state_indices, last_correct) -> bool:
     """Replay the stash for the truncated slots, before the upstream scatter."""
     if not enabled():
         return False
@@ -356,7 +363,6 @@ def compensate_from_stash(
         store_step = torch.where(
             trunc, last32, torch.full_like(last32, -1)
         ).to(torch.int32)
-        h0_idx_default = idx32
         D = T
         m = n * D
         if handoff:
@@ -366,6 +372,14 @@ def compensate_from_stash(
             prev_now = st.prev.index_select(
                 0, slots_now.to(torch.int64).clamp_min(0)
             ).to(torch.int32)
+        skip_full = os.environ.get("SGLANG_GDN_HIP_BPLUS_SKIP_FULL", "1") != "0"
+        # A full accept already committed the row verify wrote; replay only the
+        # truncated slots, so their h0 read is not paid for. Same index tensor
+        # for every layer: the row stride does not depend on the layer.
+        neg = torch.full_like(idx32, -1) if skip_full else None
+        h0_by_stride = {}
+        h0_plain = None
+        rows = []
         for lid, ent in list(st.stash.items()):
             try:
                 layer_cache = ent.get("layer_cache")
@@ -379,12 +393,31 @@ def compensate_from_stash(
                 if flat is None:
                     flat = inter.reshape(-1, *inter.shape[2:])
                     ent["flat"] = flat
+                stride = int(inter.shape[1])
                 if handoff:
                     ssm = flat
-                    h0_idx = h0_rows(slots_now, prev_now, int(inter.shape[1]))
+                    h0_idx = h0_by_stride.get(stride)
+                    if h0_idx is None:
+                        h0_idx = h0_rows(slots_now, prev_now, stride)
+                        if skip_full:
+                            h0_idx = torch.where(trunc, h0_idx, neg)
+                        h0_by_stride[stride] = h0_idx
                 else:
                     ssm = layer_cache.temporal
-                    h0_idx = h0_idx_default
+                    if h0_plain is None:
+                        h0_plain = torch.where(trunc, idx32, neg)
+                    h0_idx = h0_plain
+                rows.append((ent, ssm, flat, h0_idx, stride))
+            except Exception:  # noqa: BLE001 - optional path
+                logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
+                continue
+        if not rows:
+            return False
+        if _multi_enabled() and gdn_hip_bplus.has_multi():
+            if _compensate_multi(st, rows, n, D, m, store_step, snap32):
+                return True
+        for ent, ssm, flat, h0_idx, cache_steps in rows:
+            try:
                 gdn_hip_bplus.compensate(
                     ent["q"][:m].view(n, D, ent["qh"], ent["qk"]),
                     ent["k"][:m].view(n, D, ent["kh"], ent["kk"]),
@@ -397,16 +430,70 @@ def compensate_from_stash(
                     h0_idx,
                     flat,
                     snap32,
-                    int(inter.shape[1]),
+                    cache_steps,
                     store_step,
                     n,
                     D,
                     ent["out"],
                 )
             except Exception:  # noqa: BLE001 - optional path
-                logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
+                logger.warning("[gdn-bplus] compensate failed for layer")
                 continue
         return True
     except Exception:  # noqa: BLE001
         logger.warning("[gdn-bplus] compensate_from_stash failed", exc_info=True)
         return False
+
+
+def _multi_enabled() -> bool:
+    return os.environ.get("SGLANG_GDN_HIP_BPLUS_MULTI", "1") != "0"
+
+
+def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
+    """One launch covers every layer when their layout matches the table."""
+    if len(rows) < 2:
+        return False
+    from hcu_sglang.layers.attention.linear import gdn_hip_bplus
+
+    ent0 = rows[0][0]
+    dims = tuple(int(ent0[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv"))
+    qh, qk, kh, kk, vh, vv = dims
+    cache_steps = rows[0][4]
+    qv = ent0["q"][:m].view(n, D, qh, qk)
+    strides = (
+        int(qv.stride(1)),
+        int(ent0["k"][:m].view(n, D, kh, kk).stride(1)),
+        int(ent0["v"][:m].view(n, D, vh, vv).stride(1)),
+        int(ent0["a"][:m].view(n, D, -1).stride(1)),
+        int(ent0["b"][:m].view(n, D, -1).stride(1)),
+    )
+    key = (len(rows), dims, cache_steps, strides)
+    table = st.ml_table
+    if table is None or st.ml_key != key:
+        cells = []
+        for ent, ssm, flat, h0_idx, cs in rows:
+            if tuple(int(ent[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv")) != dims:
+                return False
+            if cs != cache_steps or int(ent["q"].stride(0)) != strides[0]:
+                return False
+            cells.append(
+                [
+                    ent["q"].data_ptr(), ent["k"].data_ptr(),
+                    ent["v"].data_ptr(), ent["a"].data_ptr(),
+                    ent["b"].data_ptr(),
+                    gdn_hip_bplus.f32(ent["A_log"]).data_ptr(),
+                    gdn_hip_bplus.f32(ent["dt_bias"]).data_ptr(),
+                    ssm.data_ptr(), ent["out"].data_ptr(), flat.data_ptr(),
+                    *strides,
+                ]
+            )
+        table = torch.tensor(
+            cells, dtype=torch.int64, device=ent0["q"].device
+        )
+        st.ml_table = table
+        st.ml_key = key
+    gdn_hip_bplus.compensate_multi(
+        table, rows[0][3], snap32, cache_steps, store_step,
+        n, D, vh, qh, kk, vv,
+    )
+    return True

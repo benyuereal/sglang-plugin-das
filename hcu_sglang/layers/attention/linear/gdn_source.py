@@ -543,7 +543,7 @@ def forward_extend(
                         slots = cache_indices[:n].to(torch.int32)
                         snap_idx = slots
                         prev = gdn_bplus.ensure_prev(
-                            self, slots, mamba_cache_params, cache_steps
+                            self, slots, mamba_cache_params
                         )
                         gdn_bplus.remember_step(self, slots, prev, cache_steps)
                         h0_src = flat
