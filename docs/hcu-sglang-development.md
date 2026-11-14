@@ -3010,3 +3010,36 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
   更低概率来源）。
 - 未验证：非 handoff（`HANDOFF=0`，9112 那类配置）分支为同源代码推导修复，
   未在本机重跑 A/B；PP stable-rows 分支未验证。
+
+## 2026-11-15 GDN B+ 纠偏：跳过全接受槽 + 多层单次 launch
+
+- 背景：`compensate_from_stash` 每步对每个 GDN 层各发一次核，且 40 个槽全部读
+  h0、跑满 T 步；全接受槽的提交行 verify 已经写好（`store_row=(prev+1)%D`），
+  这一趟既不会写行也不改提交指针。
+- 改动：
+  - 非截断槽（`last_correct >= T-1` 或无效槽）把 `h0_idx` 置 -1，核里
+    `sidx < 0` 立即整块退出；只重放真正要写提交行的槽。
+  - 新增 `gdn_recurrent_update_bplus_state_multi`（`lib/gdn_bplus_multi.hip`，
+    构建脚本 `lib/build_gdn_bplus_multi.sh`）：每层的 q/k/v/a/b/A_log/dt_bias/
+    ssm/o/snap 指针与 5 个 token 步长打成 int64 表，`blockIdx.z` 选层，48 层一次
+    launch。旧 .so 没有该符号时 `has_multi()` 返回 False，自动回退逐层。
+  - 开关：`SGLANG_GDN_HIP_BPLUS_SKIP_FULL`（默认 1）、
+    `SGLANG_GDN_HIP_BPLUS_MULTI`（默认 1）。多层入口要求所有层形状/步长一致，
+    否则回退逐层。
+- 验证：
+  - 合成状态对拍（`perf/gdn/test_det.py`，GPU4）：多层入口与逐层入口逐位相同
+    （`torch.equal=True`），含无效槽提前退出。
+  - T=0 逐字节 sha：`3a3b7d3c88626bc7f3ca7d8aade88c113e3668f77495166e1dc32ec31326b7cf`
+    （未变）。
+  - c40 短输入锁步 probe（128 in / 2k out / TEMP=0，新进程首轮，GPU6）：
+    全槽纠偏 1211.82 tok/s / TPOT 25.84 / ITL 91.66 → 跳过全接受槽
+    1357.00 / 23.29 / 86.15 → 再加多层 1311.12 / 23.86 / 86.10。
+  - 2k 输入官方口径（新进程，TTFT 12.28 s）：1066.17 tok/s / TPOT 27.88 /
+    ITL 103.35 / median ITL 92.10。
+  - 服务端稳态 @bs=40（2k context，日志 gen throughput）：全槽纠偏
+    1424.6 tok/s（accept 3.58，≈100.5 ms/step）→ 本改动 1630 tok/s
+    （accept 3.82，≈93.3 ms/step）；不跑纠偏的错误版本 1711（≈91.2 ms/step）。
+- 结论：主收益来自“只重放截断槽”（约 −7.5 ms/step）；多层单次 launch 在 c40
+  上中性（ITL 86.15→86.10 ms，低于 0.3 ms 门限），保留为可选路径。
+- 未验证：非 handoff 分支未在本机做 A/B（代码同源推导）；层形状不一致的回退
+  路径未构造用例；多层入口未在 bs<17（T=5）下单独跑 sha。

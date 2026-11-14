@@ -43,6 +43,18 @@ _ARGS_FULL = (
     + [ctypes.c_void_p]
 )
 
+# Multi-layer compensate: the per-layer pointers/strides arrive as an int64
+# meta table, so one launch covers every GDN layer (blockIdx.z picks a row).
+_ARGS_MULTI = (
+    [ctypes.c_void_p] * 3
+    + [ctypes.c_int]
+    + [ctypes.c_void_p]
+    + [ctypes.c_int] * 7
+    + [ctypes.c_float] * 3
+    + [ctypes.c_int] * 3
+    + [ctypes.c_void_p]
+)
+
 _LIB = None
 _ERR = None
 
@@ -63,6 +75,10 @@ def lib():
             fn.restype = None
         h.gdn_recurrent_update_nofma.argtypes = _ARGS_FULL
         h.gdn_recurrent_update_nofma.restype = None
+        multi = getattr(h, "gdn_recurrent_update_bplus_state_multi", None)
+        if multi is not None:
+            multi.argtypes = _ARGS_MULTI
+            multi.restype = None
         _LIB = h
     except Exception as e:  # noqa: BLE001 - 报清楚为什么没起来
         _ERR = f"[gdn-hip-bplus] 加载 {path} 失败: {e}"
@@ -190,3 +206,30 @@ def compensate(q, k, v, a, b, A_log, dt_bias, ssm_states, h0_rows,
           None, ssm_states, h0_rows, o, snap_flat, snap_idx, cache_steps,
           store_step, None, n_seq, tok_per_seq, v.shape[-2], q.shape[-2],
           k.shape[-1], v.shape[-1], use_h0=True)
+
+
+def f32(x: torch.Tensor) -> torch.Tensor:
+    """Cached fp32 view of A_log/dt_bias for the pointer table."""
+    return _f32(x)
+
+
+def has_multi() -> bool:
+    return getattr(lib(), "gdn_recurrent_update_bplus_state_multi", None) is not None
+
+
+def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
+                     n_seq, tok_per_seq, hv, h, kdim, vdim):
+    """One-launch state replay for every layer in ``layer_ptrs``."""
+    getattr(lib(), "gdn_recurrent_update_bplus_state_multi")(
+        layer_ptrs.data_ptr(),
+        h0_indices.data_ptr(),
+        snap_idx.data_ptr(),
+        int(cache_steps),
+        0 if store_step is None else store_step.data_ptr(),
+        int(layer_ptrs.shape[0]),
+        int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
+        int(hv // h),
+        1.0 / (kdim ** 0.5), 1.0, 20.0,
+        1, 0, 1,
+        torch.cuda.current_stream().cuda_stream,
+    )

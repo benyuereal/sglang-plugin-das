@@ -414,8 +414,11 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         if not rows:
             return False
         if _multi_enabled() and gdn_hip_bplus.has_multi():
-            if _compensate_multi(st, rows, n, D, m, store_step, snap32):
-                return True
+            try:
+                if _compensate_multi(st, rows, n, D, m, store_step, snap32):
+                    return True
+            except Exception:  # noqa: BLE001 - per-layer path is the fallback
+                logger.warning("[gdn-bplus] multi compensate failed", exc_info=True)
         for ent, ssm, flat, h0_idx, cache_steps in rows:
             try:
                 gdn_hip_bplus.compensate(
@@ -474,7 +477,11 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
         for ent, ssm, flat, h0_idx, cs in rows:
             if tuple(int(ent[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv")) != dims:
                 return False
-            if cs != cache_steps or int(ent["q"].stride(0)) != strides[0]:
+            if (
+                cs != cache_steps
+                or int(ent["q"].stride(0)) != strides[0]
+                or int(ent["a"].stride(0)) != strides[3]
+            ):
                 return False
             cells.append(
                 [
