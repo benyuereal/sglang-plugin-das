@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 import torch
 
 from hcu_sglang.utils.detection import is_hcu
+
+logger = logging.getLogger(__name__)
 
 
 def around_handle_dspark(original: Callable[..., None], server_args: Any) -> None:
@@ -33,6 +36,37 @@ def around_dspark_dequant_supported(original: Callable[..., bool], linear: Any) 
     ):
         return False
     return original(linear)
+
+
+def around_handle_eagle_family(
+    original: Callable[..., None], server_args: Any, *args, **kwargs
+) -> None:
+    result = original(server_args, *args, **kwargs)
+    if not is_hcu():
+        return result
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    from hcu_sglang.server_args_hooks import _declare_values
+
+    view = resolving_view(server_args)
+    if (
+        view.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and not view.speculative_use_rejection_sampling
+        and view.speculative_eagle_topk == 1
+        and view.speculative_accept_threshold_single == 1.0
+        and view.speculative_accept_threshold_acc == 1.0
+        and not view.enable_deterministic_inference
+        and view.speculative_token_map is None
+    ):
+        _declare_values(
+            server_args,
+            "hcu_sglang:hcu_rejection_sampling",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info(
+            "HCU has no tree-sampling kernel; using rejection sampling."
+        )
+    return result
 
 
 def _get_dspark_ragged_settings():
@@ -116,6 +150,11 @@ def register_hooks() -> None:
     HookRegistry.register(
         "sglang.srt.arg_groups.speculative_hook._handle_dspark",
         around_handle_dspark,
+        HookType.AROUND,
+    )
+    HookRegistry.register(
+        "sglang.srt.arg_groups.speculative_hook._handle_eagle_family",
+        around_handle_eagle_family,
         HookType.AROUND,
     )
     HookRegistry.register(
