@@ -69,6 +69,30 @@ def around_handle_eagle_family(
     return result
 
 
+def around_commit_mamba_states(
+    original: Callable[..., None],
+    target_worker: Any,
+    batch: Any,
+    accept_lens: Any,
+    accept_index: Any,
+    draft_token_num: int,
+    *args,
+    **kwargs,
+) -> None:
+    # Graph replay never reruns the verify forward, so its recorded draft width
+    # is stale. Publish the live one for the GDN handoff commit.
+    linear = getattr(
+        target_worker.model_runner.attn_backend, "linear_attn_backend", None
+    )
+    if linear is not None:
+        from hcu_sglang.layers.attention.linear import gdn_bplus
+
+        gdn_bplus.state(linear).live_T = int(draft_token_num)
+    return original(
+        target_worker, batch, accept_lens, accept_index, draft_token_num, *args, **kwargs
+    )
+
+
 def _get_dspark_ragged_settings():
     from sglang.srt.environ import envs
     from sglang.srt.speculative.ragged_verify import (
@@ -155,6 +179,11 @@ def register_hooks() -> None:
     HookRegistry.register(
         "sglang.srt.arg_groups.speculative_hook._handle_eagle_family",
         around_handle_eagle_family,
+        HookType.AROUND,
+    )
+    HookRegistry.register(
+        "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify",
+        around_commit_mamba_states,
         HookType.AROUND,
     )
     HookRegistry.register(

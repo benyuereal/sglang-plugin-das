@@ -548,13 +548,13 @@ def forward_extend(
                         gdn_bplus.remember_step(self, slots, prev, cache_steps)
                         h0_src = flat
                         h0_idx = gdn_bplus.h0_rows(slots, prev, cache_steps)
-                        prev_arg = getattr(self, "_gdn_hip_prev")
+                        prev_arg = gdn_bplus.state(self).prev
                     else:
                         snap_idx = intermediate_state_indices[:n].to(torch.int32)
                         h0_src = ssm_states
                         h0_idx = cache_indices[:n].to(torch.int32)
                         prev_arg = None
-                    self._gdn_hip_snap_idx = snap_idx
+                    gdn_bplus.state(self).snap_idx = snap_idx
                     hip_out = query.new_empty(
                         (1, query.shape[1], value.shape[2], value.shape[3])
                     )

@@ -1,15 +1,6 @@
-"""GDN B+ commit chain for the 0.5.22 stack (no state handoff).
-
-verify writes only the full-accept row (draft_token_num - 1); the commit
-replays the same stash through the same kernel for the truncated slots and
-writes the accepted step. 0.5.22 has no handoff, so the row base is the
-batch position and the snapshot rows are the verify's
-``intermediate_state_indices`` (the same rows the upstream scatter reads).
-
-The 0.5.18 original (gdn_backend.py) is handoff-based; this port follows the
-no-handoff variant: ssm_states = the temporal pool, h0_rows = the mamba
-cache indices, store_row = draft_token_num - 1 (constant), store_step = the
-accepted step for the truncated slots and -1 for the full-accept ones.
+"""GDN B+ commit chain: verify stores only the last snapshot row, and the
+commit replays the stash for the truncated slots. The handoff variant points
+verify at the committed row, valid only with --disable-radix-cache.
 """
 
 import logging
@@ -17,7 +8,54 @@ import os
 
 import torch
 
+from hcu_sglang.constants import SEED_SCRATCH_MIN_ROWS, SLOT_BUFFER_SLACK
+
 logger = logging.getLogger(__name__)
+
+
+class BplusState:
+    """Per-backend scratch, kept off the nn.Module so plain attributes work."""
+
+    __slots__ = (
+        "prev",
+        "stash",
+        "snap_idx",
+        "capture_T",
+        "live_T",
+        "slots_now",
+        "prev_now",
+        "store_row",
+        "cache_steps",
+        "seed_scratch",
+        "tdev",
+        "max_slots",
+        "logged",
+        "commit_failed",
+    )
+
+    def __init__(self):
+        self.prev = None
+        self.stash = None
+        self.snap_idx = None
+        self.capture_T = 0
+        self.live_T = 0
+        self.slots_now = None
+        self.prev_now = None
+        self.store_row = None
+        self.cache_steps = 0
+        self.seed_scratch = None
+        self.tdev = None
+        self.max_slots = 0
+        self.logged = False
+        self.commit_failed = False
+
+
+def state(backend) -> BplusState:
+    st = getattr(backend, "_gdn_bplus", None)
+    if st is None:
+        st = BplusState()
+        object.__setattr__(backend, "_gdn_bplus", st)
+    return st
 
 
 def enabled() -> bool:
@@ -25,89 +63,66 @@ def enabled() -> bool:
 
 
 _HANDOFF_OK = None
-_HANDOFF_LOGGED = False
 
 
 def handoff_enabled() -> bool:
-    """Zero-copy state handoff: verify reads h0 from the snapshot rows.
-
-    Requires B+ and ``SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK=1``, which is only
-    valid with ``--disable-radix-cache``: the mamba interval checkpoints
-    (``mamba_track_indices``) are radix-cache bookkeeping, so with radix off
-    the commit can drop both full-state scatters. With radix on keep the
-    upstream copy path (never touch the pointer).
-    """
+    """Zero-copy state handoff: verify reads h0 from the committed row."""
     global _HANDOFF_OK
-    if _HANDOFF_OK is not None:
-        return _HANDOFF_OK
-    _HANDOFF_OK = (
-        enabled()
-        and os.environ.get("SGLANG_GDN_HIP_HANDOFF") == "1"
-        and os.environ.get("SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK") == "1"
-    )
+    if _HANDOFF_OK is None:
+        _HANDOFF_OK = (
+            enabled()
+            and os.environ.get("SGLANG_GDN_HIP_HANDOFF") == "1"
+            and os.environ.get("SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK") == "1"
+        )
     return _HANDOFF_OK
 
 
-def _slot_tensor(backend, slots, fill: int, size: int) -> torch.Tensor:
-    """Per-slot buffer sized by the mamba pool, not by the running batch."""
-    buf = getattr(backend, "_gdn_hip_prev", None)
-    if buf is None or int(buf.numel()) < size:
-        buf = torch.full((size,), fill, dtype=torch.int32, device=slots.device)
-        object.__setattr__(backend, "_gdn_hip_prev", buf)
-    return buf
+def _prev_buf(backend, slots, size: int) -> torch.Tensor:
+    st = state(backend)
+    if st.prev is None or int(st.prev.numel()) < size:
+        st.prev = torch.full((size,), -1, dtype=torch.int32, device=slots.device)
+    return st.prev
 
 
 def ensure_prev(backend, slots: torch.Tensor, mamba_cache_params, D: int):
-    """Return ``prev_step`` for this step's slots, seeding new slots from temporal.
-
-    A slot whose state has never gone through the handoff has ``prev_step < 0``.
-    Its post-prefill state lives in ``temporal[slot]``; copy it once into
-    ``intermediate_ssm[slot, 0]`` so every later verify reads the same buffer.
-    """
-    del D  # row stride is owned by seed_prev / h0_rows
-    prev_buf = _slot_tensor(
-        backend, slots, -1, int(mamba_cache_params.temporal.shape[0]) + 3
-    )
-    # Pure gather: graph-capture safe (no data-dependent branch, no temp).
+    """Return the committed step for this batch's slots."""
+    del D  # row stride belongs to seed_prev / h0_rows
+    st = state(backend)
+    size = int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK
+    prev_buf = _prev_buf(backend, slots, size)
     s64 = slots.to(torch.int64).clamp_min(0)
     return prev_buf.index_select(0, s64).to(torch.int32)
 
 
-def seed_prev(backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int) -> None:
-    """Publish a freshly written temporal state to the handoff scratch rows.
-
-    Runs at the end of prefill/extend, after the kernel wrote ``temporal``.
-    Unconditional over the batch's slots, so it stays capture-safe; one state
-    copy per slot per prefill (amortized over the request's decode steps).
-    """
+def seed_prev(
+    backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int
+) -> None:
+    """Publish a freshly written temporal state to the handoff scratch rows."""
     if not handoff_enabled():
         return
     temporal = mamba_cache_params.temporal
-    # Plain (non-speculative) mamba cache has no intermediate scratch.
     inter = getattr(mamba_cache_params, "intermediate_ssm", None)
     if inter is None or temporal is None:
         return
-    prev_buf = _slot_tensor(backend, slots, -1, int(temporal.shape[0]) + 3)
+    st = state(backend)
+    prev_buf = _prev_buf(backend, slots, int(temporal.shape[0]) + SLOT_BUFFER_SLACK)
     s64 = slots.to(torch.int64).clamp_min(0)
     flat = inter.reshape(-1, *inter.shape[2:])
-    # Reuse one scratch instead of allocating a state-sized temporary per
-    # layer per chunk: the churn fragments the allocator and the next bench
-    # runs prefill ever slower.
+    # One persistent scratch: a per-chunk temporary fragments the allocator.
     n = int(s64.numel())
-    state_shape = tuple(temporal.shape[1:])
-    scratch = getattr(backend, "_gdn_seed_scratch", None)
     if (
-        scratch is None
-        or int(scratch.shape[0]) < n
-        or tuple(scratch.shape[1:]) != state_shape
-        or scratch.dtype != temporal.dtype
+        st.seed_scratch is None
+        or int(st.seed_scratch.shape[0]) < n
+        or tuple(st.seed_scratch.shape[1:]) != tuple(temporal.shape[1:])
+        or st.seed_scratch.dtype != temporal.dtype
     ):
-        scratch = torch.empty(
-            (max(n, 128), *state_shape), dtype=temporal.dtype, device=temporal.device
+        st.seed_scratch = torch.empty(
+            (max(n, SEED_SCRATCH_MIN_ROWS), *temporal.shape[1:]),
+            dtype=temporal.dtype,
+            device=temporal.device,
         )
-        object.__setattr__(backend, "_gdn_seed_scratch", scratch)
-    torch.index_select(temporal, 0, s64, out=scratch[:n])
-    flat.index_copy_(0, s64 * int(cache_steps), scratch[:n])
+    torch.index_select(temporal, 0, s64, out=st.seed_scratch[:n])
+    flat.index_copy_(0, s64 * int(cache_steps), st.seed_scratch[:n])
     prev_buf.index_fill_(0, s64, 0)
 
 
@@ -115,24 +130,24 @@ def invalidate_prev(backend, slots: torch.Tensor) -> None:
     """Drop the handoff pointer for slots whose state was rewritten by prefill."""
     if not handoff_enabled():
         return
-    buf = getattr(backend, "_gdn_hip_prev", None)
+    buf = state(backend).prev
     if buf is None:
         return
-    # Static-shape form: prefill may run inside a captured graph.
     buf.index_fill_(0, slots.to(torch.int64).clamp_min(0), -1)
 
 
 def remember_step(backend, slots: torch.Tensor, prev: torch.Tensor, cache_steps: int):
-    """Record the step's prev/store_row so the commit can rotate the pointer.
+    """Record the step's slots and rows so the commit can rotate the pointer.
 
     ``cache_steps`` is the allocated row stride (``intermediate_ssm.shape[1]``),
-    not the runtime draft-token count: the rows are addressed by the stride.
+    not the runtime draft-token count: rows are addressed by the stride.
     """
+    st = state(backend)
     store_row = torch.remainder(prev + 1, cache_steps).to(torch.int32)
-    object.__setattr__(backend, "_gdn_hip_slots_now", slots.to(torch.int32))
-    object.__setattr__(backend, "_gdn_hip_prev_now", prev.to(torch.int32))
-    object.__setattr__(backend, "_gdn_hip_store_row_now", store_row)
-    object.__setattr__(backend, "_gdn_hip_cache_steps", int(cache_steps))
+    st.slots_now = slots.to(torch.int32)
+    st.prev_now = prev.to(torch.int32)
+    st.store_row = store_row
+    st.cache_steps = int(cache_steps)
     return store_row
 
 
@@ -142,91 +157,91 @@ def h0_rows(slots: torch.Tensor, prev: torch.Tensor, D: int) -> torch.Tensor:
 
 
 def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) -> bool:
-    """Advance ``prev_step`` to the committed row; no state copy.
-
-    Full-accept slots point at the verify's rotated row; truncated slots point
-    at the row the compensate replay wrote (``last_correct``). Row stride is the
-    allocated ``cache_steps`` recorded by :func:`remember_step`.
-    """
+    """Advance the committed row; no state copy."""
     if not handoff_enabled():
         return False
-    try:
-        prev_buf = getattr(backend, "_gdn_hip_prev")
-        idx = state_indices.to(torch.int64)
-        last = last_correct.to(torch.int64)
-        # Compute the rotated row here, not from the forward: the forward runs
-        # inside captured CUDA graphs whose Python-level tensors keep the
-        # capture batch's length, while the commit sees the live batch.
-        prev = prev_buf.index_select(0, idx.clamp_min(0)).to(torch.int64)
-        store_row = torch.remainder(prev + 1, cache_steps)
-        keep = torch.where(last < T - 1, last, store_row).to(torch.int32)
-        # Boolean-mask indexing (idx[valid]) synchronizes the device to size
-        # its output, which stalls the host behind the whole decode step.
-        # Route invalid slots to the buffer's discard row instead.
-        discard = torch.full_like(idx, prev_buf.numel() - 1)
-        put_idx = torch.where(idx >= 0, idx, discard)
-        prev_buf.index_copy_(0, put_idx, keep)
-        global _HANDOFF_LOGGED
-        if not _HANDOFF_LOGGED:
-            _HANDOFF_LOGGED = True
-            print("[gdn-bplus] handoff commit active (scatter skipped)", flush=True)
-        return True
-    except Exception:  # noqa: BLE001 - fall back to the scatter
-        logger.warning("[gdn-bplus] commit_prev failed", exc_info=True)
+    st = state(backend)
+    if st.prev is None or st.commit_failed:
         return False
-
-
-def _fused_qkv_src(q, k, v, n: int, T: int):
-    """Return the [n, T, W] view when q/k/v share one fused buffer, else None."""
     try:
-        qd = int(q.shape[2]) * int(q.shape[3])
-        kd = int(k.shape[2]) * int(k.shape[3])
-        vd = int(v.shape[2]) * int(v.shape[3])
-        W = int(q.stride(1))
-        esz = q.element_size()
-        if W != qd + kd + vd:
-            return None
-        if int(k.stride(1)) != W or int(v.stride(1)) != W:
-            return None
-        if int(q.stride(3)) != 1 or int(k.stride(3)) != 1 or int(v.stride(3)) != 1:
-            return None
-        if (
-            int(q.stride(2)) != int(q.shape[3])
-            or int(k.stride(2)) != int(k.shape[3])
-            or int(v.stride(2)) != int(v.shape[3])
-        ):
-            return None
-        if q.dtype != k.dtype or q.dtype != v.dtype:
-            return None
-        base = q.untyped_storage().data_ptr()
-        if k.untyped_storage().data_ptr() != base or v.untyped_storage().data_ptr() != base:
-            return None
-        if int(k.data_ptr()) - int(q.data_ptr()) != qd * esz:
-            return None
-        if int(v.data_ptr()) - int(k.data_ptr()) != kd * esz:
-            return None
-        if int(q.shape[1]) != n * T:
-            return None
-        return torch.as_strided(q, (n, T, W), (T * W, W, 1))
-    except Exception:  # noqa: BLE001 - fall back to three copies
+        _commit_prev(backend, st, state_indices, last_correct, T, cache_steps)
+    except Exception:  # noqa: BLE001 - the upstream scatter is always correct
+        st.commit_failed = True
+        logger.warning("[gdn-bplus] commit_prev failed; falling back to scatter",
+                       exc_info=True)
+        return False
+    if not st.logged:
+        st.logged = True
+        print("[gdn-bplus] handoff commit active (scatter skipped)", flush=True)
+    return True
+
+
+def _commit_prev(backend, st, state_indices, last_correct, T: int, cache_steps: int):
+    idx = state_indices.to(torch.int64)
+    last = last_correct.to(torch.int64)
+    # Rows are rotated here, not in the forward: the forward's Python tensors
+    # keep the capture batch's length, the commit sees the live batch.
+    prev = st.prev.index_select(0, idx.clamp_min(0)).to(torch.int64)
+    store_row = torch.remainder(prev + 1, cache_steps)
+    keep = torch.where(last < T - 1, last, store_row).to(torch.int32)
+    # Boolean-mask indexing (idx[valid]) sizes its output on the device, which
+    # stalls the host behind the whole decode step; route invalid slots to the
+    # buffer's discard row instead.
+    discard = torch.full_like(idx, st.prev.numel() - 1)
+    put_idx = torch.where(idx >= 0, idx, discard)
+    st.prev.index_copy_(0, put_idx, keep)
+
+
+def _same_storage_in_order(tensors, offsets) -> bool:
+    base = tensors[0].untyped_storage().data_ptr()
+    esz = tensors[0].element_size()
+    for t, off in zip(tensors, offsets):
+        if t.untyped_storage().data_ptr() != base:
+            return False
+        if int(t.data_ptr()) - int(tensors[0].data_ptr()) != off * esz:
+            return False
+    return True
+
+
+def _fused_qkv_view(q, k, v, n: int, T: int):
+    """[n, T, W] view over one fused q|k|v buffer, or None when they are apart."""
+    qd, kd, vd = (int(t.shape[2]) * int(t.shape[3]) for t in (q, k, v))
+    W = int(q.stride(1))
+    if q.dtype != k.dtype or q.dtype != v.dtype:
         return None
+    if W != qd + kd + vd:
+        return None
+    if any(int(t.stride(1)) != W for t in (k, v)):
+        return None
+    # Row-major within the head dim: the head axis sits immediately above it.
+    if any(
+        int(t.stride(3)) != 1 or int(t.stride(2)) != int(t.shape[3])
+        for t in (q, k, v)
+    ):
+        return None
+    if not _same_storage_in_order((q, k, v), (0, qd, qd + kd)):
+        return None
+    if int(q.shape[1]) != n * T:
+        return None
+    return torch.as_strided(q, (n, T, W), (T * W, W, 1))
 
 
 def _max_slots(backend) -> int:
-    value = int(getattr(backend, "_gdn_hip_max_slots", 0) or 0)
-    if value > 0:
-        return value
-    try:
-        return int(backend.req_to_token_pool.size)
-    except Exception:  # noqa: BLE001
-        return 0
+    st = state(backend)
+    if st.max_slots <= 0:
+        st.max_slots = int(backend.req_to_token_pool.size)
+    return st.max_slots
+
+
+def _stash_entries(backend):
+    st = state(backend)
+    if st.stash is None:
+        st.stash = {}
+    return st.stash
 
 
 def _ensure(backend, layer, q, k, v, a, b, D: int):
-    ents = getattr(backend, "_gdn_hip_stash_ents", None)
-    if ents is None:
-        ents = {}
-        object.__setattr__(backend, "_gdn_hip_stash_ents", ents)
+    ents = _stash_entries(backend)
     max_slots = _max_slots(backend)
     if max_slots <= 0:
         return None, 0
@@ -238,8 +253,7 @@ def _ensure(backend, layer, q, k, v, a, b, D: int):
         qd = int(q.shape[2]) * int(q.shape[3])
         kd = int(k.shape[2]) * int(k.shape[3])
         vd = int(v.shape[2]) * int(v.shape[3])
-        W = qd + kd + vd
-        qkv = torch.zeros((rows, W), dtype=q.dtype, device=dev)
+        qkv = torch.zeros((rows, qd + kd + vd), dtype=q.dtype, device=dev)
         ent = {
             "rows": rows,
             "qh": q.shape[2], "qk": q.shape[3],
@@ -248,7 +262,7 @@ def _ensure(backend, layer, q, k, v, a, b, D: int):
             "qkv": qkv,
             "q": qkv[:, :qd],
             "k": qkv[:, qd:qd + kd],
-            "v": qkv[:, qd + kd:W],
+            "v": qkv[:, qd + kd:],
             "a": torch.zeros((rows, a.shape[-1]), dtype=a.dtype, device=dev),
             "b": torch.zeros((rows, b.shape[-1]), dtype=b.dtype, device=dev),
             "out": torch.zeros(
@@ -266,9 +280,9 @@ def _ensure(backend, layer, q, k, v, a, b, D: int):
 def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
     if not enabled():
         return False
-    # Host-side int: the commit needs T without a device sync (.item() would
-    # serialize the CPU behind the verify every step).
-    object.__setattr__(backend, "_gdn_hip_T", int(draft_token_num))
+    st = state(backend)
+    # Host-side int: the commit needs T without a device sync.
+    st.capture_T = int(draft_token_num)
     try:
         T = int(draft_token_num)
         n = int(q.shape[1]) // T
@@ -279,7 +293,7 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         if ent is None or n > max_slots:
             return False
         m = n * D
-        src = _fused_qkv_src(q, k, v, n, T)
+        src = _fused_qkv_view(q, k, v, n, T)
         if src is not None:
             ent["qkv"][:m].view(n, D, -1)[:, :T].copy_(src)
         else:
@@ -292,34 +306,49 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
             dest[:, :T, qd + kd:W].copy_(v.reshape(n, T, -1))
         ent["a"][:m].view(n, D, -1)[:, :T].copy_(a.reshape(n, T, -1))
         ent["b"][:m].view(n, D, -1)[:, :T].copy_(b.reshape(n, T, -1))
-        tdev = getattr(backend, "_gdn_hip_tdev", None)
-        if tdev is None:
-            tdev = torch.zeros(1, dtype=torch.int32, device=q.device)
-            object.__setattr__(backend, "_gdn_hip_tdev", tdev)
-        tdev.fill_(T)
+        if st.tdev is None:
+            st.tdev = torch.zeros(1, dtype=torch.int32, device=q.device)
+        st.tdev.fill_(T)
         return True
     except Exception:  # noqa: BLE001 - never take serving down
         logger.warning("[gdn-bplus] stash failed", exc_info=True)
         return False
 
 
-def compensate_from_stash(backend, state_indices, last_correct, mamba_caches=None) -> bool:
+def compensate_from_stash(
+    backend, state_indices, last_correct, mamba_caches=None
+) -> bool:
     """Replay the stash for the truncated slots, before the upstream scatter."""
     if not enabled():
         return False
-    ents = getattr(backend, "_gdn_hip_stash_ents", None)
-    if not ents:
+    st = state(backend)
+    if not st.stash or st.snap_idx is None:
         return False
-    snap_idx = getattr(backend, "_gdn_hip_snap_idx", None)
-    if snap_idx is None:
-        return False
+    handoff = handoff_enabled()
     try:
-        T = int(getattr(backend, "_gdn_hip_T", 0))
+        # Graph replay skips the verify forward's Python, so anything it
+        # recorded describes the last captured bucket; prefer the live value.
+        T = int(st.live_T or st.capture_T)
         if T <= 1:
             return False
         n = int(state_indices.shape[0])
-        if int(snap_idx.numel()) != n:
-            return False
+        if handoff:
+            snap32 = state_indices.to(torch.int32)
+        else:
+            from sglang.srt.layers.attention.linear.utils import (
+                pp_spec_stable_rows_enabled,
+            )
+
+            if pp_spec_stable_rows_enabled():
+                if int(st.snap_idx.numel()) != n:
+                    return False
+                snap32 = st.snap_idx.to(torch.int32)
+            else:
+                # Default verify rows are batch positions; rebuild them for the
+                # live batch instead of reusing the capture bucket's view.
+                snap32 = torch.arange(
+                    n, dtype=torch.int32, device=state_indices.device
+                )
         from hcu_sglang.layers.attention.linear import gdn_hip_bplus
 
         idx32 = state_indices.to(torch.int32)
@@ -329,20 +358,16 @@ def compensate_from_stash(backend, state_indices, last_correct, mamba_caches=Non
             trunc, last32, torch.full_like(last32, -1)
         ).to(torch.int32)
         h0_idx_default = idx32
-        snap32 = snap_idx.to(torch.int32)
         D = T
         m = n * D
-        handoff = handoff_enabled()
         if handoff:
-            prev_buf = getattr(backend, "_gdn_hip_prev", None)
-            if prev_buf is None:
+            if st.prev is None:
                 return False
-            # Eager read: the forward's Python tensors are capture-length.
             slots_now = state_indices.to(torch.int32)
-            prev_now = prev_buf.index_select(
+            prev_now = st.prev.index_select(
                 0, slots_now.to(torch.int64).clamp_min(0)
             ).to(torch.int32)
-        for lid, ent in list(ents.items()):
+        for lid, ent in list(st.stash.items()):
             try:
                 layer_cache = ent.get("layer_cache")
                 if layer_cache is None:

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 #: M values a decode CUDA graph can issue.  Spec decode runs the target at
 #: bs * num_draft_tokens and the draft module at bs, so sweeping 1..128 covers
 #: every captured tier without having to introspect the graph config.
-_DECODE_MAX_M = 128
+from hcu_sglang.constants import DECODE_MAX_M
 
 _EMBEDDING_TYPES = {"VocabParallelEmbedding"}
 _LM_HEAD_TYPES = {"ParallelLMHead"}
@@ -146,7 +146,7 @@ def prepare_model(model, runner=None):
     prepared, failed = 0, 0
     try:
         for (n, k), device in shapes.items():
-            for m in range(1, _DECODE_MAX_M + 1):
+            for m in range(1, DECODE_MAX_M + 1):
                 try:
                     ops.prepare_bf16(m, n, k, device)
                     prepared += 1

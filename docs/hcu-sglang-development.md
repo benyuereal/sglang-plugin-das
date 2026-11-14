@@ -2963,3 +2963,50 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 同口径（40 请求单波）首轮：**1182.33 tok/s / TPOT 26.03 / TTFT 12.25s**。
 - 注意：测试时不能中途 kill bench（僵尸请求会让下一轮排队）；
   聚合吞吐受尾部 accept 波动影响，**TPOT 是稳定指标**。
+
+## 2026-11-14 HCU 自动开启 rejection sampling（修 T>0 崩服务）
+
+- 问题：adapter 让 HCU 以 CUDA 语义对外（`is_hip()` 恒 False），上游
+  `speculative_hook.py` 里「ROCm 自动开 rejection sampling」的分支在 HCU
+  永不触发。非贪心请求因此走 `tree_speculative_sampling_target_only` 的 CUDA
+  JIT，缺 flashinfer 头文件 → `RuntimeError` → scheduler 被 watchdog 杀掉。
+  贪心 bench（TEMP=0）走 argmax 分支，所以一直没暴露。
+- 修复：`hcu_sglang/speculative_compat.py` 新增 AROUND hook
+  `_handle_eagle_family`，条件与上游 ROCm 分支一致（EAGLE/EAGLE3、topk=1、
+  accept threshold 均为 1.0、非 deterministic、无 token_map）时声明
+  `speculative_use_rejection_sampling=True`。
+- 验证：重启 9121（启动脚本**不带** `--speculative-use-rejection-sampling`），
+  日志出现 "HCU has no tree-sampling target kernel..." 且配置快照中
+  `'speculative_use_rejection_sampling': True`；T=0.2 全量门可跑完（见下）。
+- 未验证：EAGLE topk>1 / deterministic inference 场景（条件上保持关闭）。
+
+## 2026-11-14 修 GDN handoff 提前 EOS（空最终答案）
+
+- 现象：NEXTN 投机 + thinking + T>0 的健康服务上，部分请求在 `` 之前直接
+  采到 `<|im_end|>`（248046）：reasoning_content 非空、content 为空、
+  `finish=stop`/`matched_stop=248046`。同 prompt 在 `BPLUS=0` 或无投机服务上
+  不复现。164 题 / T=0.2 / c=84 口径修复前 **5/130**（4 条恰好 8 token）。
+- 根因：B+ 的 `compensate_from_stash` 用 `_gdn_hip_snap_idx` 作截断槽的
+  快照行号，而它是 verify 前向在 **CUDA graph capture** 时写入的 Python 属性；
+  replay 不执行 Python 前向，服务期该属性一直指向最后抓取的桶。本机 target
+  verify 抓取顺序 bs=40→1，故 `snap_idx.numel()==1`，`snap_idx.numel() != n`
+  对全部 bs>1 的提交成立 → 截断槽的 accepted-step 状态从未重放；`commit_prev`
+  仍把 handoff 指针推进到未写入的行，下一步 verify 的 h0 是旧状态。目标分布
+  漂移后可观测到 draft 接受率下降（accept len 2.65→1.73，尾部 1.00），少数
+  请求提前采到 im_end。`_gdn_hip_T` 同样来自 capture（adaptive 4/5 步切换），
+  本次抓取顺序下恰好落在无害方向，一并改为读取 live 值。
+- 修复：`compensate_from_stash` 的快照行号改用 live `state_indices`
+  （handoff）或 `arange(n)`（非 handoff、非 PP stable rows）；宽度用
+  `_gdn_live_T`（由 `spec_utils.commit_mamba_states_after_verify` 每步用真实
+  `draft_token_num` 写入），`commit_prev` 同源。`SGLANG_ENABLE_PP_SPEC` 的
+  stable-rows 分支保留旧守卫。
+- 验证：同 164 prompt / T=0.2 / c=84：修复前 5/130（其中 4 条恰好 8 token），
+  修复后 **1/164**（#163，917 token，形态与修复前不同）；c=12 / 24 题修复后
+  0/24。同相位（bs>=35）accept len 2.21→2.50，与 `BPLUS=0` 的 2.50 持平。
+  部署日志 `snap-audit n=12 snap_numel=1` 直接证明旧守卫在 bs>1 时跳过补偿；
+  bs=1 时 `snap_numel==n==1`，与“c=1 串行 10/12 OK”的历史观测一致。
+- 残留：修复后仍有 1/164（#163）提前 EOS；#163 在退化服务上也空过。T=0.2 下
+  #163 重复 16 次复现 0 次，说明它不是“B+ 状态提交”这条链（或还有第二个
+  更低概率来源）。
+- 未验证：非 handoff（`HANDOFF=0`，9112 那类配置）分支为同源代码推导修复，
+  未在本机重跑 A/B；PP stable-rows 分支未验证。

@@ -1821,13 +1821,6 @@ class _HybridMethods:
             )
             return
 
-        _t0 = None
-        _t1 = None
-        if __import__("os").environ.get("HCU_GDN_COMMIT_TIMING") == "1":
-            import time as _time
-
-            _t0 = _time.perf_counter()
-            _t1 = _t0
         _linear = getattr(self, "linear_attn_backend", None)
         if _linear is not None:
             from hcu_sglang.layers.attention.linear import gdn_bplus
@@ -1838,15 +1831,14 @@ class _HybridMethods:
                 last_correct_step_indices,
                 mamba_caches,
             )
-            if _t0 is not None:
-                _t1 = _time.perf_counter()
             # Handoff: verify/compensate already wrote the committed rows, so
             # only the pointer moves and the 6 GiB ssm copy is skipped.
             if gdn_bplus.handoff_enabled() and src_indices_raw is None:
-                # Host int from stash: .item() here would serialize the CPU
-                # behind the verify every decode step.
-                T = int(getattr(_linear, "_gdn_hip_T", 0))
-                _cp0 = _time.perf_counter() if _t0 is not None else None
+                # Host int: .item() here would serialize the CPU behind the
+                # verify every decode step. The forward's own record is
+                # capture-time only, so prefer the live width.
+                _st = gdn_bplus.state(_linear)
+                T = int(_st.live_T or _st.capture_T)
                 _cp_ok = T > 1 and gdn_bplus.commit_prev(
                     _linear,
                     state_indices_tensor,
@@ -1854,18 +1846,6 @@ class _HybridMethods:
                     T,
                     int(mamba_caches.intermediate_ssm.shape[2]),
                 )
-                if _cp0 is not None:
-                    _ct = globals().setdefault(
-                        "_CP_TIMING", {"t": 0.0, "n": 0}
-                    )
-                    _ct["t"] += _time.perf_counter() - _cp0
-                    _ct["n"] += 1
-                    if _ct["n"] % 40 == 0:
-                        print(
-                            "[commit-prev-timing] %.2f ms (n=%d)"
-                            % (_ct["t"] * 1e3 / _ct["n"], _ct["n"]),
-                            flush=True,
-                        )
                 if _cp_ok:
                     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
                         _conv_multi_eligible,
@@ -1909,25 +1889,6 @@ class _HybridMethods:
             mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
         )
-
-        if _t0 is not None:
-            _t2 = _time.perf_counter()
-            _tel = globals().setdefault(
-                "_COMMIT_TIMING", {"comp": 0.0, "scat": 0.0, "n": 0}
-            )
-            _tel["comp"] += _t1 - _t0
-            _tel["scat"] += _t2 - _t1
-            _tel["n"] += 1
-            if _tel["n"] % 40 == 0:
-                print(
-                    "[commit-timing] comp=%.2f ms scat=%.2f ms (n=%d)"
-                    % (
-                        _tel["comp"] * 1e3 / _tel["n"],
-                        _tel["scat"] * 1e3 / _tel["n"],
-                        _tel["n"],
-                    ),
-                    flush=True,
-                )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,

@@ -8,6 +8,8 @@ import types
 
 import torch
 
+from hcu_sglang.constants import FA3_MAX_DESCALE_HEAD_DIM
+
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from hcu_sglang.models.fused_rotary import has_fused_kv_store
 from hcu_sglang.utils.detection import is_hcu
@@ -170,41 +172,57 @@ def around_get_paged_mha_kv_cache(original_fn, backend, layer, *, head_group_num
             value.view(-1, page, layer.tp_v_head_num // head_group_num, layer.v_head_dim))
 
 
-def around_prepare_paged_mha_query(original, self, *args, **kwargs):
+def _descale_tile(scale, shape, device):
+    """Per-row descale tile, 1.0 when the model carries no scale."""
+    if scale is None:
+        return torch.ones(shape, dtype=torch.float32, device=device)
+    try:
+        return scale.expand(shape)
+    except RuntimeError:  # stored as [1]
+        return scale.reshape(-1)[:1].expand(shape)
+
+
+def around_prepare_paged_mha_query(
+    original,
+    self,
+    q,
+    q_rope,
+    k_rope,
+    layer,
+    *,
+    logical_batch_size,
+    kv_head_num,
+    is_prefill,
+):
     """Fill fp8 KV descales when the upstream path leaves them unset.
 
     0.5.18 fell back to the backend-level k_scale/v_scale; 0.5.22 only uses
     ``layer.k_scale``. The fa3 varlen entry requires q/k/v descales for an
     fp8 prefix decode, so fill the missing ones (1.0 when no scale is set).
     """
-    out = original(self, *args, **kwargs)
-    q, q_rope, k_rope, k_descale, v_descale = out
-    if k_descale is not None:
-        return out
-    if getattr(self, "kv_cache_dtype_str", "auto") == "auto":
-        return out
-    layer = args[3] if len(args) > 3 else kwargs.get("layer")
-    if layer is None or getattr(layer, "head_dim", 0) > 256:
-        return out
-    batch = int(kwargs.get("logical_batch_size", q.shape[0]))
-    heads = int(kwargs.get("kv_head_num", getattr(layer, "tp_k_head_num", 0)))
-    if batch <= 0 or heads <= 0:
-        return out
-    shape = (batch, heads)
-    dev = q.device
-
-    def _descale(scale):
-        if scale is None:
-            return torch.ones(shape, dtype=torch.float32, device=dev)
-        try:
-            return scale.expand(shape)
-        except RuntimeError:
-            return scale.reshape(-1)[:1].expand(shape)
-
-    return (
+    out = original(
+        self,
         q,
         q_rope,
         k_rope,
-        _descale(getattr(layer, "k_scale", None)),
-        _descale(getattr(layer, "v_scale", None)),
+        layer,
+        logical_batch_size=logical_batch_size,
+        kv_head_num=kv_head_num,
+        is_prefill=is_prefill,
+    )
+    if out[3] is not None or self.kv_cache_dtype_str == "auto":
+        return out
+    if (
+        layer.head_dim > FA3_MAX_DESCALE_HEAD_DIM
+        or logical_batch_size <= 0
+        or kv_head_num <= 0
+    ):
+        return out
+    shape = (int(logical_batch_size), int(kv_head_num))
+    return (
+        out[0],
+        out[1],
+        out[2],
+        _descale_tile(layer.k_scale, shape, q.device),
+        _descale_tile(layer.v_scale, shape, q.device),
     )
