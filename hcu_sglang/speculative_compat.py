@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
 
 import torch
@@ -48,6 +49,8 @@ def around_handle_eagle_family(
 
     from hcu_sglang.server_args_hooks import _declare_values
 
+    if os.environ.get("SGLANG_HCU_AUTO_REJECTION_SAMPLING", "1") == "0":
+        return result
     view = resolving_view(server_args)
     if (
         view.speculative_algorithm in ("EAGLE", "EAGLE3")
