@@ -1,7 +1,5 @@
 """hbird-gemm as a bf16 GEMM backend."""
 
-import torch
-
 from ..provider import Bf16GemmProvider
 
 
@@ -69,8 +67,3 @@ class HbirdProvider(Bf16GemmProvider):
 def load() -> HbirdProvider | None:
     provider = HbirdProvider()
     return provider if provider.available() else None
-
-
-def is_bf16_linear(module) -> bool:
-    weight = getattr(module, "weight", None)
-    return isinstance(weight, torch.Tensor) and weight.dim() == 2
