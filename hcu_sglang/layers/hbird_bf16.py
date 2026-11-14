@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 #: M values a decode CUDA graph can issue.  Spec decode runs the target at
 #: bs * num_draft_tokens and the draft module at bs, so sweeping 1..128 covers
 #: every captured tier without having to introspect the graph config.
-from hcu_sglang.constants import DECODE_MAX_M
+from hcu_sglang.constants import BYTES_PER_GIB, DECODE_MAX_M, SKIPPED_LOG_LIMIT
 
 _EMBEDDING_TYPES = {"VocabParallelEmbedding"}
 _LM_HEAD_TYPES = {"ParallelLMHead"}
@@ -164,7 +164,7 @@ def prepare_model(model, runner=None):
         ".so cap M <= %d",
         "draft worker" if getattr(runner, "is_draft_worker", False) else "target",
         converted,
-        freed / 2**30,
+        freed / BYTES_PER_GIB,
         kept,
         len(skipped),
         prepared,
@@ -172,7 +172,7 @@ def prepare_model(model, runner=None):
         limit,
     )
     if skipped:
-        logger.info("[hbird_bf16_gemm] skipped: %s", skipped[:8])
+        logger.info("[hbird_bf16_gemm] skipped: %s", skipped[:SKIPPED_LOG_LIMIT])
     return {
         "converted": converted,
         "freed": freed,

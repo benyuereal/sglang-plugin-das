@@ -53,8 +53,7 @@ class BplusState:
 def state(backend) -> BplusState:
     st = getattr(backend, "_gdn_bplus", None)
     if st is None:
-        st = BplusState()
-        object.__setattr__(backend, "_gdn_bplus", st)
+        st = backend._gdn_bplus = BplusState()
     return st
 
 
@@ -172,7 +171,7 @@ def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) 
         return False
     if not st.logged:
         st.logged = True
-        print("[gdn-bplus] handoff commit active (scatter skipped)", flush=True)
+        logger.info("[gdn-bplus] handoff commit active (scatter skipped)")
     return True
 
 

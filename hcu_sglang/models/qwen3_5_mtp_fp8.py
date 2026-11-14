@@ -12,6 +12,13 @@ import time
 
 import torch
 
+from hcu_sglang.constants import (
+    AMAX_EPS,
+    BYTES_PER_GIB,
+    FP8_ALIGN_ELEMS,
+    MTP_LMHEAD_QUANT_BLOCK,
+)
+
 logger = logging.getLogger(__name__)
 
 _MTP_LMHEAD_FP8_CHUNK_DEFAULT = 24576
@@ -31,7 +38,9 @@ def _mtp_lmhead_fp8_chunk() -> int:
         chunk = _MTP_LMHEAD_FP8_CHUNK_DEFAULT
     if chunk <= 0:
         chunk = _MTP_LMHEAD_FP8_CHUNK_DEFAULT
-    return max(16, chunk - chunk % 16)
+    return max(
+        FP8_ALIGN_ELEMS, chunk - chunk % FP8_ALIGN_ELEMS
+    )
 
 
 def _mtp_lmhead_fp8_backend() -> str:
@@ -69,7 +78,7 @@ class _MTPDraftLMHeadFP8Method:
         assert bias is None, "draft fp8 lm_head does not support a bias"
         xf = x.to(torch.float32)
         xs = (
-            xf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+            xf.abs().amax(dim=-1, keepdim=True).clamp_min(AMAX_EPS)
             / _MTP_LMHEAD_FP8_E4M3_MAX
         )
         xq = (xf / xs).clamp(
@@ -120,12 +129,12 @@ def _mtp_quantize_lmhead_rows(weight: torch.Tensor):
         (vocab, hidden), dtype=torch.float8_e4m3fn, device=weight.device
     )
     weight_scale = torch.empty((vocab, 1), dtype=torch.float32, device=weight.device)
-    block = 4096
+    block = MTP_LMHEAD_QUANT_BLOCK
     for i in range(0, vocab, block):
         j = min(i + block, vocab)
         wf = weight[i:j].to(torch.float32)
         scale = (
-            wf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+            wf.abs().amax(dim=-1, keepdim=True).clamp_min(AMAX_EPS)
             / _MTP_LMHEAD_FP8_E4M3_MAX
         )
         weight_fp8[i:j] = (wf / scale).clamp(
@@ -165,7 +174,7 @@ def _mtp_hbird_draft_head(weight_fp8: torch.Tensor, weight_scale: torch.Tensor):
     logger.info(
         "[mtp_draft_lmhead_fp8] draft head on hbird fp8: packed B %.2f GiB, "
         "%d M workspaces (%d..%d), %.2fs",
-        weight_fp8.numel() / 2**30,
+        weight_fp8.numel() / BYTES_PER_GIB,
         len(ms),
         ms[0],
         ms[-1],
@@ -225,19 +234,16 @@ def install(model) -> bool:
         ),
     )
     model._mtp_fp8_installed = True
-    print(
+    logger.info(
         "[mtp_draft_lmhead_fp8] draft head %d x %d -> e4m3, %.2fs, "
-        "%.2f -> %.2f GiB, chunk=%d, hbird_max_m=%d"
-        % (
-            weight.shape[0],
-            weight.shape[1],
-            time.perf_counter() - started,
-            weight.numel() * weight.element_size() / 2**30,
-            (weight_fp8.numel() + weight_scale.numel() * 4) / 2**30,
-            chunk,
-            hbird_max_m,
-        ),
-        flush=True,
+        "%.2f -> %.2f GiB, chunk=%d, hbird_max_m=%d",
+        weight.shape[0],
+        weight.shape[1],
+        time.perf_counter() - started,
+        weight.numel() * weight.element_size() / BYTES_PER_GIB,
+        (weight_fp8.numel() + weight_scale.numel() * 4) / BYTES_PER_GIB,
+        chunk,
+        hbird_max_m,
     )
     return True
 

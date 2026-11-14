@@ -12,6 +12,8 @@ import os
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+from hcu_sglang.constants import BYTES_PER_GIB
+
 from . import hbird_bf16
 
 _LOG = logging.getLogger(__name__)
@@ -28,16 +30,13 @@ def _around_load_model(original, self, *args, **kwargs):
     try:
         result = hbird_bf16.prepare_model(getattr(self, "model", None), self)
         if result:
-            print(
-                "[hbird_bf16] packed=%d freed=%.2fGiB kept=%d skipped=%d ws=%d"
-                % (
-                    result["converted"],
-                    result["freed"] / 2**30,
-                    result["kept"],
-                    len(result["skipped"]),
-                    result["prepared"],
-                ),
-                flush=True,
+            _LOG.info(
+                "[hbird_bf16] packed=%d freed=%.2fGiB kept=%d skipped=%d ws=%d",
+                result["converted"],
+                result["freed"] / BYTES_PER_GIB,
+                result["kept"],
+                len(result["skipped"]),
+                result["prepared"],
             )
     except Exception:  # noqa: BLE001 - optional path, never take serving down
         _LOG.warning("hbird_bf16: prepare_model failed", exc_info=True)

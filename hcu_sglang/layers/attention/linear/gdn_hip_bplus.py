@@ -58,8 +58,9 @@ def lib():
         h = ctypes.CDLL(path)
         for name in ("gdn_recurrent_update_bplus",
                      "gdn_recurrent_update_bplus_state"):
-            h[name].argtypes = _ARGS
-            h[name].restype = None
+            fn = getattr(h, name)
+            fn.argtypes = _ARGS
+            fn.restype = None
         h.gdn_recurrent_update_nofma.argtypes = _ARGS_FULL
         h.gdn_recurrent_update_nofma.restype = None
         _LIB = h
@@ -105,7 +106,7 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
     # cu_seqlens (fixed D steps) but must still read h0.
     if use_h0 is None:
         use_h0 = True
-    lib()[fn](
+    getattr(lib(), fn)(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
         _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
         0 if cu_seqlens is None else cu_seqlens.data_ptr(),
@@ -165,7 +166,7 @@ def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
     """Full-snapshot entry, for the A/B only: same kernel and inputs, every step
     written, so the row B+ writes must be torch.equal to it."""
     n = int(snap_idx.shape[0])
-    lib()["gdn_recurrent_update_nofma"](
+    getattr(lib(), "gdn_recurrent_update_nofma")(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
         _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
         0 if cu_seqlens is None else cu_seqlens.data_ptr(),
