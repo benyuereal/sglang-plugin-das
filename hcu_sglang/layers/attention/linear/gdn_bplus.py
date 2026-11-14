@@ -90,9 +90,24 @@ def seed_prev(backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int
     prev_buf = _slot_tensor(backend, slots, -1, int(temporal.shape[0]) + 3)
     s64 = slots.to(torch.int64).clamp_min(0)
     flat = inter.reshape(-1, *inter.shape[2:])
-    flat.index_copy_(
-        0, s64 * int(cache_steps), temporal.index_select(0, s64)
-    )
+    # Reuse one scratch instead of allocating a state-sized temporary per
+    # layer per chunk: the churn fragments the allocator and the next bench
+    # runs prefill ever slower.
+    n = int(s64.numel())
+    state_shape = tuple(temporal.shape[1:])
+    scratch = getattr(backend, "_gdn_seed_scratch", None)
+    if (
+        scratch is None
+        or int(scratch.shape[0]) < n
+        or tuple(scratch.shape[1:]) != state_shape
+        or scratch.dtype != temporal.dtype
+    ):
+        scratch = torch.empty(
+            (max(n, 128), *state_shape), dtype=temporal.dtype, device=temporal.device
+        )
+        object.__setattr__(backend, "_gdn_seed_scratch", scratch)
+    torch.index_select(temporal, 0, s64, out=scratch[:n])
+    flat.index_copy_(0, s64 * int(cache_steps), scratch[:n])
     prev_buf.index_fill_(0, s64, 0)
 
 
