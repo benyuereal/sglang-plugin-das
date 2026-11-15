@@ -17,6 +17,10 @@ _DEFAULT_SO = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "lib", "gdn_bplus_multi.so"
 )
 _BV = 32  # 与 gdn_recurrent.hip 的 BV 一致
+# softplus(beta * x + threshold) literals the recurrent kernel expects; they
+# must match gdn_recurrent.hip.
+_SOFTPLUS_BETA = 1.0
+_SOFTPLUS_THRESHOLD = 20.0
 
 # 13 个指针 + cache_steps + store_step + store_row + (N,T,HV,K,V,hratio)
 # + 5 stride (q,k,v,**a**,b) + 3 float + 3 int + stream
@@ -138,7 +142,7 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
         # (96 vs a's 48) and a shared one makes a read another token's row.
         _tok_stride(q), _tok_stride(k), _tok_stride(v),
         _tok_stride(a), _tok_stride(b),
-        1.0 / (kdim ** 0.5), 1.0, 20.0,
+        1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
         # (use_initial_state, varlen, disable_state_update)
         1 if use_h0 else 0,
         # varlen must be off without cu_seqlens: the kernel would read through
@@ -197,7 +201,7 @@ def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
         int(k.shape[-1]), int(v.shape[-1]), int(v.shape[-2] // q.shape[-2]),
         _tok_stride(q), _tok_stride(k), _tok_stride(v),
         _tok_stride(a), _tok_stride(b),
-        1.0 / (k.shape[-1] ** 0.5), 1.0, 20.0,
+        1.0 / (k.shape[-1] ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
         1, 0 if cu_seqlens is None else 1, 1,
         torch.cuda.current_stream().cuda_stream,
     )
@@ -234,7 +238,7 @@ def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
         int(layer_ptrs.shape[0]),
         int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
         int(hv // h),
-        1.0 / (kdim ** 0.5), 1.0, 20.0,
+        1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
         1, 0, 1,
         torch.cuda.current_stream().cuda_stream,
     )

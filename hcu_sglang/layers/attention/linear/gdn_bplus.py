@@ -140,15 +140,6 @@ def seed_prev(
     prev_buf.index_fill_(0, s64, 0)
 
 
-def invalidate_prev(backend, slots: torch.Tensor) -> None:
-    """Drop the handoff pointer for slots whose state was rewritten by prefill."""
-    if not handoff_enabled():
-        return
-    buf = state(backend).prev
-    if buf is None:
-        return
-    buf.index_fill_(0, _slot_ids(slots), -1)
-
 
 def _step_buffer(st, name: str, rows: int, dtype, device) -> torch.Tensor:
     """Persistent scratch: captures bake buffer addresses into the graph, so a

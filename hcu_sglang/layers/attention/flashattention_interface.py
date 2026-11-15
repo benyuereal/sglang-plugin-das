@@ -11,7 +11,7 @@ from hcu_sglang.constants import (
     PAGED_VERIFY_MAX_Q,
     PAGED_VERIFY_Q_ROWS_PER_KV_HEAD,
 )
-from hcu_sglang.utils.detection import is_hcu, is_hcu_native_fp8_supported
+from hcu_sglang.utils.detection import is_hcu
 
 
 def _layout_enabled() -> bool:
@@ -20,13 +20,6 @@ def _layout_enabled() -> bool:
     # default mirrors hcu_sglang.environ (single source): official layout
     # unless the HCU FA perf-A/B path is explicitly requested.
     return get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="false")
-
-
-def is_native_fp8(dtype: torch.dtype) -> bool:
-    return is_hcu_native_fp8_supported() and dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-    )
 
 
 _current_max_seq_len_k: Optional[int] = None
