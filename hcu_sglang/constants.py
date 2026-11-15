@@ -27,3 +27,9 @@ MTP_LMHEAD_QUANT_BLOCK = 4096
 # element alignment of the fp8 chunk size, and the amax floor used when scaling.
 FP8_ALIGN_ELEMS = 16
 AMAX_EPS = 1e-8
+
+# lm_head quant methods SGLang runs as plain bf16, so the packed-B path may serve
+# them too; mirrors logits_processor._UNQUANTIZED_LM_HEAD_METHODS.
+UNQUANTIZED_LM_HEAD_METHODS = frozenset(
+    {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod", "PackWeightMethod"}
+)

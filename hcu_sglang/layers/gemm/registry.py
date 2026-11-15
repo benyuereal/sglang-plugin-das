@@ -5,7 +5,12 @@ import os
 
 import torch
 
-from hcu_sglang.constants import BYTES_PER_GIB, DECODE_MAX_M, SKIPPED_LOG_LIMIT
+from hcu_sglang.constants import (
+    BYTES_PER_GIB,
+    DECODE_MAX_M,
+    SKIPPED_LOG_LIMIT,
+    UNQUANTIZED_LM_HEAD_METHODS,
+)
 
 from .providers import hbird
 
@@ -149,6 +154,9 @@ def lm_head_linear(hidden_states, lm_head, embedding_bias, use_fp32_lm_head):
     backend = provider()
     if backend is None or use_fp32_lm_head or embedding_bias is not None:
         return None
+    method = getattr(lm_head, "quant_method", None)
+    if method is not None and type(method).__name__ not in UNQUANTIZED_LM_HEAD_METHODS:
+        return None  # a real quant method (the fp8 draft head) owns this GEMM
     weight = getattr(lm_head, "weight", None)
     if weight is None or weight.dtype != torch.bfloat16:
         return None
