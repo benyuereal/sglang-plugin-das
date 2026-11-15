@@ -587,6 +587,9 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
         int(ent0["a"][:m].view(n, D, -1).stride(1)),
         int(ent0["b"][:m].view(n, D, -1).stride(1)),
     )
+    # The table holds raw data_ptrs, so this key is only valid because mamba
+    # pools are allocated once, before graph capture; a replaced layer entry
+    # clears it at `st.ml_table = None`.
     key = (len(rows), dims, cache_steps, strides)
     table = st.ml_table
     if table is None or st.ml_key != key:

@@ -18,6 +18,7 @@ _ENV_SPECS: dict[str, tuple[type, Any]] = {
     "SGLANG_HCU_W8A8_USE_LIGHTOP": (EnvBool, False),
     "SGLANG_HCU_GLM_CT_BF16_ROUTER": (EnvBool, False),
     "SGLANG_LIGHTOP_KVALLOC_KERNEL": (EnvBool, False),
+    "SGLANG_HCU_FA_PAGED_BSHD": (EnvBool, False),
     "SGLANG_HCU_FUSE_SILU": (EnvBool, False),
     "SGLANG_HCU_FUSE_ADD_RMS": (EnvBool, False),
     "SGLANG_USE_FUSED_SILU_MUL_CLAMP_QUANT": (EnvBool, False),
