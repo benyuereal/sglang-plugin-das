@@ -24,6 +24,8 @@
 |---|---|---|
 | `SGLANG_HCU_FUSE_QKVZBA_VERIFY` | 0 | verify 零拷贝视图；单波 TPOT 26.18→26.06，逐位不变 |
 | `SGLANG_GDN_ZBA_STRIDED` | 0 | z/b 保持 strided；与上项同开才不亏 |
+| `SGLANG_HCU_FUSE_SILU` | 0 | Triton `_silu_mul_kernel` 取代 lightop `silu_and_mul_kernel_opt2`（保留两次 bf16 舍入）；逐位对拍待 GPU 验证 |
+| `SGLANG_HCU_FUSE_ADD_RMS` | 0 | 单遍 Gemma add-RMSNorm（一次读 x/r、一次写 residual/x），语义与 adapter 两遍 Triton 核逐位相同；待 GPU 验证 |
 | `SGLANG_GDN_HIP_KERNEL` | 0 | kernel-only 线（非 B+）；默认关 |
 | `SGLANG_FORCE_MM_FAST_PROCESSOR_GPU` | 0 | 打开会让 tokenizer 进程建第二个 CUDA context（HCU 驱动 runlist 超订），**不要开** |
 
