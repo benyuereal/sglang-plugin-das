@@ -96,16 +96,16 @@ class PlainCompensateTest(unittest.TestCase):
         self.assertTrue(recorded.get("called"))
         return recorded["h0"]
 
-    def test_skip_full_off_plain_path_yields_a_valid_index(self):
+    def test_skip_full_off_plain_path_replays_every_slot(self):
         h0 = self._run_plain({"SGLANG_GDN_HIP_BPLUS_SKIP_FULL": "0"})
         self.assertEqual(h0.dtype, torch.int32)
-        # trunc = [True, False]: slot 0 replays its real index, slot 1
-        # (full-accept) gets the skip marker -1 -- never None, never a raise.
-        self.assertEqual(h0.tolist(), [1, -1])
+        # trunc = [True, False]: with the switch off the full-accept slot keeps
+        # its own index instead of the -1 skip marker.
+        self.assertEqual(h0.tolist(), [1, 2])
 
-    def test_skip_full_on_plain_path_yields_the_same_valid_index(self):
+    def test_skip_full_on_plain_path_marks_the_full_accept(self):
         h0 = self._run_plain({"SGLANG_GDN_HIP_BPLUS_SKIP_FULL": "1"})
-        self.assertEqual(h0.tolist(), [1, -1])
+        assert h0.tolist() == [1, -1]
 
 
 if __name__ == "__main__":

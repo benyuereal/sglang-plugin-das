@@ -483,12 +483,11 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         # A full accept already committed the row verify wrote; replay only the
         # truncated slots, so their h0 read is not paid for. Same index tensor
         # for every layer: the row stride does not depend on the layer.
-        # ``neg`` (the -1 skip marker) is built unconditionally: the handoff
-        # branch masks only when skip_full, but the plain branch's
-        # ``torch.where(trunc, idx32, neg)`` at :521 always needs it -- with a
-        # None third argument where() raises, the per-layer except swallows it,
-        # and every layer's row is dropped with no state replayed.
-        neg = torch.full_like(idx32, -1)
+        # ``neg`` is built unconditionally: ``torch.where`` raises on a None
+        # third argument, and the per-layer except would then drop every layer's
+        # row. With the switch off it is the row's own index, so a full accept
+        # still replays.
+        neg = torch.full_like(idx32, -1) if skip_full else idx32
         h0_by_stride = {}
         h0_plain = None
         rows = []

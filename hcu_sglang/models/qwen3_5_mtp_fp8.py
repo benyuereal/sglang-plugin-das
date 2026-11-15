@@ -45,12 +45,18 @@ def _mtp_hbird_ops():
 
 
 class _MTPDraftLMHeadFP8Method:
-    def __init__(self, base, weight_fp8, weight_scale, hbird_gemm, hbird_max_m):
+    def __init__(self, base, weight_fp8, weight_scale, hbird_gemm, hbird_max_m, out_rows):
         self.base = base
         self.weight_fp8 = weight_fp8
         self.weight_scale = weight_scale
         self.hbird_gemm = hbird_gemm
         self.hbird_max_m = hbird_max_m
+        # One buffer for every decode row count: a per-call allocation lands in
+        # the CUDA-graph pool once per bs bucket (~0.4 GiB over bs 1..40) and
+        # that is what pushed verify into OOM.
+        self.out = torch.empty(
+            (out_rows, weight_fp8.shape[0]), dtype=torch.bfloat16, device=weight_fp8.device
+        )
 
     def apply(self, layer, x: torch.Tensor, bias=None) -> torch.Tensor:
         assert bias is None, "draft fp8 lm_head does not support a bias"
@@ -64,8 +70,7 @@ class _MTPDraftLMHeadFP8Method:
         xq = (xf / xs).clamp(
             -_MTP_LMHEAD_FP8_E4M3_MAX, _MTP_LMHEAD_FP8_E4M3_MAX
         ).to(torch.float8_e4m3fn)
-        vocab = self.weight_fp8.shape[0]
-        out = torch.empty((x.shape[0], vocab), dtype=torch.bfloat16, device=x.device)
+        out = self.out[: x.shape[0]]
         self.hbird_gemm(
             xq,
             self.weight_fp8,
@@ -196,7 +201,14 @@ def install(model) -> bool:
         "lm_head",
         _MTPDraftLMHeadFP8Proxy(
             head,
-            _MTPDraftLMHeadFP8Method(head, weight_fp8, weight_scale, hbird_gemm, hbird_max_m),
+            _MTPDraftLMHeadFP8Method(
+                head,
+                weight_fp8,
+                weight_scale,
+                hbird_gemm,
+                hbird_max_m,
+                hbird_max_m,
+            ),
         ),
     )
     model._mtp_fp8_installed = True
