@@ -28,6 +28,7 @@
 |---|---|---|
 | `SGLANG_GDN_HIP_KERNEL` | 0 | kernel-only 线（非 B+）；默认关 |
 | `SGLANG_FORCE_MM_FAST_PROCESSOR_GPU` | 0 | 打开会让 tokenizer 进程建第二个 CUDA context（HCU 驱动 runlist 超订），**不要开** |
+| `SGLANG_HCU_FA_PAGED_BSHD` | 0 | decode/MTP-verify 走 wheel `layout="bshd"` 直连 paged 核（NHD 池无需换布局）。**改变 T=0 输出**：与 splitkv 不是同一数值实现；40/40、TPOT 26.90→26.42 |
 
 ## 已确认的坑（会崩/会错，不是性能问题）
 
@@ -51,6 +52,46 @@
 
 差距分解：verify +30.6 ms/步、draft_extend +15.0 ms/步，主机侧我们快 12 ms/步。
 精度：投机 12w 全量门 161/163 = 98.77%（空答案 0）。详见 `/workspace/clean-stack/PERF_RECORD.md`。
+
+## decode/verify paged attention（2026-11-15，实验，默认关）
+
+口径：Qwen3.8-27B、40 请求单波 2k/2k、TEMP=0、40/40、重启后第一轮、CUDA graph。
+
+- **产线 0.5.18 的 decode/verify 也用 `paged_attention_combine_parallel`**。`logs/fk_kernels_prod.tsv`
+  里 595 次 `paged_attention_kernel_fp8_opt` 203.78 µs 配 595 次
+  `paged_attention_combine_parallel` 30.03 µs；单次 `paged_attention_combine` 9.51 µs 只与
+  非 opt 的 `paged_attention_kernel_fp8`（166.23 µs）配对。parallel/单次跟随主核族，
+  `num_splits` 与 `max_seqlen_k` 都改不了它（wheel 的两个入口都不把 `num_splits` 传给
+  `paged_attention`；launcher 把 ≤10 或 >8192 的 `max_seqlen_k` 归一到 meanseq）。
+- graph 真实负载下用时间戳对拍（绕开 trace 时长错位一格，每次主核到 combine 后一个事件
+  的 span）：产线 0.5.18 `ab_prod518_clean`（40/40）231.1 µs、我们 bshd 251.8 µs、
+  bhsd(HND) 259.4 µs，splitkv 350.9 µs。产线 custom 布局仍快我们 20–28 µs/次；
+  microbench 的 144–226 µs（`logs/pa_real_pool_bench.log`）是紧凑池/窄页表的乐观值。
+- 四臂（同一 worktree、重启后第一轮、均 40/40）：
+
+  | 臂 | tok/s | Mean TPOT | Mean ITL | 主核 |
+  |---|---:|---:|---:|---|
+  | baseline splitkv（NHD） | 1075.97 | 26.85 | 103.88 | `flash_fwd_splitkv_fp8_gfx938` |
+  | bshd（NHD） | 1161.57 | 26.10 | 102.42 | `paged_attention_kernel_bshd_fp8_opt` |
+  | HND（bhsd） | 1087.02 | 26.36 | 101.98 | `paged_attention_kernel_bhsd_fp8_opt` |
+  | custom（plugin HCU 池） | 962.88 | 31.54 | 122.24 | `paged_attention_kernel_fp8_opt` |
+
+  attention 换核把 ITL 降了 ~1.9 ms/step（与 19 次 × ~90 µs 的核差一致），TPOT 只降 ~0.5：
+  TPOT = step_time/(1+accept)，实测 ITL/TPOT 在四臂为 3.87–3.92，即每步约 3.9 个 token，
+  ~1.9 ms 的步时收益只能折成 ~0.5 ms TPOT。
+- `SGLANG_USE_HND_KVCACHE=1` 用官方 page-major 池；插件按 stride 识别
+  `paged_kv_view` 的 HND 视图，还原物理 `[pages, heads, page, dim]` 后按 `layout="bhsd"`
+  调 wheel（prefill/decode/verify 全走 bhsd）。decode 与 torch 参考对拍 max_abs 4.3e-3，
+  三布局互相逐位相同（`logs/pa_layout_equiv.log`、`logs/pa_prefill_equiv.log`）。
+- plugin 的 HCU page-major 池（`SGLANG_KV_LAYOUT_HCU_FA=1`，V 转置布局）仍慢：TPOT 31.54，
+  与 08:10 的 31.90 一致，**继续默认关**。它走的是产线同款 custom 布局入口（未单独抓核
+  trace），代价在换池后的写路径/其它链路上，换 attention 核本身不是瓶颈。
+- T=0 400-token 贪心：splitkv 基线 sha `33bcb427…`、HND `18d075b4…`，臂内 2/2 稳定、文本连贯
+  （`logs/t0_base.log`、`logs/t0_hnd.log`）。换 paged 核与产线 custom paged 逐位一致、
+  与 splitkv 不同，这是允许的精度门口径。
+- 精度门（bshd 臂，`he_probe.py 9140 bshd 1`）：FAILS 7/9、CONTROLS 3/3，只挂
+  #47/#145（bf16 基线 3 轮 20/27、8/9）；#47 是题面陷阱、#145 基线也 0/3。
+  日志 `logs/he_bshd.log`。
 
 ## 未验证
 
