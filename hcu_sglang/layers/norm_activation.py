@@ -6,6 +6,7 @@ import logging
 from typing import Any, Callable, Optional
 
 import torch
+from sglang.srt.environ import envs
 
 from hcu_sglang.utils.detection import is_hcu
 
@@ -34,15 +35,12 @@ _ADD_RMS_MAX_N = 8192
 _FAST_FAILED = {"silu": False, "add_rms": False}
 
 
-def _enabled(name: str) -> bool:
-    from sglang.srt.environ import envs
+def _silu_enabled() -> bool:
+    return envs.SGLANG_HCU_FUSE_SILU.get()
 
-    field = getattr(envs, name, None)
-    if field is not None:
-        return bool(field.get())
-    from sglang.srt.utils import get_bool_env_var
 
-    return get_bool_env_var(name, default="false")
+def _add_rms_enabled() -> bool:
+    return envs.SGLANG_HCU_FUSE_ADD_RMS.get()
 
 
 if _HAS_TRITON:
@@ -160,7 +158,7 @@ def around_silu_and_mul_forward_cuda(
     if not is_hcu():
         return original(layer, x)
 
-    if _enabled("SGLANG_HCU_FUSE_SILU"):
+    if _silu_enabled():
         fast = _fast_silu_and_mul(x)
         if fast is not None:
             return fast
@@ -186,7 +184,7 @@ def around_gemma_forward_cuda(
     if (
         residual is not None
         and post_residual_addition is None
-        and _enabled("SGLANG_HCU_FUSE_ADD_RMS")
+        and _add_rms_enabled()
     ):
         fast = _fast_gemma_add_rmsnorm(
             x, residual, layer.weight.data, layer.variance_epsilon

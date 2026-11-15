@@ -32,3 +32,9 @@ AMAX_EPS = 1e-8
 UNQUANTIZED_LM_HEAD_METHODS = frozenset(
     {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod", "PackWeightMethod"}
 )
+
+# The wheel's direct paged decode branch only accepts these shapes
+# (flash_attn_interface.py: use_direct_paged / is_mtp).
+PAGED_DECODE_PAGE_SIZE = 64
+PAGED_VERIFY_MAX_Q = 16
+PAGED_VERIFY_Q_ROWS_PER_KV_HEAD = 64

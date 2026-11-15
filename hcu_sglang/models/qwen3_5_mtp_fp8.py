@@ -45,7 +45,7 @@ def _mtp_hbird_ops():
 
 
 class _MTPDraftLMHeadFP8Method:
-    def __init__(self, base, weight_fp8, weight_scale, hbird_gemm, hbird_max_m, out_rows):
+    def __init__(self, base, weight_fp8, weight_scale, hbird_gemm, hbird_max_m):
         self.base = base
         self.weight_fp8 = weight_fp8
         self.weight_scale = weight_scale
@@ -55,7 +55,9 @@ class _MTPDraftLMHeadFP8Method:
         # the CUDA-graph pool once per bs bucket (~0.4 GiB over bs 1..40) and
         # that is what pushed verify into OOM.
         self.out = torch.empty(
-            (out_rows, weight_fp8.shape[0]), dtype=torch.bfloat16, device=weight_fp8.device
+            (hbird_max_m, weight_fp8.shape[0]),
+            dtype=torch.bfloat16,
+            device=weight_fp8.device,
         )
 
     def apply(self, layer, x: torch.Tensor, bias=None) -> torch.Tensor:
@@ -202,12 +204,7 @@ def install(model) -> bool:
         _MTPDraftLMHeadFP8Proxy(
             head,
             _MTPDraftLMHeadFP8Method(
-                head,
-                weight_fp8,
-                weight_scale,
-                hbird_gemm,
-                hbird_max_m,
-                hbird_max_m,
+                head, weight_fp8, weight_scale, hbird_gemm, hbird_max_m
             ),
         ),
     )
@@ -219,7 +216,8 @@ def install(model) -> bool:
         weight.shape[1],
         time.perf_counter() - started,
         weight.numel() * weight.element_size() / BYTES_PER_GIB,
-        (weight_fp8.numel() + weight_scale.numel() * 4) / BYTES_PER_GIB,
+        (weight_fp8.numel() + weight_scale.numel() * weight_scale.element_size())
+        / BYTES_PER_GIB,
         hbird_max_m,
     )
     return True

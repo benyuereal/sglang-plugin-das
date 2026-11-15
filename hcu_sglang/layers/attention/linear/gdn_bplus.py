@@ -9,6 +9,7 @@ import os
 import torch
 
 from hcu_sglang.constants import SEED_SCRATCH_MIN_ROWS, SLOT_BUFFER_SLACK
+from hcu_sglang.layers.attention.linear import gdn_hip_bplus
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +465,6 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 snap32 = torch.arange(
                     n, dtype=torch.int32, device=state_indices.device
                 )
-        from hcu_sglang.layers.attention.linear import gdn_hip_bplus
 
         idx32 = state_indices.to(torch.int32)
         last32 = last_correct.to(torch.int32)
@@ -573,8 +573,6 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     """One launch covers every layer when their layout matches the table."""
     if len(rows) < 2:
         return False
-    from hcu_sglang.layers.attention.linear import gdn_hip_bplus
-
     ent0 = rows[0][0]
     dims = tuple(int(ent0[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv"))
     qh, qk, kh, kk, vh, vv = dims
@@ -601,6 +599,7 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
                 cs != cache_steps
                 or int(ent["q"].stride(0)) != strides[0]
                 or int(ent["a"].stride(0)) != strides[3]
+                or int(ent["b"].stride(0)) != strides[4]
             ):
                 return False
             cells.append(

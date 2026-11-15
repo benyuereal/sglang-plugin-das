@@ -6,6 +6,11 @@ from typing import Optional, Union
 
 import torch
 
+from hcu_sglang.constants import (
+    PAGED_DECODE_PAGE_SIZE,
+    PAGED_VERIFY_MAX_Q,
+    PAGED_VERIFY_Q_ROWS_PER_KV_HEAD,
+)
 from hcu_sglang.utils.detection import is_hcu, is_hcu_native_fp8_supported
 
 
@@ -104,7 +109,7 @@ def _direct_paged_eligible(
     The NHD pool is [pages, page_size, heads, dim], which is exactly the bshd
     interpretation: page size from dim 1, head count from dim -2. The wheel
     keeps decode and MTP-packed verify (q rows == bs * max_seqlen_q) on the
-    paged kernel only for page size 64 and q/k head dims that match.
+    paged kernel only for page size 64 and q/v head dims that match.
     """
     if not _paged_bshd_enabled() or _layout_enabled():
         return False
@@ -119,7 +124,11 @@ def _direct_paged_eligible(
     page_size = k_cache.shape[1]
     nheads_q, head_dim_qk = q.shape[-2], q.shape[-1]
     nheads_kv = k_cache.shape[-2]
-    if page_size != 64 or nheads_kv <= 0 or head_dim_qk != v_cache.shape[-1]:
+    if (
+        page_size != PAGED_DECODE_PAGE_SIZE
+        or nheads_kv <= 0
+        or head_dim_qk != v_cache.shape[-1]
+    ):
         return False
     if nheads_q % nheads_kv:
         return False
@@ -129,7 +138,9 @@ def _direct_paged_eligible(
     if q.shape[0] != bs * max_seqlen_q:
         return False
     return max_seqlen_q == 1 or (
-        1 < max_seqlen_q < 16 and max_seqlen_q * nheads_q <= 64 * nheads_kv
+        1 < max_seqlen_q < PAGED_VERIFY_MAX_Q
+        and max_seqlen_q * nheads_q
+        <= PAGED_VERIFY_Q_ROWS_PER_KV_HEAD * nheads_kv
     )
 
 

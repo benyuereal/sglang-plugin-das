@@ -109,7 +109,6 @@ def convert_model(model, runner=None):
             freed += int(weight.numel()) * int(weight.element_size())
             handle = backend.pack(weight)
             backend.release(module, handle)
-            module._hbird_dbg_name = name
             shapes[(int(handle.N), int(handle.K))] = weight.device
             converted += 1
         except Exception as exc:  # noqa: BLE001

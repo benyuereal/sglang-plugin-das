@@ -10,11 +10,11 @@ import os
 
 import torch
 
-# 默认恢复为 **gdn_exp.so**（B+ 原本使用的核）。逐位版 gdn_bw_ship.so 只给
-# kernel-only 那条线用（SGLANG_GDN_HIP_KERNEL=1 时由调用方显式指定），
-# 不再作为这里的默认值 —— 2026-11-11 起 B+ 与 kernel-only 的核彻底解耦。
+# The B+ entries (single-layer and the one-launch multi) live in this build;
+# the per-layer `gdn_bw_ship.so` is kernel-only lineage and has no multi entry,
+# so it is never the default here.
 _DEFAULT_SO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "lib", "gdn_bw_ship.so"
+    os.path.dirname(os.path.abspath(__file__)), "lib", "gdn_bplus_multi.so"
 )
 _BV = 32  # 与 gdn_recurrent.hip 的 BV 一致
 
