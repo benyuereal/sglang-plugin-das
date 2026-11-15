@@ -93,13 +93,6 @@ def around_init(original_fn, backend, *args, **kwargs):
     if fb_module is not None:
         fb_module.flash_attn_varlen_func = flash_attn_varlen_func
         fb_module.flash_attn_with_kvcache = flash_attn_with_kvcache
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_HCU_FA_PAGED_BSHD.get() and envs.SGLANG_HCU_FA_REAL_MAXK.get():
-        # The paged kernel's split count follows max_seqlen_k. Publish the
-        # host seq lengths so eager verify metadata carries the real bound
-        # instead of max_context_len; one small D2H per step.
-        backend.needs_cpu_seq_lens = True
     return result
 
 

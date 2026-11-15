@@ -100,8 +100,6 @@ class DirectPagedEligibilityTests(unittest.TestCase):
     def test_switch_is_off_by_default(self):
         defaults = _env_defaults(ROOT / "hcu_sglang/environ.py")
         self.assertEqual(defaults["SGLANG_HCU_FA_PAGED_BSHD"], False)
-        self.assertEqual(defaults["SGLANG_HCU_FA_MAX_SEQLEN_K"], 0)
-        self.assertEqual(defaults["SGLANG_HCU_FA_REAL_MAXK"], True)
         self.fi._paged_bshd_enabled = lambda: False
         self.assertFalse(self.eligible(40, 1))
 

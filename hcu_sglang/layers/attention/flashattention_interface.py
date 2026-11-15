@@ -211,19 +211,6 @@ def flash_attn_with_kvcache(
             window_size,
             softcap,
         ):
-            # The paged kernel turns max_seqlen_k into its split count; the
-            # page-table capacity (full context) over-splits, pushing work
-            # into the combine kernel. Prefer the real host bound when the
-            # scheduler publishes one, then any explicit override.
-            from sglang.srt.environ import envs
-
-            eff_maxk = page_capacity
-            if _current_max_seq_len_k:
-                eff_maxk = min(eff_maxk, _current_max_seq_len_k)
-            cap = envs.SGLANG_HCU_FA_MAX_SEQLEN_K.get()
-            if cap > 0:
-                eff_maxk = min(eff_maxk, cap)
-            varlen_kwargs["max_seqlen_k"] = eff_maxk
             # bshd selects the wheel's direct paged attention kernel for
             # decode and MTP verify; the vllm wrapper hardcodes "custom",
             # which misreads NHD pool shapes and falls back to split-KV.
