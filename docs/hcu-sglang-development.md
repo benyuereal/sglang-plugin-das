@@ -16,7 +16,7 @@
 | `SGLANG_GDN_HIP_BPLUS` + `_HANDOFF` + `_HANDOFF_SKIP_TRACK` | 脚本开启 | GDN verify 只写提交行，commit 只移指针 | 空答案 5/130 → 1/164；accept len 回到 2.50（T=0.2） |
 | `SGLANG_GDN_HIP_BPLUS_SKIP_FULL` | 1 | compensate 只重放截断槽，全接受槽跳过 | 受控 probe 100.5 → 93.2 ms/步 |
 | `SGLANG_GDN_HIP_BPLUS_MULTI` | 1 | 48 层 compensate 合并一次 launch；旧 .so 自动回退 | c40 上中性（<0.3 ms） |
-| B+ verify 每步共享索引（无开关，`gdn_bplus.shared_step_values`） | 开 | verify 的 `store`/`store_row`/h0/prev 只依赖 batch，不依赖层：48 层各算一遍改成整步算一次并复用持久 buffer；同时删掉只在写死字段、无人读的 `remember_step`/`tdev.fill_` | 离线 200 组随机逐位全等（`tests/test_gdn_bplus_step_shared.py`、`diag/gdnk_bitwise.py`）；eager 预期 −950 kernel/步，端到端待 GPU 窗口 |
+| B+ verify 每步共享索引（无开关，`gdn_bplus.shared_step_values`） | 开 | verify 的 `store`/`store_row`/h0/prev 只依赖 batch，不依赖层：48 层各算一遍改成整步算一次并复用持久 buffer；同时删掉只在写死字段、无人读的 `remember_step`/`tdev.fill_` | 离线 200 组随机逐位全等（`tests/test_gdn_bplus_step_shared.py`、`diag/gdnk_bitwise.py`）；GPU6 c40 单波 40/40、Mean TPOT 26.05、sha 与基线逐位相同；eager 2622 → 1677 kernel/步（B+ 零碎核 993 → 34/步，5.21 → 0.20 ms/步） |
 | HCU 自动 rejection sampling（无开关，`speculative_compat.py`） | 开 | 非贪心请求避免走缺头的 CUDA JIT；`SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 可关 | T=0.2 全量门可跑完 |
 
 ## 默认关闭（实验/A-B 用）
@@ -59,4 +59,4 @@
 - EAGLE topk>1 / deterministic inference 下 rejection sampling 保持关闭（未测）。
 - `SGLANG_ENABLE_PP_SPEC` 的 stable-rows 分支未验证。
 - 多卡 / TP>1 未验证。
-- B+ 每步共享索引（2026-11-15）：离线逐位已过，端到端 TPOT/sha 与 CUDA graph 多桶共享受持久 buffer 尚未在硬件上验证；窗口脚本 `clean-stack/gdnk_window.sh`。
+- B+ 每步共享索引（2026-11-15）：c40 graph bench（40 桶全部捕获）40/40 且 sha 逐位相同，剩余未验证为非 handoff 分支的硬件 A/B 与 PP/TP 场景；窗口脚本 `clean-stack/gdnk_window.sh`。
