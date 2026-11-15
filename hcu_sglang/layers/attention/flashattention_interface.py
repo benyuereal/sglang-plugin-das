@@ -58,6 +58,57 @@ def _restore_hcu_cache_layout(k_cache: torch.Tensor, v_cache: torch.Tensor):
     )
 
 
+def _paged_bshd_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_HCU_FA_PAGED_BSHD.get()
+
+
+def _direct_paged_eligible(
+    q,
+    k_cache,
+    v_cache,
+    cu_seqlens_q,
+    max_seqlen_q,
+    page_table,
+    cache_seqlens,
+    window_size,
+    softcap,
+) -> bool:
+    """Whether the wheel's layout="bshd" branch reaches its direct paged kernel.
+
+    The NHD pool is [pages, page_size, heads, dim], which is exactly the bshd
+    interpretation: page size from dim 1, head count from dim -2. The wheel
+    keeps decode and MTP-packed verify (q rows == bs * max_seqlen_q) on the
+    paged kernel only for page size 64 and q/k head dims that match.
+    """
+    if not _paged_bshd_enabled() or _layout_enabled():
+        return False
+    if max_seqlen_q is None or softcap != 0.0:
+        return False
+    if window_size is not None and tuple(window_size) != (-1, -1):
+        return False
+    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.ndim != 4:
+        return False
+    if page_table is None or not torch.is_tensor(cache_seqlens):
+        return False
+    page_size = k_cache.shape[1]
+    nheads_q, head_dim_qk = q.shape[-2], q.shape[-1]
+    nheads_kv = k_cache.shape[-2]
+    if page_size != 64 or nheads_kv <= 0 or head_dim_qk != v_cache.shape[-1]:
+        return False
+    if nheads_q % nheads_kv:
+        return False
+    bs = cu_seqlens_q.numel() - 1
+    # q must be exactly the packed decode/MTP rows: the paged entry reshapes
+    # it to [bs, max_seqlen_q, heads, dim] and ignores cu_seqlens_q.
+    if q.shape[0] != bs * max_seqlen_q:
+        return False
+    return max_seqlen_q == 1 or (
+        1 < max_seqlen_q < 16 and max_seqlen_q * nheads_q <= 64 * nheads_kv
+    )
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -104,6 +155,7 @@ def flash_attn_with_kvcache(
     layout=None,
 ):
     from flash_attn import (
+        flash_attn_varlen_func as fa3_varlen_func,
         vllm_flash_attn_varlen_func,
         vllm_flash_attn_with_kvcache,
     )
@@ -130,7 +182,7 @@ def flash_attn_with_kvcache(
         )
         if q_descale is None and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
-        result = vllm_flash_attn_varlen_func(
+        varlen_kwargs = dict(
             q=q,
             k=k_cache,
             v=v_cache,
@@ -142,13 +194,42 @@ def flash_attn_with_kvcache(
             causal=causal,
             window_size=window_size,
             block_table=page_table,
-            fa_version=2,
             softcap=softcap,
             s_aux=sinks,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
         )
+        if _direct_paged_eligible(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            max_seqlen_q,
+            page_table,
+            cache_seqlens,
+            window_size,
+            softcap,
+        ):
+            # The paged kernel turns max_seqlen_k into its split count; the
+            # page-table capacity (full context) over-splits, pushing work
+            # into the combine kernel. Prefer the real host bound when the
+            # scheduler publishes one, then any explicit override.
+            from sglang.srt.environ import envs
+
+            eff_maxk = page_capacity
+            if _current_max_seq_len_k:
+                eff_maxk = min(eff_maxk, _current_max_seq_len_k)
+            cap = envs.SGLANG_HCU_FA_MAX_SEQLEN_K.get()
+            if cap > 0:
+                eff_maxk = min(eff_maxk, cap)
+            varlen_kwargs["max_seqlen_k"] = eff_maxk
+            # bshd selects the wheel's direct paged attention kernel for
+            # decode and MTP verify; the vllm wrapper hardcodes "custom",
+            # which misreads NHD pool shapes and falls back to split-KV.
+            result = fa3_varlen_func(layout="bshd", **varlen_kwargs)
+        else:
+            result = vllm_flash_attn_varlen_func(fa_version=2, **varlen_kwargs)
         return _apply_out(result, out, return_softmax_lse)
 
     q_4d = q

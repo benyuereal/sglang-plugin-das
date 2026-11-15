@@ -92,6 +92,15 @@ _ENV_SPECS: dict[str, tuple[type, Any]] = {
     # the default now; this layout stays for perf A/B with the vllm_-prefixed
     # HCU FA attention kernels that consume it.
     "SGLANG_KV_LAYOUT_HCU_FA": (EnvBool, False),
+    # Route NHD-pool decode/MTP-verify varlen calls to the wheel's direct
+    # paged kernel (layout="bshd"). Changes T=0 output: different kernel.
+    "SGLANG_HCU_FA_PAGED_BSHD": (EnvBool, False),
+    # Cap the paged kernel's max_seqlen_k (0 = page-table capacity).
+    # Dispatch hint only; it moves work between the main and combine kernels.
+    "SGLANG_HCU_FA_MAX_SEQLEN_K": (EnvInt, 0),
+    # Publish seq_lens_cpu so the eager verify metadata carries the real
+    # max KV length instead of max_context_len (only with PAGED_BSHD).
+    "SGLANG_HCU_FA_REAL_MAXK": (EnvBool, True),
     # Fork-source JIT overlay: opt-in only. The adapter already owns DTK
     # compile-time shims for official sources; the overlay's global header
     # shadowing breaks official-source JIT builds in stacked runs.

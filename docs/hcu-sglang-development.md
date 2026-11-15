@@ -26,6 +26,9 @@
 | `SGLANG_GDN_ZBA_STRIDED` | 0 | z/b 保持 strided；与上项同开才不亏 |
 | `SGLANG_GDN_HIP_KERNEL` | 0 | kernel-only 线（非 B+）；默认关 |
 | `SGLANG_FORCE_MM_FAST_PROCESSOR_GPU` | 0 | 打开会让 tokenizer 进程建第二个 CUDA context（HCU 驱动 runlist 超订），**不要开** |
+| `SGLANG_HCU_FA_PAGED_BSHD` | 0 | decode/MTP-verify 走 wheel `layout="bshd"` 直连 paged 核（NHD 池无需换布局）。**改变 T=0 输出**：与 splitkv 不是同一数值实现；40/40、TPOT 26.90→26.42 |
+| `SGLANG_HCU_FA_MAX_SEQLEN_K` | 0 | paged 核的 max_seqlen_k 上限（0=页表容量）。只挪 split/combine 的工作分配，不换核 |
+| `SGLANG_HCU_FA_REAL_MAXK` | 1 | 仅 `PAGED_BSHD=1` 时生效：发布 seq_lens_cpu，让 eager verify 的 max_seq_len_k 用真实 KV 上限而不是 max_context_len |
 
 ## 已确认的坑（会崩/会错，不是性能问题）
 
@@ -49,6 +52,20 @@
 
 差距分解：verify +30.6 ms/步、draft_extend +15.0 ms/步，主机侧我们快 12 ms/步。
 精度：投机 12w 全量门 161/163 = 98.77%（空答案 0）。详见 `/workspace/clean-stack/PERF_RECORD.md`。
+
+## decode/verify paged attention（2026-11-15，实验，默认关）
+
+口径：Qwen3.8-27B、40 请求单波 2k/2k、TEMP=0、40/40。
+
+- `SGLANG_HCU_FA_PAGED_BSHD=1`：decode 用 `paged_attention_kernel_fp8_bshd`，verify 用
+  `paged_attention_kernel_bshd_fp8_opt` + `paged_attention_combine_parallel`；核确实换掉。
+- 吞吐 1127.40 tok/s、Mean TPOT 26.42、Mean ITL 102.48（splitkv 基线 1080.36 / 26.90 / 104.59）。
+- **T=0 sha 变为 `e0b0cfdf…`**（基线 `3a3b7d3c…`），文本仍连贯、差异是选词级抖动的累积：
+  合成对拍证明 bshd paged 与产线 custom(HND) paged 逐位相同、与 splitkv 不同，即换 paged 核
+  必然改 T=0 输出，除非把逐位门换成精度门。
+- 每 verify 步 attention：本改动 4.28 ms（主核 0.33 + combine 3.95），产线 eager 3.97 ms
+  （主核 3.46 + combine 0.51）——总量只差 0.31 ms/步，combine 大是因为 split 多，主核相应更小。
+  因此单靠 attention 换核最多再赚 ~0.3 ms/步，无法补上到产线的 2.2 ms TPOT 差。
 
 ## 未验证
 
