@@ -12,16 +12,10 @@ import time
 
 import torch
 
-from hcu_sglang.constants import (
-    AMAX_EPS,
-    BYTES_PER_GIB,
-    FP8_ALIGN_ELEMS,
-    MTP_LMHEAD_QUANT_BLOCK,
-)
+from hcu_sglang.constants import AMAX_EPS, BYTES_PER_GIB, MTP_LMHEAD_QUANT_BLOCK
 
 logger = logging.getLogger(__name__)
 
-_MTP_LMHEAD_FP8_CHUNK_DEFAULT = 24576
 _MTP_LMHEAD_FP8_E4M3_MAX = 448.0
 _MTP_HBIRD_MAX_M_DEFAULT = 192
 
@@ -29,22 +23,6 @@ _MTP_HBIRD_MAX_M_DEFAULT = 192
 def _mtp_lmhead_fp8_enabled() -> bool:
     value = os.environ.get("SGLANG_MTP_LMHEAD_FP8", "0")
     return value.strip().lower() not in ("", "0", "false", "off")
-
-
-def _mtp_lmhead_fp8_chunk() -> int:
-    try:
-        chunk = int(os.environ.get("SGLANG_MTP_LMHEAD_FP8_CHUNK", ""))
-    except ValueError:
-        chunk = _MTP_LMHEAD_FP8_CHUNK_DEFAULT
-    if chunk <= 0:
-        chunk = _MTP_LMHEAD_FP8_CHUNK_DEFAULT
-    return max(
-        FP8_ALIGN_ELEMS, chunk - chunk % FP8_ALIGN_ELEMS
-    )
-
-
-def _mtp_lmhead_fp8_backend() -> str:
-    return os.environ.get("SGLANG_MTP_LMHEAD_FP8_BACKEND", "hbird").strip().lower()
 
 
 def _mtp_hbird_ops():
@@ -67,15 +45,17 @@ def _mtp_hbird_ops():
 
 
 class _MTPDraftLMHeadFP8Method:
-    def __init__(self, weight_fp8, weight_scale, chunk, hbird_gemm=None, hbird_max_m=0):
+    def __init__(self, base, weight_fp8, weight_scale, hbird_gemm, hbird_max_m):
+        self.base = base
         self.weight_fp8 = weight_fp8
         self.weight_scale = weight_scale
-        self.chunk = chunk
         self.hbird_gemm = hbird_gemm
         self.hbird_max_m = hbird_max_m
 
     def apply(self, layer, x: torch.Tensor, bias=None) -> torch.Tensor:
         assert bias is None, "draft fp8 lm_head does not support a bias"
+        if x.shape[0] > self.hbird_max_m:
+            return self.base(x)  # prefill-sized rows keep the bf16 head
         xf = x.to(torch.float32)
         xs = (
             xf.abs().amax(dim=-1, keepdim=True).clamp_min(AMAX_EPS)
@@ -86,25 +66,14 @@ class _MTPDraftLMHeadFP8Method:
         ).to(torch.float8_e4m3fn)
         vocab = self.weight_fp8.shape[0]
         out = torch.empty((x.shape[0], vocab), dtype=torch.bfloat16, device=x.device)
-        if self.hbird_gemm is not None and x.shape[0] <= self.hbird_max_m:
-            self.hbird_gemm(
-                xq,
-                self.weight_fp8,
-                xs,
-                self.weight_scale,
-                out=out,
-                prepare_shape=False,
-            )
-            return out
-        for i in range(0, vocab, self.chunk):
-            j = min(i + self.chunk, vocab)
-            out[:, i:j] = torch._scaled_mm(
-                xq,
-                self.weight_fp8[i:j].t(),
-                scale_a=xs,
-                scale_b=self.weight_scale[i:j].t(),
-                out_dtype=torch.bfloat16,
-            )
+        self.hbird_gemm(
+            xq,
+            self.weight_fp8,
+            xs,
+            self.weight_scale,
+            out=out,
+            prepare_shape=False,
+        )
         return out
 
 
@@ -146,8 +115,6 @@ def _mtp_quantize_lmhead_rows(weight: torch.Tensor):
 
 
 def _mtp_hbird_draft_head(weight_fp8: torch.Tensor, weight_scale: torch.Tensor):
-    if _mtp_lmhead_fp8_backend() in ("torch", "0", "false", "off", "no"):
-        return None, 0
     try:
         ops = _mtp_hbird_ops()
         vocab, hidden = weight_fp8.shape
@@ -167,7 +134,7 @@ def _mtp_hbird_draft_head(weight_fp8: torch.Tensor, weight_scale: torch.Tensor):
     except Exception as exc:  # noqa: BLE001 - optional path
         logger.info(
             "[mtp_draft_lmhead_fp8] hbird fp8 unavailable (%s); "
-            "staying on the chunked _scaled_mm path",
+            "draft head stays bf16",
             exc,
         )
         return None, 0
@@ -222,27 +189,25 @@ def install(model) -> bool:
         )
         return False
     hbird_gemm, hbird_max_m = _mtp_hbird_draft_head(weight_fp8, weight_scale)
-    chunk = _mtp_lmhead_fp8_chunk()
+    if hbird_gemm is None:
+        return False
     object.__setattr__(
         model,
         "lm_head",
         _MTPDraftLMHeadFP8Proxy(
             head,
-            _MTPDraftLMHeadFP8Method(
-                weight_fp8, weight_scale, chunk, hbird_gemm, hbird_max_m
-            ),
+            _MTPDraftLMHeadFP8Method(head, weight_fp8, weight_scale, hbird_gemm, hbird_max_m),
         ),
     )
     model._mtp_fp8_installed = True
     logger.info(
         "[mtp_draft_lmhead_fp8] draft head %d x %d -> e4m3, %.2fs, "
-        "%.2f -> %.2f GiB, chunk=%d, hbird_max_m=%d",
+        "%.2f -> %.2f GiB, hbird_max_m=%d",
         weight.shape[0],
         weight.shape[1],
         time.perf_counter() - started,
         weight.numel() * weight.element_size() / BYTES_PER_GIB,
         (weight_fp8.numel() + weight_scale.numel() * 4) / BYTES_PER_GIB,
-        chunk,
         hbird_max_m,
     )
     return True

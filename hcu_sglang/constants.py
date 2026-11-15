@@ -24,8 +24,7 @@ SKIPPED_LOG_LIMIT = 8
 # Row block the MTP draft head is quantized in.
 MTP_LMHEAD_QUANT_BLOCK = 4096
 
-# element alignment of the fp8 chunk size, and the amax floor used when scaling.
-FP8_ALIGN_ELEMS = 16
+# amax floor used when scaling fp8 activations and weights.
 AMAX_EPS = 1e-8
 
 # lm_head quant methods SGLang runs as plain bf16, so the packed-B path may serve
