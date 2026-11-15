@@ -57,14 +57,14 @@ class BplusState:
         self.step_gen = 0
         self.step_lid = -1
         self.step_cache = None
-        self.s64_buf = None
-        self.prev32_buf = None
-        self.prev64_buf = None
-        self.store_buf = None
+        self.s64_buf = {}
+        self.prev32_buf = {}
+        self.prev64_buf = {}
+        self.store_buf = {}
         self.row_bufs = {}
         self.h0_bufs = {}
-        self.tmp32_buf = None
-        self.tmp64_buf = None
+        self.tmp32_buf = {}
+        self.tmp64_buf = {}
 
 
 def state(backend) -> BplusState:
@@ -142,12 +142,14 @@ def seed_prev(
 
 
 def _step_buffer(st, name: str, rows: int, dtype, device) -> torch.Tensor:
-    """Persistent scratch: captures bake buffer addresses into the graph, so a
-    per-step allocation would leave older graphs pointing at freed memory."""
-    buf = getattr(st, name)
-    if buf is None or int(buf.numel()) < rows or buf.dtype != dtype or buf.device != device:
+    """Persistent scratch, one buffer per size: captures bake buffer addresses
+    into the graph, so a larger eager batch must never replace a buffer that a
+    captured graph still points at."""
+    bufs = getattr(st, name)
+    buf = bufs.get(rows)
+    if buf is None or buf.dtype != dtype or buf.device != device:
         buf = torch.empty(rows, dtype=dtype, device=device)
-        setattr(st, name, buf)
+        bufs[rows] = buf
     return buf
 
 
