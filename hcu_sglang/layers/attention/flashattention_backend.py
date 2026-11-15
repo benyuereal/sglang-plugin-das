@@ -86,6 +86,13 @@ def around_init(original_fn, backend, *args, **kwargs):
     backend.flash_attn_with_kvcache = flash_attn_with_kvcache
     backend._get_scheduler_metadata = None
     backend._get_fa_runtime_policy = None
+    # 0.5.22 binds both names at module import and the forward methods call those
+    # module globals, so the instance attributes above are not enough: without
+    # this the decode/verify path silently keeps the upstream FA3 kernels.
+    fb_module = sys.modules.get("sglang.srt.layers.attention.flashattention_backend")
+    if fb_module is not None:
+        fb_module.flash_attn_varlen_func = flash_attn_varlen_func
+        fb_module.flash_attn_with_kvcache = flash_attn_with_kvcache
     return result
 
 
