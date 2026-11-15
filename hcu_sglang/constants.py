@@ -27,12 +27,6 @@ MTP_LMHEAD_QUANT_BLOCK = 4096
 # amax floor used when scaling fp8 activations and weights.
 AMAX_EPS = 1e-8
 
-# lm_head quant methods SGLang runs as plain bf16, so the packed-B path may serve
-# them too; mirrors logits_processor._UNQUANTIZED_LM_HEAD_METHODS.
-UNQUANTIZED_LM_HEAD_METHODS = frozenset(
-    {"UnquantizedEmbeddingMethod", "UnquantizedLinearMethod", "PackWeightMethod"}
-)
-
 # The wheel's direct paged decode branch only accepts these shapes
 # (flash_attn_interface.py: use_direct_paged / is_mtp).
 PAGED_DECODE_PAGE_SIZE = 64

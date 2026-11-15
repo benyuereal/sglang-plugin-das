@@ -22,7 +22,7 @@
 | HCU 自动 rejection sampling（无开关，`speculative_compat.py`） | 开 | 非贪心请求避免走缺头的 CUDA JIT；`SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 可关 | T=0.2 全量门可跑完 |
 | `SGLANG_HCU_FUSE_QKVZBA_VERIFY` + `SGLANG_GDN_ZBA_STRIDED` | 1（HCU 默认） | verify 零拷贝 qkvzba 视图 + z/b 保持 strided，split 核消失 | 40/40 TPOT 27.01→26.67，T=0 sha 不变 |
 | `SGLANG_HCU_FUSE_SILU` | 1（HCU 默认） | Triton silu，保留两次 bf16 舍入，取代 lightop 编译核 | 全 shape 逐位对拍 0 mismatch；核 12.99→11.14 µs/call；40/40 TPOT 在噪声内 |
-| `SGLANG_HCU_FA_PAGED_BSHD` | 1（HCU 默认） | decode/MTP-verify 走 wheel `layout="bshd"` 直连 paged 核（NHD 池无需换布局）。**改变 T=0 输出**：与 splitkv 不是同一数值实现 | 40/40 TPOT 26.90→26.10；与产线 custom paged 逐位一致（`logs/pa_layout_equiv.log`）；精度门只挂 #47/#145，两者基线也红 |
+| `SGLANG_HCU_FA_PAGED_BSHD` | 脚本开启（代码默认 0） | decode/MTP-verify 走 wheel `layout="bshd"` 直连 paged 核（NHD 池无需换布局）。**改变 T=0 输出**：与 splitkv 不是同一数值实现 | 40/40 TPOT 26.90→26.10；与产线 custom paged 逐位一致（`logs/pa_layout_equiv.log`）；精度门只挂 #47/#145，两者基线也红 |
 | `SGLANG_MTP_LMHEAD_FP8`（`_BACKEND`/`_CHUNK`） | 脚本开启 | 只替换 draft 模型的 lm_head（target head 不动），e4m3 + hbird fp8 整词表一次 launch | fp8+bshd 40/40 TPOT 25.03、`logs/bench_fp8_bshd.log`。**依赖 `--mem-fraction-static` ≤0.86**：0.88 下 verify 采样 0 bytes free 直接 OOM；0.86 起精度门 19/27、9/9 |
 | `SGLANG_HCU_FUSE_ADD_RMS` | 1（HCU 默认） | 单遍 Gemma add-RMSNorm（x/r 各读一次、residual/x 各写一次） | 全 shape 逐位对拍 0 mismatch；核 18.88→17.14 µs/call（含两次拷贝）；全开 40/40 TPOT 26.58，默认配置（无 env）40/40 TPOT 26.51，T=0 sha 不变 |
 
