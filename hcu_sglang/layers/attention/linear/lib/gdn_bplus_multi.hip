@@ -53,6 +53,65 @@ __device__ __forceinline__ float grp_sum(float p) {
   return p;
 }
 
+// ---- 与 Triton 完全同序的归约树（同 gdn_recurrent_bitwise.hip）------------
+// aiter 的 tl.sum 在 BK=128 上按 32 个「k 组」（每组 4 个连续 k）归约：
+//   组内 d=0..3 顺序累加；32 组的 xor 树是 16,8,4,2,1。
+// 本核的 k 归属 k = 4g + 32c 正好把 Triton 线程 tk = g + 8c 的 4 个组放进
+// 同一 lane，所以 16/8 两级是 lane 内配对 —— (c0,c2) 与 (c1,c3) —— 只有
+// 4/2/1 三级是 8-lane shuffle，shuffle 数与原来的平铺链完全相同。
+static_assert(KL == 16, "bitwise 归约树按 KL=16（G=8）展开");
+// Triton 的 delta/o 归约里乘积是**独立**的 v_mul_f32，不能被后端折进 v_fma
+// （逐位对拍已证实：折了就 1 ULP 漂移，约 3/4 行中招）。
+#ifndef BPLUS_NOFOLD_ASM
+#define BPLUS_NOFOLD_ASM 1
+#endif
+__device__ __forceinline__ float mul_nofold(float a, float b) {
+#if BPLUS_NOFOLD_ASM
+  float d;
+  asm volatile("v_mul_f32 %0, %1, %2" : "=v"(d) : "v"(a), "v"(b));
+  return d;
+#else
+  return __fmul_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float sum4_seq(float x0, float x1, float x2, float x3) {
+  return __fadd_rn(__fadd_rn(__fadd_rn(x0, x1), x2), x3);
+}
+__device__ __forceinline__ float grp_tree(float g0, float g1, float g2, float g3) {
+  float s = __fadd_rn(__fadd_rn(g0, g2), __fadd_rn(g1, g3));
+  s = __fadd_rn(s, __shfl_xor(s, 4, 8));
+  s = __fadd_rn(s, __shfl_xor(s, 2, 8));
+  s = __fadd_rn(s, __shfl_xor(s, 1, 8));
+  return s;
+}
+
+// l2norm 的归约树：从缓存的 .llir 逐条还原（与 state 的树不同）
+//   叶子 q_i = x[2i] + x[2i+1]           —— 同一线程相邻两个 k
+//   组内 row_shr 8,4,2,1 的移位链      —— 每 16 个 q 一组，取组末 lane
+//   组间 (T0+T1)+(T2+T3)
+// 映射到 k = 4g+32c+d：Triton lane = 2g+16c+d/2，所以
+//   c ↔ 组，d/2 ↔ 组内 e；移位链在 g 方向是 g-4 / g-2 / g-1，
+//   最后一级 row_shr:1 是 e 翻转（同一个 lane 内）。
+// 只有 g==7 的 lane 拿到 T_c，再广播给 8-lane 组。
+__device__ __forceinline__ float norm_grp(float q0, float q1, int g) {
+  float t;
+  t = __shfl_up(q0, 4, 8); q0 = g >= 4 ? __fadd_rn(q0, t) : q0;
+  t = __shfl_up(q1, 4, 8); q1 = g >= 4 ? __fadd_rn(q1, t) : q1;
+  t = __shfl_up(q0, 2, 8); q0 = g >= 2 ? __fadd_rn(q0, t) : q0;
+  t = __shfl_up(q1, 2, 8); q1 = g >= 2 ? __fadd_rn(q1, t) : q1;
+  t = __shfl_up(q0, 1, 8); q0 = g >= 1 ? __fadd_rn(q0, t) : q0;
+  t = __shfl_up(q1, 1, 8); q1 = g >= 1 ? __fadd_rn(q1, t) : q1;
+  return __shfl(__fadd_rn(q1, q0), 7, 8);
+}
+
+#define NORM_SQ(x, y) __fadd_rn(__fmul_rn(x, x), __fmul_rn(y, y))
+
+// 产线 sglang 核（sglang.kernels.ops.attention.fla）用 1.0/tl.sqrt，编译成
+// v_sqrt_f32 + v_div_f32；aiter 的 tl.rsqrt 是 v_rsq_f32 近似，两者差 1 ULP。
+__device__ __forceinline__ float norm_inv(float x) {
+  return __fdiv_rn(1.0f, sqrtf(x));
+}
+
 // BPLUS：只写 store_step[i_n] 那一份快照（-1 = 该槽不写），并让无效槽（h0_idx<0）
 //        立即退出，使纠偏那一趟的成本正比于真正要补的槽数。默认 false，
 //        原有两个导出符号的行为逐字节不变。
@@ -234,13 +293,14 @@ __global__ __launch_bounds__(64 * WAVES, 2) void gdn_recurrent_update_kernel(
       eg = __expf(g_);
     }
 
-    // ---- l2norm(k) ------------------------------------------------------
+    // ---- l2norm(k)：Triton 的相邻配对 + 64-lane 树 -------------------------
     if (!PRENORM) {
-      float ss = __fmul_rn(kk[0], kk[0]);
-#pragma unroll
-      for (int j = 1; j < KL; ++j) ss = __fadd_rn(ss, __fmul_rn(kk[j], kk[j]));
-      ss = grp_sum(ss);
-      const float invk = rsqrtf(__fadd_rn(ss, 1e-6f));
+      const float t0 = norm_grp(NORM_SQ(kk[0], kk[1]), NORM_SQ(kk[2], kk[3]), g);
+      const float t1 = norm_grp(NORM_SQ(kk[4], kk[5]), NORM_SQ(kk[6], kk[7]), g);
+      const float t2 = norm_grp(NORM_SQ(kk[8], kk[9]), NORM_SQ(kk[10], kk[11]), g);
+      const float t3 = norm_grp(NORM_SQ(kk[12], kk[13]), NORM_SQ(kk[14], kk[15]), g);
+      const float ss = __fadd_rn(__fadd_rn(t0, t1), __fadd_rn(t2, t3));
+      const float invk = norm_inv(__fadd_rn(ss, 1e-6f));
 #pragma unroll
       for (int j = 0; j < KL; ++j) kk[j] = __fmul_rn(kk[j], invk);
     }
@@ -265,10 +325,15 @@ __global__ __launch_bounds__(64 * WAVES, 2) void gdn_recurrent_update_kernel(
     float part[VL];
 #pragma unroll
     for (int r = 0; r < VL; ++r) {
-      float s = __fmul_rn(h[0][r], kk[0]);
-#pragma unroll
-      for (int j = 1; j < KL; ++j) s = __fadd_rn(s, __fmul_rn(h[j][r], kk[j]));
-      part[r] = grp_sum(s);
+      part[r] = grp_tree(
+          sum4_seq(mul_nofold(h[0][r], kk[0]), mul_nofold(h[1][r], kk[1]),
+                   mul_nofold(h[2][r], kk[2]), mul_nofold(h[3][r], kk[3])),
+          sum4_seq(mul_nofold(h[4][r], kk[4]), mul_nofold(h[5][r], kk[5]),
+                   mul_nofold(h[6][r], kk[6]), mul_nofold(h[7][r], kk[7])),
+          sum4_seq(mul_nofold(h[8][r], kk[8]), mul_nofold(h[9][r], kk[9]),
+                   mul_nofold(h[10][r], kk[10]), mul_nofold(h[11][r], kk[11])),
+          sum4_seq(mul_nofold(h[12][r], kk[12]), mul_nofold(h[13][r], kk[13]),
+                   mul_nofold(h[14][r], kk[14]), mul_nofold(h[15][r], kk[15])));
     }
 
     // ---- v = (v - s) * sigmoid(b) ---------------------------------------
@@ -345,11 +410,12 @@ __global__ __launch_bounds__(64 * WAVES, 2) void gdn_recurrent_update_kernel(
             *reinterpret_cast<const uint2*>(pq + kstep * c);
 #pragma unroll
       for (int j = 0; j < KL; ++j) qq[j] = float(qb[j]);
-      float sq = __fmul_rn(qq[0], qq[0]);
-#pragma unroll
-      for (int j = 1; j < KL; ++j) sq = __fadd_rn(sq, __fmul_rn(qq[j], qq[j]));
-      sq = grp_sum(sq);
-      const float invq = rsqrtf(__fadd_rn(sq, 1e-6f));
+      const float t0 = norm_grp(NORM_SQ(qq[0], qq[1]), NORM_SQ(qq[2], qq[3]), g);
+      const float t1 = norm_grp(NORM_SQ(qq[4], qq[5]), NORM_SQ(qq[6], qq[7]), g);
+      const float t2 = norm_grp(NORM_SQ(qq[8], qq[9]), NORM_SQ(qq[10], qq[11]), g);
+      const float t3 = norm_grp(NORM_SQ(qq[12], qq[13]), NORM_SQ(qq[14], qq[15]), g);
+      const float sq = __fadd_rn(__fadd_rn(t0, t1), __fadd_rn(t2, t3));
+      const float invq = norm_inv(__fadd_rn(sq, 1e-6f));
 #pragma unroll
       for (int j = 0; j < KL; ++j) qq[j] = __fmul_rn(__fmul_rn(qq[j], invq), scale);
     }
@@ -358,10 +424,15 @@ __global__ __launch_bounds__(64 * WAVES, 2) void gdn_recurrent_update_kernel(
     float oacc[VL];
 #pragma unroll
     for (int r = 0; r < VL; ++r) {
-      float s = __fmul_rn(h[0][r], qq[0]);
-#pragma unroll
-      for (int j = 1; j < KL; ++j) s = __fadd_rn(s, __fmul_rn(h[j][r], qq[j]));
-      oacc[r] = grp_sum(s);
+      oacc[r] = grp_tree(
+          sum4_seq(mul_nofold(h[0][r], qq[0]), mul_nofold(h[1][r], qq[1]),
+                   mul_nofold(h[2][r], qq[2]), mul_nofold(h[3][r], qq[3])),
+          sum4_seq(mul_nofold(h[4][r], qq[4]), mul_nofold(h[5][r], qq[5]),
+                   mul_nofold(h[6][r], qq[6]), mul_nofold(h[7][r], qq[7])),
+          sum4_seq(mul_nofold(h[8][r], qq[8]), mul_nofold(h[9][r], qq[9]),
+                   mul_nofold(h[10][r], qq[10]), mul_nofold(h[11][r], qq[11])),
+          sum4_seq(mul_nofold(h[12][r], qq[12]), mul_nofold(h[13][r], qq[13]),
+                   mul_nofold(h[14][r], qq[14]), mul_nofold(h[15][r], qq[15])));
     }
     {
       hip_bfloat16 packed[VL];
@@ -467,19 +538,21 @@ __global__ __launch_bounds__(256, 2) void gdn_verify_norm_pass_kernel(
     kk[j] = float(kb[j]);
     qq[j] = float(qb[j]);
   }
-  float ss = __fmul_rn(kk[0], kk[0]);
-#pragma unroll
-  for (int j = 1; j < KL; ++j) ss = __fadd_rn(ss, __fmul_rn(kk[j], kk[j]));
-  ss = grp_sum(ss);
-  const float invk = rsqrtf(__fadd_rn(ss, 1e-6f));
+  const float tk0 = norm_grp(NORM_SQ(kk[0], kk[1]), NORM_SQ(kk[2], kk[3]), g);
+  const float tk1 = norm_grp(NORM_SQ(kk[4], kk[5]), NORM_SQ(kk[6], kk[7]), g);
+  const float tk2 = norm_grp(NORM_SQ(kk[8], kk[9]), NORM_SQ(kk[10], kk[11]), g);
+  const float tk3 = norm_grp(NORM_SQ(kk[12], kk[13]), NORM_SQ(kk[14], kk[15]), g);
+  const float ss = __fadd_rn(__fadd_rn(tk0, tk1), __fadd_rn(tk2, tk3));
+  const float invk = norm_inv(__fadd_rn(ss, 1e-6f));
 #pragma unroll
   for (int j = 0; j < KL; ++j) kk[j] = __fmul_rn(kk[j], invk);
 
-  float sq = __fmul_rn(qq[0], qq[0]);
-#pragma unroll
-  for (int j = 1; j < KL; ++j) sq = __fadd_rn(sq, __fmul_rn(qq[j], qq[j]));
-  sq = grp_sum(sq);
-  const float invq = rsqrtf(__fadd_rn(sq, 1e-6f));
+  const float tq0 = norm_grp(NORM_SQ(qq[0], qq[1]), NORM_SQ(qq[2], qq[3]), g);
+  const float tq1 = norm_grp(NORM_SQ(qq[4], qq[5]), NORM_SQ(qq[6], qq[7]), g);
+  const float tq2 = norm_grp(NORM_SQ(qq[8], qq[9]), NORM_SQ(qq[10], qq[11]), g);
+  const float tq3 = norm_grp(NORM_SQ(qq[12], qq[13]), NORM_SQ(qq[14], qq[15]), g);
+  const float sq = __fadd_rn(__fadd_rn(tq0, tq1), __fadd_rn(tq2, tq3));
+  const float invq = norm_inv(__fadd_rn(sq, 1e-6f));
   // 与原核同一顺序：先乘 invq，再乘 scale（调用方传入，与 verify 同一个值）。
 #pragma unroll
   for (int j = 0; j < KL; ++j)

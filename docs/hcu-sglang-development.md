@@ -17,6 +17,7 @@
 | `SGLANG_GDN_HIP_BPLUS_SKIP_FULL` | 1 | compensate 只重放截断槽，全接受槽跳过 | 受控 probe 100.5 → 93.2 ms/步 |
 | `SGLANG_GDN_HIP_BPLUS_MULTI` | 1 | 48 层 compensate 合并一次 launch；旧 .so 自动回退 | c40 上中性（<0.3 ms） |
 | B+ 纠偏核 4-wave CTA + `store_step` 早退（无开关，`launch_multi`） | 开 | 4 个 v-block 合进 256 线程 CTA（CTA 数 1/4），STATE_ONLY 循环截到 `store_step+1`；只影响纠偏，写出的提交行逐位不变 | 微基准 T=4：p=0.15 1.56→1.25 ms/步、p=0.3 2.96→2.30；提交行 452984832/452984832 全等 |
+| B+ verify 递推核算术对齐产线（无开关，`lib/gdn_bplus_multi.hip`） | 开 | l2norm/delta/o 三处 K=128 归约按产线 `sglang.kernels...fused_sigmoid_gating_recurrent` 的树展开；l2norm 倒数用 `1/sqrt`（产线 LLIR 是 `sqrt + fdiv`，aiter 是 `v_rsq_f32`）；B+ 只写提交行不变 | 内核级（GPU6/5）：B+ 写入行 == `gdn_recurrent_update_nofma` 全真；T=1 零态 + 恒定 q/k 对产线核逐位 100%；随机态 state 84.8%、o 99.995%（原 rsqrt 版 state 67.5%）；single/multi compensate 行 == verify 行。端到端 c40 单波 40/40：TPOT 24.49、吞吐 1190.41、accept 3.96–3.97（rate 0.99）；同栈 B+ 关 29.00 / 3.94。T=0 串行 sha 55c95e7e（同栈 B+ 关 a29e2610；任务给的 3a3b7d3c 属旧栈，今日 B+ 关也复现不出） |
 | B+ verify 每步共享索引（无开关，`gdn_bplus.shared_step_values`） | 开 | verify 的 `store`/`store_row`/h0/prev 只依赖 batch，不依赖层：48 层各算一遍改成整步算一次并复用持久 buffer；同时删掉只在写死字段、无人读的 `remember_step`/`tdev.fill_` | 离线 200 组随机逐位全等（`tests/test_gdn_bplus_step_shared.py`、`diag/gdnk_bitwise.py`）；GPU6 c40 单波 40/40、Mean TPOT 26.05、sha 与基线逐位相同；eager 2622 → 1677 kernel/步（B+ 零碎核 993 → 34/步，5.21 → 0.20 ms/步） |
 | HCU 自动 rejection sampling（无开关，`speculative_compat.py`） | 开 | 非贪心请求避免走缺头的 CUDA JIT；`SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 可关 | T=0.2 全量门可跑完 |
 
@@ -60,5 +61,6 @@
 - `SGLANG_ENABLE_PP_SPEC` 的 stable-rows 分支未验证。
 - 多卡 / TP>1 未验证。
 - B+ 每步共享索引（2026-11-15）：c40 graph bench（40 桶全部捕获）40/40 且 sha 逐位相同，剩余未验证为非 handoff 分支的硬件 A/B 与 PP/TP 场景；窗口脚本 `clean-stack/gdnk_window.sh`。
-- GDN verify prenorm 外提（2026-11-15）：只做了逐位微基准与 9170 smoke；c40 单波 40/40、T=0 sha、错误题重跑与 20:00 精度门待验收。非 handoff 分支、bs≤16 的 T=5 桶、TP/PP 未测。
+- GDN verify prenorm 外提（2026-11-15）：微基准 + 9170 smoke；本轮 B+ 逐位化后 GPU6 c40 单波 40/40（TPOT 24.49、accept 0.99）用的是 prenorm=1，但只跑了 1 轮；错误题重跑与 20:00 精度门仍待验收。非 handoff 分支、bs≤16 的 T=5 桶、TP/PP 未测。
+- GDN B+ 逐位化（2026-11-15）：B+ 行与 nofma 行逐位相同、accept/TPOT 达标；但随机 q/k 下 fp32 state 与产线 Triton 核仍有 ≤4 ULP 差（恒定 q/k 时 100%），倒数已按产线改成 `sqrt+fdiv`（LLIR/HSACO 已核对），恒定 q/k（和可精确相加）时对产线核 100%，故剩余在 l2norm 的求和顺序，尚未逐条对齐；T=0 串行 sha 因此与同栈 B+ 关键不同，也未复现任务给的 3a3b7d3c（同栈 B+ 关是 a29e2610）。
 - conv1d update 与 recurrent 核的融合未实现（评估约可再省 1.3–1.7 ms/步，风险在 intermediate_conv_window 回滚契约与 q/k 的 3 hv 共享）。

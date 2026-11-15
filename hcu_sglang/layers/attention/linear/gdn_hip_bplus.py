@@ -2,8 +2,9 @@
 
 B+ omits writes, not math: the chain, its reduction order and the accept rule
 are unchanged, and the row it does write matches the full-snapshot kernel bit
-for bit. This kernel is not bit-identical to aiter: three K=128 fp32 reductions
-are regrouped, giving <=64 ULP and a non-degrading match rate.
+for bit. The three K=128 fp32 reductions (l2norm, delta, o) and the 1/sqrt
+norm reciprocal reproduce the production Triton kernel
+(sglang.kernels.ops.attention.fla), not aiter's tl.rsqrt variant.
 """
 import ctypes
 import os
@@ -37,7 +38,7 @@ _ARGS = (
 
 # 全量快照入口 `gdn_recurrent_update_nofma`：同一个内核、同一份输入，只是
 # BPLUS=false —— 每步都落一份快照。B+ 的「纯写入省略」就该和它逐位相同，
-# 所以对拍必须用它当参考臂，而不是 aiter（aiter 与本核本就差几个 ULP）。
+# 所以对拍必须用它当参考臂；两者的算术都已对齐产线 Triton 核。
 _ARGS_FULL = (
     [ctypes.c_void_p] * 13
     + [ctypes.c_int] * 7
