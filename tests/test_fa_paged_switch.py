@@ -130,5 +130,28 @@ class DirectPagedEligibilityTests(unittest.TestCase):
         self.assertFalse(self.eligible(40, 1, cache_seqlens=100))
 
 
+class HndPageViewTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fi = _load_interface()
+
+    def test_contiguous_nhd_pool_is_not_hnd(self):
+        nhd = torch.zeros(8, 64, 4, 256)
+        self.assertFalse(self.fi._is_hnd_page_view(nhd))
+
+    def test_single_kv_head_nhd_is_not_hnd(self):
+        nhd = torch.zeros(8, 64, 1, 256)
+        self.assertFalse(self.fi._is_hnd_page_view(nhd))
+
+    def test_permuted_hnd_pool_is_detected_and_restored(self):
+        base = torch.arange(8 * 4 * 64 * 256, dtype=torch.float32).view(8, 4, 64, 256)
+        view = base.permute(0, 2, 1, 3)
+        self.assertTrue(self.fi._is_hnd_page_view(view))
+        k, v = self.fi._to_hnd_buffers(view, view)
+        self.assertTrue(k.is_contiguous() and v.is_contiguous())
+        self.assertEqual(tuple(k.shape), (8, 4, 64, 256))
+        self.assertTrue(torch.equal(k, base))
+
+
 if __name__ == "__main__":
     unittest.main()
