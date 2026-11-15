@@ -63,7 +63,9 @@ class _MTPDraftLMHeadFP8Method:
     def apply(self, layer, x: torch.Tensor, bias=None) -> torch.Tensor:
         assert bias is None, "draft fp8 lm_head does not support a bias"
         if x.shape[0] > self.hbird_max_m:
-            return self.base(x)  # prefill-sized rows keep the bf16 head
+            # ParallelLMHead.forward raises by design (the head's weight belongs
+            # to the sampler), so wide rows go through the weight directly.
+            return torch.matmul(x, self.base.weight.t())
         xf = x.to(torch.float32)
         xs = (
             xf.abs().amax(dim=-1, keepdim=True).clamp_min(AMAX_EPS)
