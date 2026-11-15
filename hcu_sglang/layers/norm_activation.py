@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Optional
 
 import torch
 
 from hcu_sglang.utils.detection import is_hcu
+
+logger = logging.getLogger(__name__)
 
 try:
     import triton
@@ -21,6 +24,9 @@ _SILU_WARPS = 8
 # One program per row with the whole row in registers; the gate below refuses
 # rows wider than this so a call never needs a second pass.
 _ADD_RMS_MAX_N = 8192
+# One-strike: a raising fast path is disabled for the process and the caller
+# falls back to the vendor kernel, so an opt-in knob can never wedge serving.
+_FAST_FAILED = {"silu": False, "add_rms": False}
 
 
 def _enabled(name: str) -> bool:
@@ -71,7 +77,7 @@ if _HAS_TRITON:
 
 
 def _fast_silu_and_mul(x: torch.Tensor) -> Optional[torch.Tensor]:
-    if not (
+    if _FAST_FAILED["silu"] or not (
         _HAS_TRITON
         and x.is_cuda
         and x.dtype == torch.bfloat16
@@ -85,9 +91,14 @@ def _fast_silu_and_mul(x: torch.Tensor) -> Optional[torch.Tensor]:
     n = x.shape[-1] // 2
     total = x.numel() // 2
     out = torch.empty((*x.shape[:-1], n), dtype=x.dtype, device=x.device)
-    _silu_mul_kernel[(triton.cdiv(total, _SILU_BLOCK),)](
-        x, out, total, n, _SILU_BLOCK, num_warps=_SILU_WARPS, num_stages=1
-    )
+    try:
+        _silu_mul_kernel[(triton.cdiv(total, _SILU_BLOCK),)](
+            x, out, total, n, _SILU_BLOCK, num_warps=_SILU_WARPS, num_stages=1
+        )
+    except Exception:
+        _FAST_FAILED["silu"] = True
+        logger.exception("[hcu-norm-act] fast silu disabled; using lightop")
+        return None
     return out
 
 
@@ -95,7 +106,7 @@ def _fast_gemma_add_rmsnorm(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     n = int(x.shape[-1]) if x.dim() else 0
-    if not (
+    if _FAST_FAILED["add_rms"] or not (
         _HAS_TRITON
         and x.is_cuda
         and residual.is_cuda
@@ -114,16 +125,21 @@ def _fast_gemma_add_rmsnorm(
     warps = 16 if block >= 4096 else (8 if block >= 1024 else 4)
     x_2d = x.view(-1, n)
     res_2d = residual.view(-1, n)
-    _gemma_add_rms_1pass_kernel[(x_2d.shape[0],)](
-        x_2d,
-        res_2d,
-        weight,
-        x_2d.stride(0),
-        n,
-        eps,
-        BLOCK=block,
-        num_warps=warps,
-    )
+    try:
+        _gemma_add_rms_1pass_kernel[(x_2d.shape[0],)](
+            x_2d,
+            res_2d,
+            weight,
+            x_2d.stride(0),
+            n,
+            eps,
+            BLOCK=block,
+            num_warps=warps,
+        )
+    except Exception:
+        _FAST_FAILED["add_rms"] = True
+        logger.exception("[hcu-norm-act] fast add-rmsnorm disabled; using vendor")
+        return None
     return x, residual
 
 
