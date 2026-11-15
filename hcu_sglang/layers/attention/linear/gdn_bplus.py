@@ -515,9 +515,10 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     if h0_plain is None:
                         h0_plain = torch.where(trunc, idx32, neg)
                     h0_idx = h0_plain
-                rows.append((ent, ssm, flat, h0_idx, stride))
+                rows.append((ent, ssm, flat, h0_idx, stride, lid))
             except Exception:  # noqa: BLE001 - optional path
                 logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
+                st.commit_failed = True
                 continue
         if not rows:
             return False
@@ -527,7 +528,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     return True
             except Exception:  # noqa: BLE001 - per-layer path is the fallback
                 logger.warning("[gdn-bplus] multi compensate failed", exc_info=True)
-        for ent, ssm, flat, h0_idx, cache_steps in rows:
+        for ent, ssm, flat, h0_idx, cache_steps, lid in rows:
             try:
                 gdn_hip_bplus.compensate(
                     ent["q"][:m].view(n, D, ent["qh"], ent["qk"]),
@@ -549,6 +550,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 )
             except Exception:  # noqa: BLE001 - optional path
                 logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
+                st.commit_failed = True
                 continue
         return True
     except Exception:  # noqa: BLE001
@@ -583,7 +585,7 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     table = st.ml_table
     if table is None or st.ml_key != key:
         cells = []
-        for ent, ssm, flat, h0_idx, cs in rows:
+        for ent, ssm, flat, h0_idx, cs, _ in rows:
             if tuple(int(ent[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv")) != dims:
                 return False
             if (

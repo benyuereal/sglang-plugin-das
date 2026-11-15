@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Callable
 
 import torch
+from sglang.srt.environ import envs
 
 from hcu_sglang.utils.detection import is_hcu
 
@@ -49,7 +49,7 @@ def around_handle_eagle_family(
 
     from hcu_sglang.server_args_hooks import _declare_values
 
-    if os.environ.get("SGLANG_HCU_AUTO_REJECTION_SAMPLING", "1") == "0":
+    if not envs.SGLANG_HCU_AUTO_REJECTION_SAMPLING.get():
         return result
     view = resolving_view(server_args)
     if (
@@ -97,7 +97,6 @@ def around_commit_mamba_states(
 
 
 def _get_dspark_ragged_settings():
-    from sglang.srt.environ import envs
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,

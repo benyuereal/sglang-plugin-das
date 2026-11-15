@@ -22,7 +22,16 @@ import torch
 
 from hcu_sglang.layers.attention.linear import gdn_bplus, gdn_hip_bplus
 
-import sglang.srt.layers.attention.linear.utils as _linutils
+
+
+def _lin_utils():
+    """L0 runs without sglang on the path; the GPU lane imports it."""
+    try:
+        import sglang.srt.layers.attention.linear.utils as module
+    except ImportError:
+        raise unittest.SkipTest("L0 lane has no sglang on the path")
+    return module
+
 
 # batch=2, draft width (capture_T)=3, one GDN layer, one stash entry.
 N = 2
@@ -58,15 +67,16 @@ def _backend():
 class PlainCompensateTest(unittest.TestCase):
     def setUp(self):
         self._handoff_ok = gdn_bplus._HANDOFF_OK
-        self._pp = getattr(_linutils, "pp_spec_stable_rows_enabled", None)
-        self._had_pp = hasattr(_linutils, "pp_spec_stable_rows_enabled")
+        self._linutils = _lin_utils()
+        self._pp = getattr(self._linutils, "pp_spec_stable_rows_enabled", None)
+        self._had_pp = hasattr(self._linutils, "pp_spec_stable_rows_enabled")
 
     def tearDown(self):
         gdn_bplus._HANDOFF_OK = self._handoff_ok
         if self._had_pp:
-            setattr(_linutils, "pp_spec_stable_rows_enabled", self._pp)
+            setattr(self._linutils, "pp_spec_stable_rows_enabled", self._pp)
         else:
-            delattr(_linutils, "pp_spec_stable_rows_enabled")
+            delattr(self._linutils, "pp_spec_stable_rows_enabled")
 
     def _run_plain(self, env):
         # Force the non-handoff (plain) branch: B+ on, handoff off.
@@ -78,7 +88,7 @@ class PlainCompensateTest(unittest.TestCase):
             }
         )
         gdn_bplus._HANDOFF_OK = None  # re-evaluate with the env above
-        _linutils.pp_spec_stable_rows_enabled = lambda: False
+        self._linutils.pp_spec_stable_rows_enabled = lambda: False
         backend = _backend()
         state_indices = torch.tensor([1, 2], dtype=torch.int64)
         last_correct = torch.tensor([1, -1], dtype=torch.int64)
