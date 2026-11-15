@@ -59,8 +59,29 @@ _ARGS_MULTI = (
     + [ctypes.c_void_p]
 )
 
+# norm pass：q/k/eg/beta 一次算完（每层一次 launch）。
+_ARGS_NORM = (
+    [ctypes.c_void_p] * 10
+    + [ctypes.c_int] * 9
+    + [ctypes.c_float] * 3
+    + [ctypes.c_void_p]
+)
+# PRENORM verify：在 `..._bplus` 的参数之后追加 qn/kn/eg/beta + stride + gate。
+_ARGS_PRENORM = (
+    [ctypes.c_void_p] * 13
+    + [ctypes.c_int]
+    + [ctypes.c_void_p] * 2
+    + [ctypes.c_int] * 11
+    + [ctypes.c_float] * 3
+    + [ctypes.c_int] * 3
+    + [ctypes.c_void_p] * 4
+    + [ctypes.c_int] * 3
+    + [ctypes.c_void_p]
+)
+
 _LIB = None
 _ERR = None
+_PRENORM_BUF = {}
 
 
 def lib():
@@ -83,6 +104,14 @@ def lib():
         if multi is not None:
             multi.argtypes = _ARGS_MULTI
             multi.restype = None
+        norm = getattr(h, "gdn_verify_norm_pass", None)
+        if norm is not None:
+            norm.argtypes = _ARGS_NORM
+            norm.restype = None
+        pre = getattr(h, "gdn_recurrent_update_bplus_prenorm", None)
+        if pre is not None:
+            pre.argtypes = _ARGS_PRENORM
+            pre.restype = None
         _LIB = h
     except Exception as e:  # noqa: BLE001 - 报清楚为什么没起来
         _ERR = f"[gdn-hip-bplus] 加载 {path} 失败: {e}"
@@ -96,6 +125,57 @@ def enabled() -> bool:
 
 def enabled_kernel() -> bool:
     return os.environ.get("SGLANG_GDN_HIP_KERNEL") == "1"
+
+
+def prenorm_enabled() -> bool:
+    """Hoist q/k l2norm + gating out of the 12x-redundant verify CTAs.
+
+    Needs the norm-pass entry; a .so built before that entry silently keeps the
+    old path instead of failing a serving start.
+    """
+    if os.environ.get("SGLANG_GDN_HIP_PRENORM") != "1":
+        return False
+    return getattr(lib(), "gdn_verify_norm_pass", None) is not None
+
+
+def prenorm_gate_enabled() -> bool:
+    """Also hoist softplus/sigmoid gating to per-(token,hv) eg/beta buffers."""
+    return os.environ.get("SGLANG_GDN_HIP_PRENORM_GATE", "1") == "1"
+
+
+def prenorm_buffers(rows: int, h: int, kdim: int, hv: int, device):
+    """Persistent scratch, one entry per size.
+
+    A captured graph bakes these addresses, so a later eager batch must never
+    replace an existing entry; ``rows`` is the pool's slot*D budget and stays
+    constant for the life of the process.  The buffer is consumed by the norm
+    pass of the very next verify launch on the same stream, so one shared
+    scratch serves every GDN layer.
+    """
+    key = (int(rows), int(h), int(kdim), int(hv), str(device))
+    ent = _PRENORM_BUF.get(key)
+    if ent is None:
+        qn = torch.empty((rows, h, kdim), dtype=torch.float32, device=device)
+        kn = torch.empty_like(qn)
+        eg = torch.empty((rows, hv), dtype=torch.float32, device=device)
+        beta = torch.empty_like(eg)
+        ent = (qn, kn, eg, beta)
+        _PRENORM_BUF[key] = ent
+    return ent
+
+
+def _norm_pass(q, k, a, b, A_log, dt_bias, qn, kn, eg, beta, hv):
+    h = int(q.shape[-2])
+    kdim = int(q.shape[-1])
+    getattr(lib(), "gdn_verify_norm_pass")(
+        q.data_ptr(), k.data_ptr(), a.data_ptr(), b.data_ptr(),
+        _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
+        qn.data_ptr(), kn.data_ptr(), eg.data_ptr(), beta.data_ptr(),
+        int(q.shape[1]) * h, h, int(hv), kdim, int(hv) // h,
+        _tok_stride(q), _tok_stride(k), _tok_stride(a), _tok_stride(b),
+        _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD, 1.0 / (kdim ** 0.5),
+        torch.cuda.current_stream().cuda_stream,
+    )
 
 
 def _tok_stride(x: torch.Tensor) -> int:
@@ -179,6 +259,35 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
             safe = snap_idx.to(torch.int64).clamp(0, int(prev_step.numel()) - 1)
             prev = prev_step.index_select(0, safe).to(torch.int32)
             store_row = torch.remainder(prev + 1, int(cache_steps)).to(torch.int32)
+    prenorm = prenorm_enabled() and snap_flat is not None
+    if prenorm:
+        hv = int(v.shape[-2])
+        h = int(q.shape[-2])
+        kdim = int(q.shape[-1])
+        rows = max(int(snap_flat.shape[0]), int(q.shape[1]))
+        qn, kn, eg, beta = prenorm_buffers(rows, h, kdim, hv, q.device)
+        _norm_pass(q, k, a, b, A_log, dt_bias, qn, kn, eg, beta, hv)
+        getattr(lib(), "gdn_recurrent_update_bplus_prenorm")(
+            q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(),
+            b.data_ptr(), _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
+            0 if cu_seqlens is None else cu_seqlens.data_ptr(),
+            ssm_states.data_ptr(), cache_indices.data_ptr(), o.data_ptr(),
+            0 if snap_flat is None else snap_flat.data_ptr(),
+            0 if snap_idx is None else snap_idx.data_ptr(),
+            int(cache_steps),
+            0 if store is None else store.data_ptr(),
+            0 if store_row is None else store_row.data_ptr(),
+            n, int(draft_token_num), hv, kdim, int(v.shape[-1]),
+            int(hv // h),
+            _tok_stride(q), _tok_stride(k), _tok_stride(v),
+            _tok_stride(a), _tok_stride(b),
+            1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
+            1, 0 if cu_seqlens is None else 1, 1,
+            qn.data_ptr(), kn.data_ptr(), eg.data_ptr(), beta.data_ptr(),
+            h * kdim, hv, 1 if prenorm_gate_enabled() else 0,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        return
     _call("gdn_recurrent_update_bplus", q, k, v, a, b, A_log, dt_bias,
           cu_seqlens, ssm_states, cache_indices, o, snap_flat, snap_idx,
           cache_steps, store, store_row, n, draft_token_num, v.shape[-2],

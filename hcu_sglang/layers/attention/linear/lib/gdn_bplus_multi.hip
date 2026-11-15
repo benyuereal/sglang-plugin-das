@@ -71,10 +71,11 @@ __device__ __forceinline__ float grp_sum(float p) {
 #define GDN_MULTI_COLS 15
 
 template <bool FMA_OUTER, bool BPLUS = false, bool STATE_ONLY = false,
-          bool MULTI = false>
+          bool MULTI = false, bool PRENORM = false, bool GATE = false,
+          int WAVES = 1>
 // 64 线程/块，最少 2 waves/SIMD。默认的 4 waves 会把 VGPR 压到 64 并溢出 334 个；
 // 放到 2 waves 后是 125 VGPR / 0 溢出，与 Triton 的 119 寄存器同量级。
-__global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
+__global__ __launch_bounds__(64 * WAVES, 2) void gdn_recurrent_update_kernel(
     const void* const* layer_ptrs,          // MULTI: [L, GDN_MULTI_COLS]
     const hip_bfloat16* __restrict__ q,     // [tokens, H,  K]
     const hip_bfloat16* __restrict__ k,     // [tokens, H,  K]
@@ -101,10 +102,16 @@ __global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
     int stride_q, int stride_k, int stride_v,
     int stride_a, int stride_b,
     const float scale, const float softplus_beta, const float softplus_threshold,
-    const int use_initial_state, const int varlen, const int disable_state_update) {
-  const int i_v = blockIdx.x;
+    const int use_initial_state, const int varlen, const int disable_state_update,
+    // PRENORM: l2norm 已由 gdn_verify_norm_pass 算好（fp32, [tokens,H,K] 稠密）；
+    // GATE: eg/beta 也已算好（fp32, [tokens,HV] 稠密）。非 PRENORM 传 nullptr。
+    const float* __restrict__ qn, const float* __restrict__ kn,
+    const float* __restrict__ eg_buf, const float* __restrict__ beta_buf,
+    const int stride_qn, const int stride_ab) {
+  const int i_v = (WAVES > 1) ? blockIdx.x * WAVES + (threadIdx.x >> 6)
+                              : blockIdx.x;
   const int i_nh = blockIdx.y;
-  const int lane = threadIdx.x;
+  const int lane = threadIdx.x & 63;
   const int g = lane & (G - 1);
   const int t1 = lane / G;
 
@@ -146,6 +153,13 @@ __global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
     bos = i_n * T;
     eos = bos + T;
   }
+  // 纠偏只写 step==store_step 那一行，之后的 token 不产生任何写出；终态写回
+  // 关闭时截断循环。verify（STATE_ONLY=false）不受影响。
+  int eos_eff = eos;
+  if (STATE_ONLY && BPLUS && disable_state_update && store_step != nullptr) {
+    const int ss = store_step[i_n];
+    if (ss >= 0 && ss + bos < eos) eos_eff = bos + ss + 1;
+  }
 
   // state: h[j][r] = h0[k = kbase + j, v = vbase + r]
   float h[KL][VL];
@@ -174,44 +188,64 @@ __global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
       for (int r = 0; r < VL; ++r) h[j][r] = 0.0f;
   }
 
-  const float bA = __expf(A_log[i_hv]);
-  const float dtb = dt_bias[i_hv];
-  const float inv_beta = 1.0f / softplus_beta;
+  float bA = 0.0f, dtb = 0.0f, inv_beta = 0.0f;
+  if (!GATE) {
+    bA = __expf(A_log[i_hv]);
+    dtb = dt_bias[i_hv];
+    inv_beta = 1.0f / softplus_beta;
+  }
 
-  for (int t = bos; t < eos; ++t) {
+  for (int t = bos; t < eos_eff; ++t) {
     // ---- k (pre-l2norm, bf16)，16 个 = 32 B -------------------------------
-    hip_bfloat16 kb[KL];
-    {
+    float kk[KL];
+    if (PRENORM) {
+      const float* pk = kn + (long)t * stride_qn + i_h * K + kbase;
+#pragma unroll
+      for (int c = 0; c < KL / 4; ++c) {
+        const float4 t4 = *reinterpret_cast<const float4*>(pk + kstep * c);
+        kk[4 * c + 0] = t4.x;
+        kk[4 * c + 1] = t4.y;
+        kk[4 * c + 2] = t4.z;
+        kk[4 * c + 3] = t4.w;
+      }
+    } else {
+      hip_bfloat16 kb[KL];
       const hip_bfloat16* pk = k + (long)t * stride_k + i_h * K + kbase;
 #pragma unroll
       for (int c = 0; c < KL / 4; ++c)
         *reinterpret_cast<uint2*>(kb + 4 * c) =
             *reinterpret_cast<const uint2*>(pk + kstep * c);
-    }
-    float kk[KL];
 #pragma unroll
-    for (int j = 0; j < KL; ++j) kk[j] = float(kb[j]);
+      for (int j = 0; j < KL; ++j) kk[j] = float(kb[j]);
+    }
 
     // ---- gating: x = a + dt_bias; softplus; g = -exp(A_log) * x ----------
-    const float av = float(a[(long)t * stride_a + i_hv]);
-    float x = __fadd_rn(av, dtb);
-    const float xs = __fmul_rn(softplus_beta, x);
-    if (xs <= softplus_threshold) {
-      x = __fmul_rn(inv_beta, __logf(__fadd_rn(1.0f, __expf(xs))));
+    float eg;
+    if (GATE) {
+      eg = eg_buf[(long)t * stride_ab + i_hv];
+    } else {
+      const float av = float(a[(long)t * stride_a + i_hv]);
+      float x = __fadd_rn(av, dtb);
+      const float xs = __fmul_rn(softplus_beta, x);
+      if (xs <= softplus_threshold) {
+        x = __fmul_rn(inv_beta, __logf(__fadd_rn(1.0f, __expf(xs))));
+      }
+      const float g_ = __fmul_rn(-bA, x);
+      eg = __expf(g_);
     }
-    const float g_ = __fmul_rn(-bA, x);
 
     // ---- l2norm(k) ------------------------------------------------------
-    float ss = __fmul_rn(kk[0], kk[0]);
+    if (!PRENORM) {
+      float ss = __fmul_rn(kk[0], kk[0]);
 #pragma unroll
-    for (int j = 1; j < KL; ++j) ss = __fadd_rn(ss, __fmul_rn(kk[j], kk[j]));
-    ss = grp_sum(ss);
-    const float invk = rsqrtf(__fadd_rn(ss, 1e-6f));
+      for (int j = 1; j < KL; ++j) ss = __fadd_rn(ss, __fmul_rn(kk[j], kk[j]));
+      ss = grp_sum(ss);
+      const float invk = rsqrtf(__fadd_rn(ss, 1e-6f));
 #pragma unroll
-    for (int j = 0; j < KL; ++j) kk[j] = __fmul_rn(kk[j], invk);
+      for (int j = 0; j < KL; ++j) kk[j] = __fmul_rn(kk[j], invk);
+    }
 
     // ---- h *= exp(g) ----------------------------------------------------
-    const float eg = __expf(g_);
 #pragma unroll
     for (int j = 0; j < KL; ++j)
 #pragma unroll
@@ -238,8 +272,13 @@ __global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
     }
 
     // ---- v = (v - s) * sigmoid(b) ---------------------------------------
-    const float bv = float(b[(long)t * stride_b + i_hv]);
-    const float beta = 1.0f / (1.0f + __expf(-bv));
+    float beta;
+    if (GATE) {
+      beta = beta_buf[(long)t * stride_ab + i_hv];
+    } else {
+      const float bv = float(b[(long)t * stride_b + i_hv]);
+      beta = 1.0f / (1.0f + __expf(-bv));
+    }
 #pragma unroll
     for (int r = 0; r < VL; ++r)
       vv_[r] = __fmul_rn(__fadd_rn(vv_[r], -part[r]), beta);
@@ -286,24 +325,34 @@ __global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
 
     if (!STATE_ONLY) {
     // ---- q，同一套归一化 ------------------------------------------------
-    hip_bfloat16 qb[KL];
-    {
+    float qq[KL];
+    if (PRENORM) {
+      const float* pq = qn + (long)t * stride_qn + i_h * K + kbase;
+#pragma unroll
+      for (int c = 0; c < KL / 4; ++c) {
+        const float4 t4 = *reinterpret_cast<const float4*>(pq + kstep * c);
+        qq[4 * c + 0] = t4.x;
+        qq[4 * c + 1] = t4.y;
+        qq[4 * c + 2] = t4.z;
+        qq[4 * c + 3] = t4.w;
+      }
+    } else {
+      hip_bfloat16 qb[KL];
       const hip_bfloat16* pq = q + (long)t * stride_q + i_h * K + kbase;
 #pragma unroll
       for (int c = 0; c < KL / 4; ++c)
         *reinterpret_cast<uint2*>(qb + 4 * c) =
             *reinterpret_cast<const uint2*>(pq + kstep * c);
+#pragma unroll
+      for (int j = 0; j < KL; ++j) qq[j] = float(qb[j]);
+      float sq = __fmul_rn(qq[0], qq[0]);
+#pragma unroll
+      for (int j = 1; j < KL; ++j) sq = __fadd_rn(sq, __fmul_rn(qq[j], qq[j]));
+      sq = grp_sum(sq);
+      const float invq = rsqrtf(__fadd_rn(sq, 1e-6f));
+#pragma unroll
+      for (int j = 0; j < KL; ++j) qq[j] = __fmul_rn(__fmul_rn(qq[j], invq), scale);
     }
-    float qq[KL];
-#pragma unroll
-    for (int j = 0; j < KL; ++j) qq[j] = float(qb[j]);
-    float sq = __fmul_rn(qq[0], qq[0]);
-#pragma unroll
-    for (int j = 1; j < KL; ++j) sq = __fadd_rn(sq, __fmul_rn(qq[j], qq[j]));
-    sq = grp_sum(sq);
-    const float invq = rsqrtf(__fadd_rn(sq, 1e-6f));
-#pragma unroll
-    for (int j = 0; j < KL; ++j) qq[j] = __fmul_rn(__fmul_rn(qq[j], invq), scale);
 
     // ---- o[r] = sum_k h[k,r] * q[k] --------------------------------------
     float oacc[VL];
@@ -340,6 +389,138 @@ __global__ __launch_bounds__(64, 2) void gdn_recurrent_update_kernel(
   }
 }
 
+
+// PRENORM verify 的 host 入口：q/k 已由 norm pass 归一化成 fp32。
+template <bool GATE>
+static void launch_prenorm(const void* q, const void* k, const void* v,
+                           const void* a, const void* b, const void* A_log,
+                           const void* dt_bias, const void* cu_seqlens,
+                           void* h0_source, const void* h0_indices, void* o,
+                           void* snap_buf, const void* snap_idx, int cache_steps,
+                           const void* store_step, const void* store_row,
+                           int N, int T, int HV, int K, int V, int hratio,
+                           int stride_q, int stride_k, int stride_v,
+                           int stride_a, int stride_b, float scale,
+                           float softplus_beta, float softplus_threshold,
+                           int use_initial_state, int varlen,
+                           int disable_state_update, const void* qn,
+                           const void* kn, const void* eg_buf,
+                           const void* beta_buf, int stride_qn, int stride_ab,
+                           hipStream_t stream) {
+  dim3 grid(V / BV, N * HV);
+  dim3 block(64);
+  gdn_recurrent_update_kernel<true, true, false, false, true, GATE, 1>
+      <<<grid, block, 0, stream>>>(
+      nullptr,
+      (const hip_bfloat16*)q, (const hip_bfloat16*)k, (const hip_bfloat16*)v,
+      (const hip_bfloat16*)a, (const hip_bfloat16*)b, (const float*)A_log,
+      (const float*)dt_bias, (const int*)cu_seqlens, (float*)h0_source,
+      (const int*)h0_indices, (hip_bfloat16*)o, (float*)snap_buf,
+      (const int*)snap_idx, cache_steps, (const int*)store_step,
+      (const int*)store_row, T, HV, K, V, hratio, stride_q, stride_k, stride_v,
+      stride_a, stride_b, scale, softplus_beta, softplus_threshold,
+      use_initial_state, varlen, disable_state_update, (const float*)qn,
+      (const float*)kn, (const float*)eg_buf, (const float*)beta_buf,
+      stride_qn, stride_ab);
+}
+
+// ---------------------------------------------------------------------------
+// norm pass：每个 wave 一个 (token, head)，算 q/k 的 l2norm（fp32 稠密输出）
+// 以及该 head 对应的 hratio 个 hv 的 eg/beta。算术表达式与 verify 核逐条一致。
+// ---------------------------------------------------------------------------
+__global__ __launch_bounds__(256, 2) void gdn_verify_norm_pass_kernel(
+    const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k,
+    const hip_bfloat16* __restrict__ a, const hip_bfloat16* __restrict__ b,
+    const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+    float* __restrict__ qn, float* __restrict__ kn,
+    float* __restrict__ eg_out, float* __restrict__ beta_out,
+    int n_units, int H, int HV, int K, int hratio, int stride_q, int stride_k,
+    int stride_a, int stride_b, float softplus_beta,
+    float softplus_threshold, float scale) {
+  const int wave = threadIdx.x >> 6;
+  const int lane = threadIdx.x & 63;
+  const int unit = blockIdx.x * 4 + wave;
+  if (unit >= n_units) return;
+  const int h = unit % H;
+  const int t = unit / H;
+  const int g = lane & (G - 1);
+  const int t1 = lane / G;
+
+  hip_bfloat16 kb[KL], qb[KL];
+  {
+    const hip_bfloat16* pk = k + (long)t * stride_k + h * K + 4 * g;
+#pragma unroll
+    for (int c = 0; c < KL / 4; ++c)
+      *reinterpret_cast<uint2*>(kb + 4 * c) =
+          *reinterpret_cast<const uint2*>(pk + (BK / (KL / 4)) * c);
+  }
+  {
+    const hip_bfloat16* pq = q + (long)t * stride_q + h * K + 4 * g;
+#pragma unroll
+    for (int c = 0; c < KL / 4; ++c)
+      *reinterpret_cast<uint2*>(qb + 4 * c) =
+          *reinterpret_cast<const uint2*>(pq + (BK / (KL / 4)) * c);
+  }
+  float kk[KL], qq[KL];
+#pragma unroll
+  for (int j = 0; j < KL; ++j) {
+    kk[j] = float(kb[j]);
+    qq[j] = float(qb[j]);
+  }
+  float ss = __fmul_rn(kk[0], kk[0]);
+#pragma unroll
+  for (int j = 1; j < KL; ++j) ss = __fadd_rn(ss, __fmul_rn(kk[j], kk[j]));
+  ss = grp_sum(ss);
+  const float invk = rsqrtf(__fadd_rn(ss, 1e-6f));
+#pragma unroll
+  for (int j = 0; j < KL; ++j) kk[j] = __fmul_rn(kk[j], invk);
+
+  float sq = __fmul_rn(qq[0], qq[0]);
+#pragma unroll
+  for (int j = 1; j < KL; ++j) sq = __fadd_rn(sq, __fmul_rn(qq[j], qq[j]));
+  sq = grp_sum(sq);
+  const float invq = rsqrtf(__fadd_rn(sq, 1e-6f));
+  // 与原核同一顺序：先乘 invq，再乘 scale（调用方传入，与 verify 同一个值）。
+#pragma unroll
+  for (int j = 0; j < KL; ++j)
+    qq[j] = __fmul_rn(__fmul_rn(qq[j], invq), scale);
+
+  if (t1 == 0) {
+    const int kbase = 4 * g;
+    const int kstep = BK / (KL / 4);
+    float* pkn = kn + (long)t * (long)H * K + h * K + kbase;
+    float* pqn = qn + (long)t * (long)H * K + h * K + kbase;
+#pragma unroll
+    for (int c = 0; c < KL / 4; ++c) {
+      float4 k4;
+      k4.x = kk[4 * c + 0]; k4.y = kk[4 * c + 1];
+      k4.z = kk[4 * c + 2]; k4.w = kk[4 * c + 3];
+      *reinterpret_cast<float4*>(pkn + kstep * c) = k4;
+      float4 q4;
+      q4.x = qq[4 * c + 0]; q4.y = qq[4 * c + 1];
+      q4.z = qq[4 * c + 2]; q4.w = qq[4 * c + 3];
+      *reinterpret_cast<float4*>(pqn + kstep * c) = q4;
+    }
+    // 每个 k-head 对应 hratio 个 hv：lane 0..hratio-1 各算一个。
+    if (lane < hratio) {
+      const int hv = h * hratio + lane;
+      const float bA = __expf(A_log[hv]);
+      const float dtb = dt_bias[hv];
+      const float inv_beta = 1.0f / softplus_beta;
+      const float av = float(a[(long)t * stride_a + hv]);
+      float x = __fadd_rn(av, dtb);
+      const float xs = __fmul_rn(softplus_beta, x);
+      if (xs <= softplus_threshold) {
+        x = __fmul_rn(inv_beta, __logf(__fadd_rn(1.0f, __expf(xs))));
+      }
+      const float g_ = __fmul_rn(-bA, x);
+      eg_out[(long)t * HV + hv] = __expf(g_);
+      const float bv = float(b[(long)t * stride_b + hv]);
+      beta_out[(long)t * HV + hv] = 1.0f / (1.0f + __expf(-bv));
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // host 入口（ctypes 直接调）
 // ---------------------------------------------------------------------------
@@ -369,7 +550,8 @@ static void launch(const void* q, const void* k, const void* v, const void* a,
         (const int*)store_row,
         T, HV, K, V, hratio,
         stride_q, stride_k, stride_v, stride_a, stride_b, scale, softplus_beta,
-        softplus_threshold, use_initial_state, varlen, disable_state_update);
+        softplus_threshold, use_initial_state, varlen, disable_state_update,
+        nullptr, nullptr, nullptr, nullptr, 0, 0);
   } else {
     gdn_recurrent_update_kernel<false, BPLUS, STATE_ONLY><<<grid, block, 0, stream>>>(
         nullptr,
@@ -381,7 +563,8 @@ static void launch(const void* q, const void* k, const void* v, const void* a,
         (const int*)store_row,
         T, HV, K, V, hratio,
         stride_q, stride_k, stride_v, stride_a, stride_b, scale, softplus_beta,
-        softplus_threshold, use_initial_state, varlen, disable_state_update);
+        softplus_threshold, use_initial_state, varlen, disable_state_update,
+        nullptr, nullptr, nullptr, nullptr, 0, 0);
   }
 }
 
@@ -396,18 +579,39 @@ static void launch_multi(const void* layer_ptrs, const void* h0_indices,
                          float softplus_threshold, int use_initial_state,
                          int varlen, int disable_state_update,
                          hipStream_t stream) {
-  dim3 grid(V / BV, N * HV, L);
-  dim3 block(64);
-  gdn_recurrent_update_kernel<true, true, STATE_ONLY, true>
-      <<<grid, block, 0, stream>>>(
-      (const void* const*)layer_ptrs,
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, nullptr, (const int*)h0_indices, nullptr, nullptr,
-      (const int*)snap_idx,
-      cache_steps, (const int*)store_step, nullptr,
-      T, HV, K, V, hratio, 0, 0, 0, 0, 0,
-      scale, softplus_beta, softplus_threshold,
-      use_initial_state, varlen, disable_state_update);
+  // 4 个 v-block 合进一个 256 线程 CTA（4 waves）：CTA 数降到 1/4，纠偏的
+  // 派发地板从 1.37 ms 降到 0.39 ms。每 wave 的 lane 映射与原核一致。
+  // V/BV 不能被 4 整除的模型退回单 wave，避免 grid.x 取整后漏算。
+  const int vb = V / BV;
+  const bool merge4 = (vb % 4) == 0;
+  const int waves = merge4 ? 4 : 1;
+  dim3 grid(vb / waves, N * HV, L);
+  dim3 block(64 * waves);
+  if (merge4) {
+    gdn_recurrent_update_kernel<true, true, STATE_ONLY, true, false, false, 4>
+        <<<grid, block, 0, stream>>>(
+        (const void* const*)layer_ptrs,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, (const int*)h0_indices, nullptr, nullptr,
+        (const int*)snap_idx,
+        cache_steps, (const int*)store_step, nullptr,
+        T, HV, K, V, hratio, 0, 0, 0, 0, 0,
+        scale, softplus_beta, softplus_threshold,
+        use_initial_state, varlen, disable_state_update,
+        nullptr, nullptr, nullptr, nullptr, 0, 0);
+  } else {
+    gdn_recurrent_update_kernel<true, true, STATE_ONLY, true>
+        <<<grid, block, 0, stream>>>(
+        (const void* const*)layer_ptrs,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, (const int*)h0_indices, nullptr, nullptr,
+        (const int*)snap_idx,
+        cache_steps, (const int*)store_step, nullptr,
+        T, HV, K, V, hratio, 0, 0, 0, 0, 0,
+        scale, softplus_beta, softplus_threshold,
+        use_initial_state, varlen, disable_state_update,
+        nullptr, nullptr, nullptr, nullptr, 0, 0);
+  }
 }
 
 extern "C" void gdn_recurrent_update(
@@ -497,4 +701,53 @@ extern "C" void gdn_recurrent_update_bplus_state_multi(
                      L, N, T, HV, K, V, hratio, scale, softplus_beta,
                      softplus_threshold, use_initial_state, varlen,
                      disable_state_update, (hipStream_t)stream);
+}
+
+// ---------------------------------------------------------------------------
+// norm pass 入口：q/k/eg/beta 一次算完（48 层每层一次 launch）。
+// ---------------------------------------------------------------------------
+extern "C" void gdn_verify_norm_pass(
+    const void* q, const void* k, const void* a, const void* b,
+    const void* A_log, const void* dt_bias, void* qn, void* kn, void* eg_out,
+    void* beta_out, int n_units, int H, int HV, int K, int hratio, int stride_q,
+    int stride_k, int stride_a, int stride_b, float softplus_beta,
+    float softplus_threshold, float scale, void* stream) {
+  const int blocks = (n_units + 3) / 4;
+  gdn_verify_norm_pass_kernel<<<blocks, 256, 0, (hipStream_t)stream>>>(
+      (const hip_bfloat16*)q, (const hip_bfloat16*)k, (const hip_bfloat16*)a,
+      (const hip_bfloat16*)b, (const float*)A_log, (const float*)dt_bias,
+      (float*)qn, (float*)kn, (float*)eg_out, (float*)beta_out, n_units, H, HV,
+      K, hratio, stride_q, stride_k, stride_a, stride_b, softplus_beta,
+      softplus_threshold, scale);
+}
+
+// PRENORM verify：q/k 用 norm pass 的 fp32 结果；gate=1 时 eg/beta 也直接 load。
+extern "C" void gdn_recurrent_update_bplus_prenorm(
+    const void* q, const void* k, const void* v, const void* a, const void* b,
+    const void* A_log, const void* dt_bias, const void* cu_seqlens,
+    void* h0_source, const void* h0_indices, void* o, void* snap_buf,
+    const void* snap_idx, int cache_steps, const void* store_step,
+    const void* store_row, int N, int T, int HV, int K, int V, int hratio,
+    int stride_q, int stride_k, int stride_v, int stride_a, int stride_b,
+    float scale, float softplus_beta, float softplus_threshold,
+    int use_initial_state, int varlen, int disable_state_update, const void* qn,
+    const void* kn, const void* eg_buf, const void* beta_buf, int stride_qn,
+    int stride_ab, int gate, void* stream) {
+  if (gate) {
+    launch_prenorm<true>(
+        q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices, o,
+        snap_buf, snap_idx, cache_steps, store_step, store_row, N, T, HV, K, V,
+        hratio, stride_q, stride_k, stride_v, stride_a, stride_b, scale,
+        softplus_beta, softplus_threshold, use_initial_state, varlen,
+        disable_state_update, qn, kn, eg_buf, beta_buf, stride_qn, stride_ab,
+        (hipStream_t)stream);
+  } else {
+    launch_prenorm<false>(
+        q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices, o,
+        snap_buf, snap_idx, cache_steps, store_step, store_row, N, T, HV, K, V,
+        hratio, stride_q, stride_k, stride_v, stride_a, stride_b, scale,
+        softplus_beta, softplus_threshold, use_initial_state, varlen,
+        disable_state_update, qn, kn, eg_buf, beta_buf, stride_qn, stride_ab,
+        (hipStream_t)stream);
+  }
 }
