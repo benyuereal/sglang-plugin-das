@@ -367,10 +367,18 @@ def forward_extend(
         intermediate_conv_window_cache = (
             mamba_cache_params.intermediate_conv_window[0]
         )
+        # The mask is only read by the PP stable-rows path; computing it per
+        # layer otherwise costs one elementwise launch per GDN layer per step.
+        stable_rows = pp_spec_stable_rows_enabled()
+        valid_rows = (
+            cache_indices[: query_start_loc.shape[0] - 1] >= 0
+            if stable_rows
+            else None
+        )
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            valid_rows,
             self.req_to_token_pool.size,
         )
         mamba_pool = self.req_to_token_pool.mamba_pool
@@ -534,6 +542,7 @@ def forward_extend(
                     flat = intermediate_state_cache.reshape(
                         -1, *intermediate_state_cache.shape[2:]
                     )
+                    store_arg = store_row_arg = None
                     if gdn_bplus.handoff_enabled():
                         # Slot-indexed scratch rows: the committed row then has a
                         # stable address, so commit only moves an int32 pointer.
@@ -542,12 +551,18 @@ def forward_extend(
                         cache_steps = int(intermediate_state_cache.shape[1])
                         slots = cache_indices[:n].to(torch.int32)
                         snap_idx = slots
-                        prev = gdn_bplus.ensure_prev(
-                            self, slots, mamba_cache_params
+                        gdn_bplus.begin_verify_step(self, layer.layer_id)
+                        sh = gdn_bplus.shared_step_values(
+                            self,
+                            slots,
+                            mamba_cache_params,
+                            cache_steps,
+                            int(draft_token_num),
                         )
-                        gdn_bplus.remember_step(self, slots, prev, cache_steps)
                         h0_src = flat
-                        h0_idx = gdn_bplus.h0_rows(slots, prev, cache_steps)
+                        h0_idx = sh["rows"][cache_steps]["h0"]
+                        store_arg = sh["store"]
+                        store_row_arg = sh["rows"][cache_steps]["store_row"]
                         prev_arg = gdn_bplus.state(self).prev
                     else:
                         snap_idx = intermediate_state_indices[:n].to(torch.int32)
@@ -575,6 +590,8 @@ def forward_extend(
                         int(draft_token_num),
                         hip_out,
                         prev_step=prev_arg,
+                        store=store_arg,
+                        store_row=store_row_arg,
                     )
                     return hip_out
             if _gdn_hip_kernel_enabled():

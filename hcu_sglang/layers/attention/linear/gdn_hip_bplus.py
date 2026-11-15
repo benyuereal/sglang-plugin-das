@@ -150,26 +150,31 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
 
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
-           snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step=None):
+           snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step=None,
+           store=None, store_row=None):
     """Write the full-run snapshot to row (prev_step+1) % cache_steps.
 
     Never row draft_token_num-1: that is the row the commit points at after a
     full accept, and the next verify reads it as h0. Each slot has one live row,
     so the rotated one is dead and the write touches nothing being read.
     """
+    # store/store_row are per-batch, not per-layer: the handoff caller computes
+    # them once per step and passes them in; the fallback keeps the old path.
     n = int(snap_idx.shape[0])
-    store = torch.full((n,), draft_token_num - 1, dtype=torch.int32,
-                       device=snap_idx.device)
+    if store is None:
+        store = torch.full((n,), draft_token_num - 1, dtype=torch.int32,
+                           device=snap_idx.device)
     # Slot ids come from snap_idx: cache_indices holds flat h0 rows here
     # (slot*D+prev) and indexing prev_step with them reads out of bounds, which
     # a captured graph turns into a VMFault.
-    if prev_step is None:
-        # No state handoff: write the full-accept row (draft_token_num - 1).
-        store_row = store
-    else:
-        safe = snap_idx.to(torch.int64).clamp(0, int(prev_step.numel()) - 1)
-        prev = prev_step.index_select(0, safe).to(torch.int32)
-        store_row = torch.remainder(prev + 1, int(cache_steps)).to(torch.int32)
+    if store_row is None:
+        if prev_step is None:
+            # No state handoff: write the full-accept row (draft_token_num - 1).
+            store_row = store
+        else:
+            safe = snap_idx.to(torch.int64).clamp(0, int(prev_step.numel()) - 1)
+            prev = prev_step.index_select(0, safe).to(torch.int32)
+            store_row = torch.remainder(prev + 1, int(cache_steps)).to(torch.int32)
     _call("gdn_recurrent_update_bplus", q, k, v, a, b, A_log, dt_bias,
           cu_seqlens, ssm_states, cache_indices, o, snap_flat, snap_idx,
           cache_steps, store, store_row, n, draft_token_num, v.shape[-2],

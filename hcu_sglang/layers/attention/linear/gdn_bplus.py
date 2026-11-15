@@ -22,17 +22,23 @@ class BplusState:
         "snap_idx",
         "capture_T",
         "live_T",
-        "slots_now",
-        "prev_now",
-        "store_row",
-        "cache_steps",
         "seed_scratch",
         "ml_table",
         "ml_key",
-        "tdev",
         "max_slots",
         "logged",
         "commit_failed",
+        "step_gen",
+        "step_lid",
+        "step_cache",
+        "s64_buf",
+        "prev32_buf",
+        "prev64_buf",
+        "store_buf",
+        "row_bufs",
+        "h0_bufs",
+        "tmp32_buf",
+        "tmp64_buf",
     )
 
     def __init__(self):
@@ -41,17 +47,23 @@ class BplusState:
         self.snap_idx = None
         self.capture_T = 0
         self.live_T = 0
-        self.slots_now = None
-        self.prev_now = None
-        self.store_row = None
-        self.cache_steps = 0
         self.seed_scratch = None
         self.ml_table = None
         self.ml_key = None
-        self.tdev = None
         self.max_slots = 0
         self.logged = False
         self.commit_failed = False
+        self.step_gen = 0
+        self.step_lid = -1
+        self.step_cache = None
+        self.s64_buf = None
+        self.prev32_buf = None
+        self.prev64_buf = None
+        self.store_buf = None
+        self.row_bufs = {}
+        self.h0_bufs = {}
+        self.tmp32_buf = None
+        self.tmp64_buf = None
 
 
 def state(backend) -> BplusState:
@@ -93,14 +105,6 @@ def _prev_buf(backend, slots, size: int) -> torch.Tensor:
     if st.prev is None or int(st.prev.numel()) < size:
         st.prev = torch.full((size,), -1, dtype=torch.int32, device=slots.device)
     return st.prev
-
-
-def ensure_prev(backend, slots: torch.Tensor, mamba_cache_params):
-    """Return the committed step for this batch's slots."""
-    st = state(backend)
-    size = int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK
-    prev_buf = _prev_buf(backend, slots, size)
-    return prev_buf.index_select(0, _slot_ids(slots)).to(torch.int32)
 
 
 def seed_prev(
@@ -145,19 +149,127 @@ def invalidate_prev(backend, slots: torch.Tensor) -> None:
     buf.index_fill_(0, _slot_ids(slots), -1)
 
 
-def remember_step(backend, slots: torch.Tensor, prev: torch.Tensor, cache_steps: int):
-    """Record the step's slots and rows so the commit can rotate the pointer.
+def _step_buffer(st, name: str, rows: int, dtype, device) -> torch.Tensor:
+    """Persistent scratch: captures bake buffer addresses into the graph, so a
+    per-step allocation would leave older graphs pointing at freed memory."""
+    buf = getattr(st, name)
+    if buf is None or int(buf.numel()) < rows or buf.dtype != dtype or buf.device != device:
+        buf = torch.empty(rows, dtype=dtype, device=device)
+        setattr(st, name, buf)
+    return buf
 
-    ``cache_steps`` is the allocated row stride (``intermediate_ssm.shape[1]``),
-    not the runtime draft-token count: rows are addressed by the stride.
+
+def _stride_buffer(st, name: str, stride: int, rows: int, dtype, device):
+    bufs = getattr(st, name)
+    buf = bufs.get(int(stride))
+    if buf is None or int(buf.numel()) < rows or buf.dtype != dtype or buf.device != device:
+        buf = torch.empty(rows, dtype=dtype, device=device)
+        bufs[int(stride)] = buf
+    return buf
+
+
+def begin_verify_step(backend, layer_id: int) -> None:
+    """Rotate the per-step cache at the start of a verify forward.
+
+    GDN layers run once each in ascending id order inside one forward, so a
+    layer id that does not advance marks a new forward (and a graph capture
+    starts at the model's first layer again).
     """
     st = state(backend)
-    store_row = torch.remainder(prev + 1, cache_steps).to(torch.int32)
-    st.slots_now = slots.to(torch.int32)
-    st.prev_now = prev.to(torch.int32)
-    st.store_row = store_row
-    st.cache_steps = int(cache_steps)
-    return store_row
+    lid = int(layer_id)
+    if lid <= st.step_lid:
+        st.step_gen += 1
+        st.step_cache = None
+    st.step_lid = lid
+
+
+def shared_step_values(
+    backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int, T: int
+) -> dict:
+    """Per-batch tensors every layer of this verify forward uses unchanged.
+
+    verify used to derive them per layer: 48x the same six launches. They are
+    index arithmetic only, so computing them once is bit-identical. The buffers
+    are persistent because a captured graph keeps their addresses, and each
+    stride keeps its own row so a layer with a different allocation still works.
+    """
+    st = state(backend)
+    n = int(slots.numel())
+    rows = int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK
+    prev_buf = _prev_buf(backend, slots, rows)
+    rows = int(prev_buf.numel())
+    sh = st.step_cache
+    if (
+        sh is None
+        or sh["gen"] != st.step_gen
+        or sh["ptr"] != int(slots.data_ptr())
+        or sh["n"] != n
+    ):
+        dev = slots.device
+        s64 = _step_buffer(st, "s64_buf", rows, torch.int64, dev)[:n]
+        s64.copy_(slots)
+        torch.clamp_min(s64, 0, out=s64)
+        prev32 = _step_buffer(st, "prev32_buf", rows, torch.int32, dev)[:n]
+        torch.index_select(prev_buf, 0, s64, out=prev32)
+        store = _step_buffer(st, "store_buf", rows, torch.int32, dev)[:n]
+        store.fill_(int(T) - 1)
+        sh = {
+            "gen": st.step_gen,
+            "ptr": int(slots.data_ptr()),
+            "n": n,
+            "s64": s64,
+            "prev": prev32,
+            "store": store,
+            "rows": {},
+        }
+        st.step_cache = sh
+    ent = sh["rows"].get(int(cache_steps))
+    if ent is None:
+        ent = {"store_row": _step_store_row(st, sh, cache_steps)}
+        ent["h0"] = _step_h0(st, sh["s64"], sh["prev"], cache_steps)
+        sh["rows"][int(cache_steps)] = ent
+    return sh
+
+
+def _step_store_row(st, sh, cache_steps: int) -> torch.Tensor:
+    n = sh["n"]
+    dev = sh["prev"].device
+    tmp = _step_buffer(st, "tmp32_buf", int(sh["prev"].numel()), torch.int32, dev)[:n]
+    row = _stride_buffer(
+        st, "row_bufs", cache_steps, int(sh["prev"].numel()), torch.int32, dev
+    )[:n]
+    torch.add(sh["prev"], 1, out=tmp)
+    torch.remainder(tmp, int(cache_steps), out=row)
+    return row
+
+
+def _step_h0(st, s64, prev32, cache_steps: int) -> torch.Tensor:
+    n = int(s64.numel())
+    dev = s64.device
+    prev64 = _step_buffer(st, "prev64_buf", int(s64.numel()), torch.int64, dev)[:n]
+    prev64.copy_(prev32)
+    torch.clamp_min(prev64, 0, out=prev64)
+    tmp = _step_buffer(st, "tmp64_buf", int(s64.numel()), torch.int64, dev)[:n]
+    torch.mul(s64, int(cache_steps), out=tmp)
+    torch.add(tmp, prev64, out=tmp)
+    h0 = _stride_buffer(
+        st, "h0_bufs", cache_steps, int(s64.numel()), torch.int32, dev
+    )[:n]
+    h0.copy_(tmp)
+    return h0
+
+
+def step_h0(backend, slots: torch.Tensor, cache_steps: int):
+    """The cached h0 rows for this batch, or None when this forward did not
+    compute them (commit-side fallback then does the arithmetic itself)."""
+    st = state(backend)
+    sh = st.step_cache
+    if sh is None or sh["gen"] != st.step_gen:
+        return None
+    if sh["ptr"] != int(slots.data_ptr()) or sh["n"] != int(slots.numel()):
+        return None
+    ent = sh["rows"].get(int(cache_steps))
+    return None if ent is None else ent["h0"]
 
 
 def h0_rows(slots: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.Tensor:
@@ -314,9 +426,6 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
             dest[:, :T, qd + kd:W].copy_(v.reshape(n, T, -1))
         ent["a"][:m].view(n, D, -1)[:, :T].copy_(a.reshape(n, T, -1))
         ent["b"][:m].view(n, D, -1)[:, :T].copy_(b.reshape(n, T, -1))
-        if st.tdev is None:
-            st.tdev = torch.zeros(1, dtype=torch.int32, device=q.device)
-        st.tdev.fill_(T)
         return True
     except Exception:  # noqa: BLE001 - never take serving down
         logger.warning("[gdn-bplus] stash failed", exc_info=True)
@@ -369,9 +478,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
             if st.prev is None:
                 return False
             slots_now = state_indices.to(torch.int32)
-            prev_now = st.prev.index_select(
-                0, slots_now.to(torch.int64).clamp_min(0)
-            ).to(torch.int32)
+            prev_now = None
         skip_full = os.environ.get("SGLANG_GDN_HIP_BPLUS_SKIP_FULL", "1") != "0"
         # A full accept already committed the row verify wrote; replay only the
         # truncated slots, so their h0 read is not paid for. Same index tensor
@@ -398,7 +505,13 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     ssm = flat
                     h0_idx = h0_by_stride.get(stride)
                     if h0_idx is None:
-                        h0_idx = h0_rows(slots_now, prev_now, stride)
+                        h0_idx = step_h0(backend, slots_now, stride)
+                        if h0_idx is None:
+                            if prev_now is None:
+                                prev_now = st.prev.index_select(
+                                    0, slots_now.to(torch.int64).clamp_min(0)
+                                ).to(torch.int32)
+                            h0_idx = h0_rows(slots_now, prev_now, stride)
                         if skip_full:
                             h0_idx = torch.where(trunc, h0_idx, neg)
                         h0_by_stride[stride] = h0_idx
