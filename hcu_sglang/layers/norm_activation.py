@@ -23,6 +23,11 @@ _SILU_BLOCK = 8192
 _SILU_WARPS = 8
 # One program per row with the whole row in registers; the gate below refuses
 # rows wider than this so a call never needs a second pass.
+# Load-bearing for the sha, not just perf: the one-pass kernel computes the
+# variance as a single tl.sum(t * t) over the whole row, which is bit-identical
+# to the two-pass vendor kernel's for-off accumulate only while one BLOCK
+# covers the row. A wider row would split the sum across blocks and change its
+# order, so raising this limit breaks bit-exactness, not just adds a pass.
 _ADD_RMS_MAX_N = 8192
 # One-strike: a raising fast path is disabled for the process and the caller
 # falls back to the vendor kernel, so an opt-in knob can never wedge serving.

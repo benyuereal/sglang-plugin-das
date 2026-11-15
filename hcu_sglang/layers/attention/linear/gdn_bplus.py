@@ -483,7 +483,12 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         # A full accept already committed the row verify wrote; replay only the
         # truncated slots, so their h0 read is not paid for. Same index tensor
         # for every layer: the row stride does not depend on the layer.
-        neg = torch.full_like(idx32, -1) if skip_full else None
+        # ``neg`` (the -1 skip marker) is built unconditionally: the handoff
+        # branch masks only when skip_full, but the plain branch's
+        # ``torch.where(trunc, idx32, neg)`` at :521 always needs it -- with a
+        # None third argument where() raises, the per-layer except swallows it,
+        # and every layer's row is dropped with no state replayed.
+        neg = torch.full_like(idx32, -1)
         h0_by_stride = {}
         h0_plain = None
         rows = []
@@ -553,7 +558,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     ent["out"],
                 )
             except Exception:  # noqa: BLE001 - optional path
-                logger.warning("[gdn-bplus] compensate failed for layer")
+                logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
                 continue
         return True
     except Exception:  # noqa: BLE001

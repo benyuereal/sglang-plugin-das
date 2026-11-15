@@ -5,7 +5,7 @@ import os
 
 import torch
 
-from hcu_sglang.constants import DECODE_MAX_M, SKIPPED_LOG_LIMIT
+from hcu_sglang.constants import BYTES_PER_GIB, DECODE_MAX_M, SKIPPED_LOG_LIMIT
 
 from .providers import hbird
 
@@ -130,7 +130,7 @@ def convert_model(model, runner=None):
     _LOG.info(
         "[hbird_bf16] packed %d linear(s), freed %.2f GiB, lm_head kept %d, "
         "skipped %d, %d (M,N,K) ws prepared (%d refused), cap M <= %d",
-        converted, freed / 2**30, kept, len(skipped), prepared, failed, limit,
+        converted, freed / BYTES_PER_GIB, kept, len(skipped), prepared, failed, limit,
     )
     if skipped:
         _LOG.info("[hbird_bf16] skipped: %s", skipped[:SKIPPED_LOG_LIMIT])
