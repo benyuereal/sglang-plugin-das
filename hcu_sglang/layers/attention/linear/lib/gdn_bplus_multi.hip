@@ -751,3 +751,381 @@ extern "C" void gdn_recurrent_update_bplus_prenorm(
         (hipStream_t)stream);
   }
 }
+
+// ---------------------------------------------------------------------------
+// causal conv1d update (one GDN layer per launch), bitwise vs the Triton
+// `_causal_conv1d_update_kernel` for KERNEL_WIDTH=4 / bf16.
+//
+// The Triton kernel's arithmetic, read off its AMDGCN dump:
+//   p = cvt_f32_bf16(cvt_bf16_f32(f32(a) * f32(b)))     (product rounded to bf16)
+//   acc = fadd(acc, p)                                  (fp32, one tap per step)
+//   y = acc / (1 + exp2(-acc * log2e))                  (hw v_exp_f32, IEEE div)
+// Tap order differs per path and is part of the contract:
+//   no tree : w0*state0 + w1*state1 + w2*state2 + w3*x[t]
+//   tree    : w3*x[t] + w2*parent + w1*parent^2 + w0*parent^3
+// The conv window columns are raw bf16 moves, never recomputed.
+//
+// Strides are runtime ints (the Triton wrapper passes them as constexpr), so a
+// non-contiguous window / conv_state / x keeps working.
+// ---------------------------------------------------------------------------
+
+#ifndef GDN_CONV_MAX_T
+#define GDN_CONV_MAX_T 16
+#endif
+// CTA width for both conv kernels; variants are timed against Triton.
+#ifndef GDN_CONV_BLOCK
+#define GDN_CONV_BLOCK 256
+#endif
+
+// 2^v as the Triton kernel gets it: the AMDGPU backend lowers its
+// llvm.exp2.f32 to the hardware instruction, not to __ocml_exp2_f32.
+__device__ __forceinline__ float gdn_conv_exp2_hw(float v) {
+  float r;
+  asm("v_exp_f32 %0, %1" : "=v"(r) : "v"(v));
+  return r;
+}
+
+// One tap: f32 multiply rounded to bf16, like a bf16*bf16 in Triton.
+__device__ __forceinline__ float gdn_conv_tap(float a, float b) {
+  hip_bfloat16 r(__fmul_rn(a, b));
+  return (float)r;
+}
+
+__device__ __forceinline__ float gdn_conv_silu(float acc) {
+  // fsub 0.0,acc is not the same as -acc at zero; Triton emits the former.
+  float neg = __fsub_rn(0.0f, acc);
+  float e = gdn_conv_exp2_hw(__fmul_rn(neg, 1.4426950408889634f));
+  return acc / __fadd_rn(e, 1.0f);
+}
+
+// VEC features per thread; the host only picks VEC>1 when dim % VEC == 0.
+// IDT is the element type of retrieve_next_token / _sibling / parent out.
+template <int VEC, typename IDT>
+__global__ __launch_bounds__(GDN_CONV_BLOCK, 2) void gdn_causal_conv1d_update_kernel(
+    const hip_bfloat16* __restrict__ x, const hip_bfloat16* __restrict__ w,
+    const hip_bfloat16* __restrict__ bias, hip_bfloat16* __restrict__ conv_state,
+    const int* __restrict__ conv_idx, hip_bfloat16* __restrict__ window,
+    const int* __restrict__ inter_idx, const IDT* __restrict__ nxt,
+    const IDT* __restrict__ sib, IDT* __restrict__ par_out,
+    hip_bfloat16* __restrict__ o,
+    int dim, int seqlen, int state_len, int num_cache_lines,
+    int s_x_seq, int s_x_dim, int s_x_tok,
+    int s_w_dim, int s_w_width,
+    int s_cs_seq, int s_cs_dim, int s_cs_tok, int s_ci,
+    int s_wseq, int s_wstep, int s_wdim, int s_win, int s_ii,
+    int s_nseq, int s_ntok, int s_sseq, int s_stok,
+    int s_pseq, int s_ptok,
+    int s_o_seq, int s_o_dim, int s_o_tok,
+    int pad_slot_id, int has_bias, int silu, int cont, int save_inter,
+    int tree, int use_pad) {
+  const int seq = blockIdx.x;
+  const int f0 = (blockIdx.y * GDN_CONV_BLOCK + threadIdx.x) * VEC;
+  if (f0 >= dim) return;
+
+  const long long coord = cont ? (long long)conv_idx[seq * s_ci] : (long long)seq;
+  if (use_pad && coord == (long long)pad_slot_id) return;
+
+  float wv[VEC][4];
+#pragma unroll
+  for (int v = 0; v < VEC; ++v)
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+      wv[v][k] = (float)w[(long long)(f0 + v) * s_w_dim + k * s_w_width];
+  float bv[VEC];
+  if (has_bias) {
+#pragma unroll
+    for (int v = 0; v < VEC; ++v) bv[v] = (float)bias[f0 + v];
+  }
+
+  const hip_bfloat16* xs = x + (long long)seq * s_x_seq + (long long)f0 * s_x_dim;
+  hip_bfloat16* ob = o + (long long)seq * s_o_seq + (long long)f0 * s_o_dim;
+  const long long cs_off = coord * s_cs_seq + (long long)f0 * s_cs_dim;
+  const hip_bfloat16* cs = conv_state + cs_off;
+  hip_bfloat16* cst = conv_state + cs_off;
+
+  // STEP 1: the window columns the conv seeds from (oldest first).
+  hip_bfloat16 col0[VEC], col1[VEC], col2[VEC];
+#pragma unroll
+  for (int v = 0; v < VEC; ++v) {
+    col0[v] = cs[0 * s_cs_tok + v * s_cs_dim];
+    col1[v] = cs[1 * s_cs_tok + v * s_cs_dim];
+    col2[v] = cs[2 * s_cs_tok + v * s_cs_dim];
+  }
+
+  // STEP 2: same sliding update as Triton (shift left by seqlen, last tokens
+  // come from x; the source index is always the higher one, so in-place is safe).
+  {
+    const int val = state_len - seqlen;
+    const bool slot_ok = coord < num_cache_lines;
+    for (int i = 0; i < state_len; ++i) {
+      hip_bfloat16* dst = cst + i * s_cs_tok;
+      if (slot_ok && (i + seqlen) < state_len) {
+        const hip_bfloat16* src = cs + (i + seqlen) * s_cs_tok;
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) dst[v * s_cs_dim] = src[v * s_cs_dim];
+      } else {
+        const int xi = i - val;
+        const bool in = (xi >= 0) && (xi < seqlen);
+#pragma unroll
+        for (int v = 0; v < VEC; ++v)
+          dst[v * s_cs_dim] =
+              in ? xs[(long long)xi * s_x_tok + v * s_x_dim] : hip_bfloat16(0.0f);
+      }
+    }
+  }
+
+  hip_bfloat16* wb = nullptr;
+  if (save_inter) {
+    const long long row = (long long)inter_idx[seq * s_ii];
+    wb = window + row * s_wseq + (long long)f0 * s_wdim;
+  }
+
+  if (!tree) {
+    for (int t = 0; t < seqlen; ++t) {
+      hip_bfloat16 xt[VEC];
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) xt[v] = xs[(long long)t * s_x_tok + v * s_x_dim];
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) {
+        float acc = __fadd_rn(gdn_conv_tap((float)col0[v], wv[v][0]),
+                              has_bias ? bv[v] : 0.0f);
+        acc = __fadd_rn(acc, gdn_conv_tap((float)col1[v], wv[v][1]));
+        acc = __fadd_rn(acc, gdn_conv_tap((float)col2[v], wv[v][2]));
+        acc = __fadd_rn(acc, gdn_conv_tap((float)xt[v], wv[v][3]));
+        float y = silu ? gdn_conv_silu(acc) : acc;
+        ob[(long long)t * s_o_tok + v * s_o_dim] = hip_bfloat16(y);
+      }
+      if (save_inter) {
+        hip_bfloat16* wt = wb + (long long)t * s_wstep;
+#pragma unroll
+        for (int v = 0; v < VEC; ++v) {
+          wt[0 * s_win + v * s_wdim] = col1[v];
+          wt[1 * s_win + v * s_wdim] = col2[v];
+          wt[2 * s_win + v * s_wdim] = xt[v];
+        }
+      }
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) {
+        col0[v] = col1[v];
+        col1[v] = col2[v];
+        col2[v] = xt[v];
+      }
+    }
+  } else {
+    // Same parent map the Triton kernel builds from next/sibling on the fly;
+    // each node is assigned once, so the final map equals the incremental one
+    // on every entry a chain walk can reach.
+    int par[GDN_CONV_MAX_T];
+    for (int i = 0; i < seqlen; ++i) par[i] = 0;
+    for (int i = 0; i < seqlen; ++i) {
+      const IDT nx = nxt[(long long)seq * s_nseq + i * s_ntok];
+      if (nx != (IDT)-1 && (int)nx < GDN_CONV_MAX_T) par[(int)nx] = i;
+      const IDT sb = sib[(long long)seq * s_sseq + i * s_stok];
+      if (sb != (IDT)-1 && (int)sb < GDN_CONV_MAX_T) par[(int)sb] = par[i];
+    }
+
+    for (int t = 0; t < seqlen; ++t) {
+      hip_bfloat16* wt = save_inter ? wb + (long long)t * s_wstep : nullptr;
+#pragma unroll
+      for (int v = 0; v < VEC; ++v) {
+        hip_bfloat16 mx = xs[(long long)t * s_x_tok + v * s_x_dim];
+        int idx = t;
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          if (save_inter && (2 - j) >= 0)
+            wt[(2 - j) * s_win + v * s_wdim] = mx;
+          const float p = gdn_conv_tap((float)mx, wv[v][3 - j]);
+          acc = (j == 0) ? __fadd_rn(p, has_bias ? bv[v] : 0.0f)
+                         : __fadd_rn(acc, p);
+          if (idx > 0) {
+            idx = par[idx];
+            mx = xs[(long long)idx * s_x_tok + v * s_x_dim];
+          } else {
+            mx = (idx == 0) ? col2[v] : ((idx == -1) ? col1[v] : col0[v]);
+            idx -= 1;
+          }
+        }
+        float y = silu ? gdn_conv_silu(acc) : acc;
+        ob[(long long)t * s_o_tok + v * s_o_dim] = hip_bfloat16(y);
+      }
+    }
+
+    if (par_out) {
+      for (int i = 0; i < seqlen; ++i)
+        par_out[(long long)seq * s_pseq + i * s_ptok] = (IDT)par[i];
+    }
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Fast path for the production layout: one feature per thread (maximum warp
+// count, the shape that measured fastest), x/o/weight axes stride 1.
+//
+// The conv_state row and the conv window are 3 columns per feature, so a
+// per-feature store lands on a 6B-strided address pattern and inflates every
+// warp store into 3 L2 sectors. Both are therefore staged through shared
+// memory: the CTA copies the (feature, col) rows in/out as straight 16B
+// vectors and the compute threads only touch shared memory for them.
+// Three barriers per launch: one after the conv_state row is loaded, one after
+// the window tiles are written, one before conv_state is copied back.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Fast path for the production layout: one feature per thread (the shape that
+// measured fastest; every wider per-thread feature block lost parallelism),
+// with x/o/weight axes stride 1.
+//
+// The conv_state row is 3 columns per feature, so a per-feature access lands on
+// a 6B-strided pattern and inflates every warp access into 3 L2 sectors. The
+// CTA therefore stages that row through shared memory as straight 16B vectors
+// (load once at entry, store once at exit). The window is written per feature
+// straight from the history registers: staging it through shared memory was
+// measured 14us/layer slower, as the L2 already merges the partial-sector
+// stores before they reach DRAM.
+// ---------------------------------------------------------------------------
+template <int BLOCK>
+__global__ __launch_bounds__(BLOCK, 2) void gdn_conv_update_fast_kernel(
+    const hip_bfloat16* __restrict__ x, const hip_bfloat16* __restrict__ w,
+    const hip_bfloat16* __restrict__ bias, hip_bfloat16* __restrict__ conv_state,
+    const int* __restrict__ conv_idx, hip_bfloat16* __restrict__ window,
+    const int* __restrict__ inter_idx, hip_bfloat16* __restrict__ o,
+    int seqlen, int num_cache_lines, int s_x_seq, int s_x_tok, int s_cs_seq,
+    int s_wseq, int s_wstep, int s_o_seq, int s_o_tok, int s_ci, int s_ii,
+    int pad_slot_id, int has_bias, int silu, int save_inter) {
+  const int seq = blockIdx.x;
+  const int fb = blockIdx.y * BLOCK;
+  const int tid = (int)threadIdx.x;
+  const long long coord = (long long)conv_idx[seq * s_ci];
+  if (coord == (long long)pad_slot_id) return;  // uniform across the CTA
+
+  __shared__ hip_bfloat16 s_st[3 * BLOCK];  // (feature, col), col fastest
+  const int nch = 3 * BLOCK / 8;            // 16B chunks in one such row
+  const hip_bfloat16* xs = x + (long long)seq * s_x_seq + fb;
+  hip_bfloat16* ob = o + (long long)seq * s_o_seq + fb;
+  const long long cs_off = coord * s_cs_seq + (long long)fb * 3;
+  const hip_bfloat16* cs = conv_state + cs_off;
+  hip_bfloat16* cst = conv_state + cs_off;
+
+  if (tid < nch) ((uint4*)s_st)[tid] = ((const uint4*)cs)[tid];
+  __syncthreads();
+  // (h0,h1,h2) = (x[t-3], x[t-2], x[t-1]); token 0 seeds it from conv_state.
+  hip_bfloat16 h0 = s_st[tid * 3 + 0];
+  hip_bfloat16 h1 = s_st[tid * 3 + 1];
+  hip_bfloat16 h2 = s_st[tid * 3 + 2];
+
+  union {
+    uint2 raw;
+    hip_bfloat16 v[4];
+  } wu;  // one 8B load per thread; w is (dim, 4) contiguous
+  wu.raw = *(const uint2*)(w + (long long)(fb + tid) * 4);
+  const float w0 = (float)wu.v[0], w1 = (float)wu.v[1];
+  const float w2 = (float)wu.v[2], w3 = (float)wu.v[3];
+  const float bv = has_bias ? (float)bias[fb + tid] : 0.0f;
+  const long long wrow = save_inter ? (long long)inter_idx[seq * s_ii] : 0;
+
+  for (int t = 0; t < seqlen; ++t) {
+    const hip_bfloat16 xt = xs[(long long)t * s_x_tok + tid];
+    float acc = __fadd_rn(gdn_conv_tap((float)h0, w0), bv);
+    acc = __fadd_rn(acc, gdn_conv_tap((float)h1, w1));
+    acc = __fadd_rn(acc, gdn_conv_tap((float)h2, w2));
+    acc = __fadd_rn(acc, gdn_conv_tap((float)xt, w3));
+    ob[(long long)t * s_o_tok + tid] =
+        hip_bfloat16(silu ? gdn_conv_silu(acc) : acc);
+    if (save_inter) {
+      // window[t] = [x(t-2), x(t-1), x(t)] = [h1, h2, xt].
+      hip_bfloat16* sw = window + wrow * s_wseq + (long long)t * s_wstep +
+                         (long long)fb * 3 + tid * 3;
+      sw[0] = h1;
+      sw[1] = h2;
+      sw[2] = xt;
+    }
+    h0 = h1;
+    h1 = h2;
+    h2 = xt;
+  }
+
+  // conv_state update: the history after the last token is the new state.
+  s_st[tid * 3 + 0] = h0;
+  s_st[tid * 3 + 1] = h1;
+  s_st[tid * 3 + 2] = h2;
+  __syncthreads();
+  if (tid < nch) ((uint4*)cst)[tid] = ((const uint4*)s_st)[tid];
+}
+
+template <typename IDT>
+static void launch_conv(const void* x, const void* w, const void* bias,
+                        void* conv_state, const void* conv_idx, void* window,
+                        const void* inter_idx, const void* nxt, const void* sib,
+                        void* par_out, void* o, int batch, int dim, int seqlen,
+                        int state_len, int num_cache_lines, int s_x_seq,
+                        int s_x_dim, int s_x_tok, int s_w_dim, int s_w_width,
+                        int s_cs_seq, int s_cs_dim, int s_cs_tok, int s_ci,
+                        int s_wseq, int s_wstep, int s_wdim, int s_win,
+                        int s_ii, int s_nseq, int s_ntok, int s_sseq, int s_stok,
+                        int s_pseq, int s_ptok, int s_o_seq, int s_o_dim,
+                        int s_o_tok, int pad_slot_id, int has_bias, int silu,
+                        int cont, int save_inter, int tree, int use_pad,
+                        hipStream_t stream) {
+#define GDN_CONV_ARGS                                                          \
+  (const hip_bfloat16*)x, (const hip_bfloat16*)w, (const hip_bfloat16*)bias,   \
+      (hip_bfloat16*)conv_state, (const int*)conv_idx, (hip_bfloat16*)window,  \
+      (const int*)inter_idx, (const IDT*)nxt, (const IDT*)sib, (IDT*)par_out,  \
+      (hip_bfloat16*)o, dim, seqlen, state_len, num_cache_lines, s_x_seq,      \
+      s_x_dim, s_x_tok, s_w_dim, s_w_width, s_cs_seq, s_cs_dim, s_cs_tok,      \
+      s_ci, s_wseq, s_wstep, s_wdim, s_win, s_ii, s_nseq, s_ntok, s_sseq,      \
+      s_stok, s_pseq, s_ptok, s_o_seq, s_o_dim, s_o_tok, pad_slot_id,          \
+      has_bias, silu, cont, save_inter, tree, use_pad
+  const bool aligned = (s_x_tok % 8) == 0 && (s_x_seq % 8) == 0 &&
+                       (s_o_tok % 8) == 0 && (s_o_seq % 8) == 0 &&
+                       (s_cs_seq % 8) == 0;
+  const bool fast = !tree && use_pad && cont && state_len == 3 &&
+                    s_x_dim == 1 && s_o_dim == 1 && s_cs_dim == 3 &&
+                    s_cs_tok == 1 && s_w_dim == 4 && s_w_width == 1 &&
+                    (!save_inter || (s_wdim == 3 && s_win == 1)) &&
+                    aligned && dim % GDN_CONV_BLOCK == 0;
+  if (fast) {
+    dim3 grid(batch, dim / GDN_CONV_BLOCK);
+    gdn_conv_update_fast_kernel<GDN_CONV_BLOCK><<<grid, GDN_CONV_BLOCK, 0, stream>>>(
+        (const hip_bfloat16*)x, (const hip_bfloat16*)w,
+        (const hip_bfloat16*)bias, (hip_bfloat16*)conv_state,
+        (const int*)conv_idx, (hip_bfloat16*)window, (const int*)inter_idx,
+        (hip_bfloat16*)o, seqlen, num_cache_lines, s_x_seq, s_x_tok, s_cs_seq,
+        s_wseq, s_wstep, s_o_seq, s_o_tok, s_ci, s_ii, pad_slot_id, has_bias,
+        silu, save_inter);
+  } else {
+    dim3 grid(batch, (dim + GDN_CONV_BLOCK - 1) / GDN_CONV_BLOCK);
+    gdn_causal_conv1d_update_kernel<1, IDT>
+        <<<grid, GDN_CONV_BLOCK, 0, stream>>>(GDN_CONV_ARGS);
+  }
+#undef GDN_CONV_ARGS
+}
+
+extern "C" void gdn_causal_conv1d_update(
+    const void* x, const void* w, const void* bias, void* conv_state,
+    const void* conv_idx, void* window, const void* inter_idx, const void* nxt,
+    const void* sib, void* par_out, void* o, int batch, int dim, int seqlen,
+    int state_len, int num_cache_lines, int s_x_seq, int s_x_dim, int s_x_tok,
+    int s_w_dim, int s_w_width, int s_cs_seq, int s_cs_dim, int s_cs_tok,
+    int s_ci, int s_wseq, int s_wstep, int s_wdim, int s_win, int s_ii,
+    int s_nseq, int s_ntok, int s_sseq, int s_stok, int s_pseq, int s_ptok,
+    int s_o_seq, int s_o_dim, int s_o_tok, int pad_slot_id, int has_bias,
+    int silu, int cont, int save_inter, int tree, int use_pad, int idx64,
+    void* stream) {
+  if (idx64)
+    launch_conv<long long>(
+        x, w, bias, conv_state, conv_idx, window, inter_idx, nxt, sib, par_out,
+        o, batch, dim, seqlen, state_len, num_cache_lines, s_x_seq, s_x_dim,
+        s_x_tok, s_w_dim, s_w_width, s_cs_seq, s_cs_dim, s_cs_tok, s_ci,
+        s_wseq, s_wstep, s_wdim, s_win, s_ii, s_nseq, s_ntok, s_sseq, s_stok,
+        s_pseq, s_ptok, s_o_seq, s_o_dim, s_o_tok, pad_slot_id, has_bias, silu,
+        cont, save_inter, tree, use_pad, (hipStream_t)stream);
+  else
+    launch_conv<int>(
+        x, w, bias, conv_state, conv_idx, window, inter_idx, nxt, sib, par_out,
+        o, batch, dim, seqlen, state_len, num_cache_lines, s_x_seq, s_x_dim,
+        s_x_tok, s_w_dim, s_w_width, s_cs_seq, s_cs_dim, s_cs_tok, s_ci,
+        s_wseq, s_wstep, s_wdim, s_win, s_ii, s_nseq, s_ntok, s_sseq, s_stok,
+        s_pseq, s_ptok, s_o_seq, s_o_dim, s_o_tok, pad_slot_id, has_bias, silu,
+        cont, save_inter, tree, use_pad, (hipStream_t)stream);
+}

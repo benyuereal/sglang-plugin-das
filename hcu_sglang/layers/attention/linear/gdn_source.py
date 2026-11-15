@@ -322,6 +322,39 @@ def _gdn_hip_bplus_enabled() -> bool:
         return False
 
 
+_CONV_HIP_LOG = {"done": False}
+
+
+def conv_update(x, conv_state, weight, bias=None, activation=None, **kwargs):
+    """Triton causal_conv1d_update, or its HIP twin under SGLANG_GDN_HIP_CONV=1.
+
+    The HIP kernel is bitwise equal for the bf16 / width-4 / spec-verify shapes
+    and returns None for anything else, so the Triton path stays the fallback.
+    """
+    if _is_hcu:
+        try:
+            from hcu_sglang.layers.attention.linear import gdn_hip_bplus
+
+            if gdn_hip_bplus.conv_enabled():
+                out = gdn_hip_bplus.conv_update(
+                    x, conv_state, weight, bias, activation, **kwargs
+                )
+                if out is not None:
+                    return out
+                if not _CONV_HIP_LOG["done"]:
+                    _CONV_HIP_LOG["done"] = True
+                    rank0_log(
+                        "SGLANG_GDN_HIP_CONV=1 but this conv call is outside "
+                        "the HIP kernel "
+                        f"({gdn_hip_bplus.conv_last_reason()}); using Triton."
+                    )
+        except Exception as exc:  # noqa: BLE001 - never fail a forward here
+            if not _CONV_HIP_LOG["done"]:
+                _CONV_HIP_LOG["done"] = True
+                rank0_log(f"SGLANG_GDN_HIP_CONV path disabled: {exc}")
+    return causal_conv1d_update(x, conv_state, weight, bias, activation, **kwargs)
+
+
 def forward_extend(
     self,
     layer: RadixLinearAttention,
@@ -429,7 +462,7 @@ def forward_extend(
         mixed_qkv_reshaped = mixed_qkv.view(
             batch_size, draft_token_num, -1
         ).transpose(1, 2)
-        mixed_qkv_processed = causal_conv1d_update(
+        mixed_qkv_processed = conv_update(
             mixed_qkv_reshaped,
             conv_states,
             layer.conv_weights,

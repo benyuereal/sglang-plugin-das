@@ -14,6 +14,7 @@ _GDN_BACKEND_MODULE = "sglang.srt.layers.attention.linear.gdn_backend"
 
 
 def register() -> None:
+    _install_conv_hook()
     hooks = (
         (
             "sglang.srt.layers.attention.linear.gdn_backend.GDNAttnBackend.forward_decode",
@@ -31,6 +32,18 @@ def register() -> None:
     for target, hook in hooks:
         logger.info("[hcu_sglang] register REPLACE hook: %s", target)
         HookRegistry.register(target, hook, HookType.REPLACE)
+
+
+def _install_conv_hook() -> None:
+    """Route the upstream GDN conv call through the plugin dispatcher.
+
+    sglang's own GDNAttnBackend.forward_extend resolves `causal_conv1d_update`
+    from its module globals; replacing the name covers that path as well as the
+    plugin's gdn_source, so the HIP conv kernel is used whichever forward wins.
+    """
+    import sglang.srt.layers.attention.linear.gdn_backend as upstream_gdn
+
+    upstream_gdn.causal_conv1d_update = gdn_source.conv_update
 
 
 def replacement_forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
