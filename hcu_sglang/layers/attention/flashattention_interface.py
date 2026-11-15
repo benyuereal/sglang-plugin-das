@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from typing import Optional, Union
 
 import torch
@@ -242,11 +244,17 @@ def flash_attn_with_kvcache(
             v_descale=v_descale,
             return_softmax_lse=return_softmax_lse,
         )
+        # Split-KV width for the wheel's varlen entry only: the vllm wrapper has
+        # no such kwarg, and unset keeps the wheel's auto sizing (0).
+        forced_splits = os.environ.get("SGLANG_HCU_FA_NUM_SPLITS", "").strip()
+        fa3_kwargs = varlen_kwargs if not forced_splits else {
+            **varlen_kwargs, "num_splits": int(forced_splits)
+        }
         if hnd_layout:
             # bhsd is HND K/V with the page tokens contiguous per head; the
             # vllm wrapper hardcodes "custom" (transposed V), which this pool
             # is not, so the varlen entry is the only correct route here.
-            result = fa3_varlen_func(layout="bhsd", **varlen_kwargs)
+            result = fa3_varlen_func(layout="bhsd", **fa3_kwargs)
         elif _direct_paged_eligible(
             q,
             k_cache,
@@ -261,7 +269,7 @@ def flash_attn_with_kvcache(
             # bshd selects the wheel's direct paged attention kernel for
             # decode and MTP verify; the vllm wrapper hardcodes "custom",
             # which misreads NHD pool shapes and falls back to split-KV.
-            result = fa3_varlen_func(layout="bshd", **varlen_kwargs)
+            result = fa3_varlen_func(layout="bshd", **fa3_kwargs)
         else:
             result = vllm_flash_attn_varlen_func(fa_version=2, **varlen_kwargs)
         return _apply_out(result, out, return_softmax_lse)
