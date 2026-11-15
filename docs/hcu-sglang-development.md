@@ -1,25 +1,29 @@
 # HCU sglang plugin — 现状（2026-11-15）
 
 只写**当前生效**的开关、已验证范围与已知未验证项。历史过程与逐日数据在
-`docs/history/hcu-sglang-development-2026-10-11.md`，排查记录在 `docs/investigations/`。
+`docs/history/`，排障入口见 [故障诊断](troubleshooting.md)，交付证据见
+[交付验证记录](delivery-validation.md)。
 
 ## 平台语义
 
-- HCU 以 **CUDA 语义**对外：`is_hip()` 恒 False（`hcu_adapter/platform_seam.py`）。
+- HCU 以 **CUDA 语义**对外：`is_hip()` 恒 False（adapter 仓 `adapter-das` 的
+  `hcu_adapter/platform_seam.py`）。
   因此上游所有 "ROCm 专用" 分支在 HCU 上不会自动触发，插件必须显式接管。
 
 ## 默认开启（生产等价）
 
 | 开关 | 默认 | 作用 | 验证 |
 |---|---|---|---|
-| `HBIRD_GEMM_SGLANG` + `HBIRD_GEMM_ROLE` | 外部脚本开启 | bf16 linear / lm_head 走 hbird-gemm；`hcu_sglang/layers/gemm/` 是 provider 层 | 20: target 256 层打包、45.31 GiB 释放、skipped 48；T=0 sha 不变 |
+| `HBIRD_GEMM_SGLANG` + `HBIRD_GEMM_ROLE` | 外部脚本开启 | bf16 linear / lm_head 走 hbird-gemm；`hcu_sglang/layers/gemm/` 是 provider 层 | target 打包 256 层、释放 45.31 GiB、skipped 48，draft 打包 4 层；T=0 sha 不变 |
 | `SGLANG_GDN_HIP_BPLUS` + `_HANDOFF` + `_HANDOFF_SKIP_TRACK` | 脚本开启 | GDN verify 只写提交行，commit 只移指针 | 空答案 5/130 → 1/164；accept len 回到 2.50（T=0.2） |
-| `SGLANG_GDN_HIP_BPLUS_SKIP_FULL` | 1 | compensate 只重放截断槽，全接受槽跳过 | 受控 probe 100.5 → 93.2 ms/步 |
+| `SGLANG_GDN_HIP_BPLUS_SKIP_FULL` | 1 | compensate 只重放截断槽，全接受槽跳过；关（=0）则全接受槽也重放 | 受控 probe 100.5 → 93.3 ms/步（=1）；=0 路径在 plain 分支曾静默不重放，已修并加回归测试 |
 | `SGLANG_GDN_HIP_BPLUS_MULTI` | 1 | 48 层 compensate 合并一次 launch；旧 .so 自动回退 | c40 上中性（<0.3 ms） |
-| B+ verify 每步共享索引（无开关，`gdn_bplus.shared_step_values`） | 开 | verify 的 `store`/`store_row`/h0/prev 只依赖 batch，不依赖层：48 层各算一遍改成整步算一次并复用持久 buffer；同时删掉只在写死字段、无人读的 `remember_step`/`tdev.fill_` | 离线 200 组随机逐位全等（`tests/test_gdn_bplus_step_shared.py`、`diag/gdnk_bitwise.py`）；GPU6 c40 单波 40/40、Mean TPOT 26.05、sha 与基线逐位相同；eager 2622 → 1677 kernel/步（B+ 零碎核 993 → 34/步，5.21 → 0.20 ms/步） |
+| B+ verify 每步共享索引（无开关，`gdn_bplus.shared_step_values`） | 开 | verify 的 `store`/`store_row`/h0/prev 只依赖 batch，不依赖层：48 层各算一遍改成整步算一次并复用持久 buffer；同时删掉只在写死字段、无人读的 `remember_step`/`tdev.fill_` | 离线 200 组随机逐位全等（`tests/test_gdn_bplus_step_shared.py`，另有一次仓外 200 组随机对拍）；GPU6 c40 单波 40/40、Mean TPOT 26.05、sha 与基线逐位相同；eager 2622 → 1677 kernel/步（B+ 零碎核 993 → 34/步，5.21 → 0.20 ms/步） |
 | HCU 自动 rejection sampling（无开关，`speculative_compat.py`） | 开 | 非贪心请求避免走缺头的 CUDA JIT；`SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 可关 | T=0.2 全量门可跑完 |
 | `SGLANG_HCU_FUSE_QKVZBA_VERIFY` + `SGLANG_GDN_ZBA_STRIDED` | 1（HCU 默认） | verify 零拷贝 qkvzba 视图 + z/b 保持 strided，split 核消失 | 40/40 TPOT 27.01→26.67，T=0 sha 不变 |
 | `SGLANG_HCU_FUSE_SILU` | 1（HCU 默认） | Triton silu，保留两次 bf16 舍入，取代 lightop 编译核 | 全 shape 逐位对拍 0 mismatch；核 12.99→11.14 µs/call；40/40 TPOT 在噪声内 |
+| `SGLANG_HCU_FA_PAGED_BSHD` | 1（HCU 默认） | decode/MTP-verify 走 wheel `layout="bshd"` 直连 paged 核（NHD 池无需换布局）。**改变 T=0 输出**：与 splitkv 不是同一数值实现 | 40/40 TPOT 26.90→26.10；与产线 custom paged 逐位一致（`logs/pa_layout_equiv.log`）；精度门只挂 #47/#145，两者基线也红 |
+| `SGLANG_MTP_LMHEAD_FP8`（`_BACKEND`/`_CHUNK`） | 脚本开启 | 只替换 draft 模型的 lm_head（target head 不动），e4m3 + hbird fp8 整词表一次 launch | fp8+bshd 40/40 TPOT 25.03、`logs/bench_fp8_bshd.log`。**依赖 `--mem-fraction-static` ≤0.86**：0.88 下 verify 采样 0 bytes free 直接 OOM；0.86 起精度门 19/27、9/9 |
 | `SGLANG_HCU_FUSE_ADD_RMS` | 1（HCU 默认） | 单遍 Gemma add-RMSNorm（x/r 各读一次、residual/x 各写一次） | 全 shape 逐位对拍 0 mismatch；核 18.88→17.14 µs/call（含两次拷贝）；全开 40/40 TPOT 26.58，默认配置（无 env）40/40 TPOT 26.51，T=0 sha 不变 |
 
 ## 默认关闭（实验/A-B 用）
@@ -28,7 +32,6 @@
 |---|---|---|
 | `SGLANG_GDN_HIP_KERNEL` | 0 | kernel-only 线（非 B+）；默认关 |
 | `SGLANG_FORCE_MM_FAST_PROCESSOR_GPU` | 0 | 打开会让 tokenizer 进程建第二个 CUDA context（HCU 驱动 runlist 超订），**不要开** |
-| `SGLANG_HCU_FA_PAGED_BSHD` | 0 | decode/MTP-verify 走 wheel `layout="bshd"` 直连 paged 核（NHD 池无需换布局）。**改变 T=0 输出**：与 splitkv 不是同一数值实现；40/40、TPOT 26.90→26.42 |
 
 ## 已确认的坑（会崩/会错，不是性能问题）
 
@@ -43,17 +46,25 @@
 
 ## 当前水位（同卡、40 请求单波、2k/2k、TEMP=0、双方 40/40）
 
-| | 产线 0.5.18 | clean 0.5.22 |
+最近一轮（`qwen3.8-27b-perf` 合并后，fp8 草稿头 + bshd + `mem-fraction-static 0.87`）：
+
+| | 产线 0.5.18 | clean 0.5.22（合并后） |
 |---|---:|---:|
-| 吞吐 | 1236.93 tok/s | 1026.55 |
-| Mean TPOT | 24.20 ms | 27.07 |
-| Mean TTFT | 12.29 s | 12.39 |
-| Mean ITL | 94.44 ms | 104.09 |
+| 吞吐 | 1236.93 tok/s | 1204.33 |
+| Mean TPOT | 24.20 ms | 24.87 |
+| Mean ITL | 94.44 ms | 97.42 |
+| Median ITL | 81.61 ms | 84.53 |
 
-差距分解：verify +30.6 ms/步、draft_extend +15.0 ms/步，主机侧我们快 12 ms/步。
-精度：投机 12w 全量门 161/163 = 98.77%（空答案 0）。详见 `/workspace/clean-stack/PERF_RECORD.md`。
+差 TPOT +2.8%、吞吐 −2.6%。精度门 20/27 + CONTROLS 9/9，与 bf16 基线持平；
+投机 12w 全量门 161/163 = 98.77%（空答案 0）。日志 `logs/bench_merged.log`。
 
-## decode/verify paged attention（2026-11-15，实验，默认关）
+历史对照（B/C 补丁前，同一口径）：1026.55 tok/s / TPOT 27.07 / ITL 104.09，
+差距分解为 verify +30.6 ms/步、draft_extend +15.0 ms/步、主机侧我们快 12 ms/步。
+详见 `/workspace/clean-stack/PERF_RECORD.md`。
+
+## decode/verify paged attention（2026-11-15，`SGLANG_HCU_FA_PAGED_BSHD` 之上）
+
+> 本节与"当前水位"里的 `logs/*` 都指 `/workspace/clean-stack/logs/`（仓外实测目录）。
 
 口径：Qwen3.8-27B、40 请求单波 2k/2k、TEMP=0、40/40、重启后第一轮、CUDA graph。
 
@@ -97,6 +108,8 @@
 
 - 非 handoff（`HANDOFF=0`）分支未做硬件 A/B。
 - EAGLE topk>1 / deterministic inference 下 rejection sampling 保持关闭（未测）。
-- `SGLANG_ENABLE_PP_SPEC` 的 stable-rows 分支未验证。
+- `SGLANG_ENABLE_PP_SPEC`（官方 SGLang 树的 `sglang/srt/environ.py`，非 plugin 开关）的 stable-rows 分支未验证。
 - 多卡 / TP>1 未验证。
-- B+ 每步共享索引（2026-11-15）：c40 graph bench（40 桶全部捕获）40/40 且 sha 逐位相同，剩余未验证为非 handoff 分支的硬件 A/B 与 PP/TP 场景；窗口脚本 `clean-stack/gdnk_window.sh`。
+- B+ 每步共享索引（2026-11-15）：c40 graph bench（40 桶全部捕获）40/40 且 sha 逐位相同，剩余未验证为非 handoff 分支的硬件 A/B 与 PP/TP 场景；窗口脚本在 `clean-stack/gdnk_window.sh`（仓外）。
+- `SGLANG_MTP_LMHEAD_FP8`：0.86 以下验证通过且精度门通过，但**尚未切到常驻配置**；
+  0.88 下会 OOM，切换前需重跑吞吐与精度门。
