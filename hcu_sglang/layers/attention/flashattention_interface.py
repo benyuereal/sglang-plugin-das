@@ -240,6 +240,7 @@ def flash_attn_with_kvcache(
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            return_softmax_lse=return_softmax_lse,
         )
         if hnd_layout:
             # bhsd is HND K/V with the page tokens contiguous per head; the
@@ -279,6 +280,7 @@ def flash_attn_with_kvcache(
         window_size=window_size,
         softcap=softcap,
         return_softmax_lse=return_softmax_lse,
+        s_aux=sinks,
         num_splits=num_splits,
         layout=1 if hnd_layout else 0,
     )

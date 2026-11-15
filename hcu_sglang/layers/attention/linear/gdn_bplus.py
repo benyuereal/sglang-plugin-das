@@ -155,10 +155,11 @@ def _step_buffer(st, name: str, rows: int, dtype, device) -> torch.Tensor:
 
 def _stride_buffer(st, name: str, stride: int, rows: int, dtype, device):
     bufs = getattr(st, name)
-    buf = bufs.get(int(stride))
-    if buf is None or int(buf.numel()) < rows or buf.dtype != dtype or buf.device != device:
+    key = (int(stride), int(rows))
+    buf = bufs.get(key)
+    if buf is None or buf.dtype != dtype or buf.device != device:
         buf = torch.empty(rows, dtype=dtype, device=device)
-        bufs[int(stride)] = buf
+        bufs[key] = buf
     return buf
 
 
@@ -492,6 +493,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     ent["layer_cache"] = layer_cache
                 inter = layer_cache.intermediate_ssm
                 if inter is None:
+                    st.commit_failed = True
                     continue
                 flat = ent.get("flat")
                 if flat is None:
