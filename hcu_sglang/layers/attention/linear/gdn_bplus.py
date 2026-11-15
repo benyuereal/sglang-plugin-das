@@ -68,9 +68,16 @@ class BplusState:
 
 
 def state(backend) -> BplusState:
-    st = getattr(backend, "_gdn_bplus", None)
+    # The adaptive spec controller builds a second attention backend for its
+    # other step count and swaps it into the model runner between batches, so
+    # backend-local state would separate the committed-row pointer written by
+    # prefill from the one verify reads. The pointer is slot-indexed pool
+    # state; key it on the request pool every backend on this runner shares.
+    pool = getattr(backend, "req_to_token_pool", None)
+    owner = backend if pool is None else pool
+    st = getattr(owner, "_gdn_bplus", None)
     if st is None:
-        st = backend._gdn_bplus = BplusState()
+        st = owner._gdn_bplus = BplusState()
     return st
 
 
