@@ -12,7 +12,12 @@ import time
 
 import torch
 
-from hcu_sglang.constants import AMAX_EPS, BYTES_PER_GIB, MTP_LMHEAD_QUANT_BLOCK
+from hcu_sglang.constants import (
+    AMAX_EPS,
+    BYTES_PER_GIB,
+    MTP_LMHEAD_QUANT_BLOCK,
+    QWEN3_5_MTP_HOOK_BASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,18 +128,35 @@ def _mtp_quantize_lmhead_rows(weight: torch.Tensor):
     return weight_fp8, weight_scale
 
 
-def _mtp_hbird_draft_head(weight_fp8: torch.Tensor, weight_scale: torch.Tensor):
+def _quantize_draft_lm_head(weight: torch.Tensor):
+    try:
+        weight_fp8, weight_scale = _mtp_quantize_lmhead_rows(weight)
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - optional path
+        logger.warning(
+            "[mtp_draft_lmhead_fp8] disabling, quantization failed: %s", exc
+        )
+        return None
+    return weight_fp8, weight_scale
+
+
+def _hbird_supported_ms(ops, *, vocab: int, hidden: int):
+    ms = []
+    for m in range(1, _MTP_HBIRD_MAX_M_DEFAULT + 1):
+        if ops.guard(m, vocab, hidden) != 0:
+            break
+        ms.append(m)
+    if not ms:
+        raise RuntimeError("guard refuses every M")
+    return ms
+
+
+def _prepare_hbird_draft_head(weight_fp8: torch.Tensor):
     try:
         ops = _mtp_hbird_ops()
         vocab, hidden = weight_fp8.shape
         device = weight_fp8.device
-        ms = []
-        for m in range(1, _MTP_HBIRD_MAX_M_DEFAULT + 1):
-            if ops.guard(m, vocab, hidden) != 0:
-                break
-            ms.append(m)
-        if not ms:
-            raise RuntimeError("guard refuses every M")
+        ms = _hbird_supported_ms(ops, vocab=vocab, hidden=hidden)
         started = time.perf_counter()
         ops.prepare_weight(weight_fp8)
         for m in ms:
@@ -159,7 +181,7 @@ def _mtp_hbird_draft_head(weight_fp8: torch.Tensor, weight_scale: torch.Tensor):
     return ops.hbird_fp8_gemm, ms[-1]
 
 
-def _eligible(model) -> bool:
+def _should_use_fp8_draft_head(model) -> bool:
     """Cheap gates first: a captured stream cannot allocate, and the proxy must
     not wrap itself."""
     if getattr(model, "_mtp_fp8_installed", False):
@@ -183,32 +205,41 @@ def _eligible(model) -> bool:
     )
 
 
+def _install_fp8_draft_head(
+    *,
+    model,
+    head,
+    weight_fp8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    hbird_gemm,
+    hbird_max_m: int,
+) -> None:
+    method = _MTPDraftLMHeadFP8Method(
+        head, weight_fp8, weight_scale, hbird_gemm, hbird_max_m
+    )
+    object.__setattr__(model, "lm_head", _MTPDraftLMHeadFP8Proxy(head, method))
+
+
 def install(model) -> bool:
-    if not _eligible(model):
+    if not _should_use_fp8_draft_head(model):
         return False
     head = model.lm_head
     weight = head.weight
-    try:
-        started = time.perf_counter()
-        weight_fp8, weight_scale = _mtp_quantize_lmhead_rows(weight.detach())
-        torch.cuda.synchronize()
-    except Exception as exc:  # noqa: BLE001 - optional path
-        logger.warning(
-            "[mtp_draft_lmhead_fp8] disabling, quantization failed: %s", exc
-        )
+    started = time.perf_counter()
+    quantized = _quantize_draft_lm_head(weight.detach())
+    if quantized is None:
         return False
-    hbird_gemm, hbird_max_m = _mtp_hbird_draft_head(weight_fp8, weight_scale)
+    weight_fp8, weight_scale = quantized
+    hbird_gemm, hbird_max_m = _prepare_hbird_draft_head(weight_fp8)
     if hbird_gemm is None:
         return False
-    object.__setattr__(
-        model,
-        "lm_head",
-        _MTPDraftLMHeadFP8Proxy(
-            head,
-            _MTPDraftLMHeadFP8Method(
-                head, weight_fp8, weight_scale, hbird_gemm, hbird_max_m
-            ),
-        ),
+    _install_fp8_draft_head(
+        model=model,
+        head=head,
+        weight_fp8=weight_fp8,
+        weight_scale=weight_scale,
+        hbird_gemm=hbird_gemm,
+        hbird_max_m=hbird_max_m,
     )
     model._mtp_fp8_installed = True
     logger.info(
@@ -255,17 +286,18 @@ def _around_set_embed_and_head(original, self, embed, head):
     return out
 
 
+_AROUND_HOOKS = (
+    ("set_lm_head_from_target", _around_set_lm_head),
+    ("set_embed_and_head", _around_set_embed_and_head),
+)
+
+
 def register() -> bool:
     if not _mtp_lmhead_fp8_enabled():
         return False
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    base = "sglang.srt.models.qwen3_5_mtp.Qwen3_5ForCausalLMMTP."
-    HookRegistry.register(
-        base + "set_lm_head_from_target", _around_set_lm_head, HookType.AROUND
-    )
-    HookRegistry.register(
-        base + "set_embed_and_head", _around_set_embed_and_head, HookType.AROUND
-    )
+    for method, hook in _AROUND_HOOKS:
+        HookRegistry.register(QWEN3_5_MTP_HOOK_BASE + method, hook, HookType.AROUND)
     logger.info("[mtp_draft_lmhead_fp8] draft head fp8 hooks registered")
     return True

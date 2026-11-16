@@ -32,3 +32,7 @@ AMAX_EPS = 1e-8
 PAGED_DECODE_PAGE_SIZE = 64
 PAGED_VERIFY_MAX_Q = 16
 PAGED_VERIFY_Q_ROWS_PER_KV_HEAD = 64
+
+# Prefix of the Qwen3.5 MTP setters the draft-head hooks patch; the method
+# name is appended to it.
+QWEN3_5_MTP_HOOK_BASE = "sglang.srt.models.qwen3_5_mtp.Qwen3_5ForCausalLMMTP."
