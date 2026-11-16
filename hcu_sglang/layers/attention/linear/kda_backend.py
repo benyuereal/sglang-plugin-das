@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import types
 import dis
 import builtins
@@ -7,6 +8,7 @@ from typing import Optional, Tuple, Union
 import sglang.srt.layers.attention.linear.kda_backend as K
 import sglang.srt.layers.attention.hybrid_linear_attn_backend as H
 import sglang.srt.layers.attention.mamba.mamba2_metadata as MD
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 globals().update({name: value for name, value in vars(K).items() if not name.startswith("__")})
 globals().update({name: value for name, value in vars(H).items() if not name.startswith("__")})
@@ -2041,7 +2043,7 @@ def _bind(raw, module, owner, name, decorators):
 
 def _track_skip_enabled() -> bool:
     """Radix-off serving never consumes the per-step mamba track checkpoints."""
-    return __import__("os").environ.get("SGLANG_GDN_TRACK_SKIP") == "1"
+    return os.environ.get("SGLANG_GDN_TRACK_SKIP") == "1"
 
 
 def _around_set_mamba_track_indices(original, batch, track_positions=None):
@@ -2089,8 +2091,6 @@ def register_hooks():
     from hcu_sglang import speculative_kda
     speculative_kda.register_hooks()
     if _track_skip_enabled():
-        from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
         HookRegistry.register(
             "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
             _around_set_mamba_track_indices,
