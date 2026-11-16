@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from hcu_sglang.models.qwen3_5_mtp_fp8 import _MTPDraftLMHeadFP8Method
+from hcu_sglang.models.mtp_lmhead_quant import DraftHeadQuantMethod, active_scheme
 
 
 class _Head:
@@ -19,12 +19,13 @@ class WideRowsTest(unittest.TestCase):
     def test_wide_rows_use_the_weight_not_the_module(self):
         vocab, hidden, rows = 8, 4, 5
         weight = torch.randn(vocab, hidden, dtype=torch.bfloat16)
-        method = _MTPDraftLMHeadFP8Method(
+        method = DraftHeadQuantMethod(
             _Head(weight),
             torch.empty((vocab, hidden), dtype=torch.float8_e4m3fn),
             torch.ones((vocab, 1)),
-            hbird_gemm=None,
-            hbird_max_m=rows - 1,
+            gemm=None,
+            max_m=rows - 1,
+            scheme=active_scheme(),
         )
         x = torch.randn(rows, hidden, dtype=torch.bfloat16)
         out = method.apply(None, x)
