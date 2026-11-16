@@ -164,7 +164,7 @@ def vllm_flash_attn_varlen_func(*args, **kwargs):
     return flash_attn.flash_attn_varlen_func(**forwarded)
 
 
-def install() -> bool:
+def install_varlen_layout() -> bool:
     """Point flash_attn's wrapper at the layout-aware replacement."""
     global _INSTALLED
     if _INSTALLED:

@@ -13,13 +13,13 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 INTERFACE = ROOT / "hcu_sglang/layers/attention/flashattention_interface.py"
-PATCH = ROOT / "hcu_sglang/patches/flash_attn_layout.py"
+PATCH = ROOT / "hcu_sglang/compat/flash_attn.py"
 
 
 def _load_layout_patch():
     """Load the layout patch module without importing the hcu_sglang package."""
     stubs = {}
-    for name in ("hcu_sglang", "hcu_sglang.patches"):
+    for name in ("hcu_sglang", "hcu_sglang.compat"):
         module = types.ModuleType(name)
         module.__path__ = []
         stubs[name] = module

@@ -193,7 +193,7 @@ def flash_attn_with_kvcache(
             result = fa3_varlen_func(layout="bhsd", **varlen_kwargs)
         else:
             # The wheel's layout choice is replaced at import by
-            # hcu_sglang.patches.flash_attn_layout.
+            # hcu_sglang.compat.flash_attn.
             result = vllm_flash_attn_varlen_func(fa_version=2, **varlen_kwargs)
         return _apply_out(result, out, return_softmax_lse)
 
