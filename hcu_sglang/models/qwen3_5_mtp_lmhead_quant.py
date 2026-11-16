@@ -11,6 +11,7 @@ import os
 import time
 
 import torch
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 from hcu_sglang.constants import BYTES_PER_GIB, QWEN3_5_MTP_HOOK_BASE
 from hcu_sglang.layers.gemm import quant_lm_head
@@ -122,8 +123,6 @@ _AROUND_HOOKS = (
 def register() -> bool:
     if not _mtp_lmhead_fp8_enabled():
         return False
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
     for method, hook in _AROUND_HOOKS:
         HookRegistry.register(QWEN3_5_MTP_HOOK_BASE + method, hook, HookType.AROUND)
     logger.info("[mtp_draft_lmhead_fp8] draft head fp8 hooks registered")

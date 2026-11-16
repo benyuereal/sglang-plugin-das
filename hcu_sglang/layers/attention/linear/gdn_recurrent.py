@@ -147,8 +147,7 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
           o, snap_buf, snap_idx, cache_steps, store_step, store_row, n_seq,
           tok_per_seq, hv, h, kdim, vdim, use_h0=None):
     """Launch a B+ entry by its typed cffi function object (never a name)."""
-    # use_initial_state and varlen are independent: the compensate replay has no
-    # cu_seqlens (fixed D steps) but must still read h0.
+    # use_initial_state and varlen are independent (compensate: no cu_seqlens).
     if use_h0 is None:
         use_h0 = True
     fn(
@@ -163,15 +162,13 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
         _ptr(store_row),
         int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
         int(hv // h),
-        # a and b carry separate strides: b is often a slice of a wider buffer
-        # (96 vs a's 48) and a shared one makes a read another token's row.
+        # a and b carry separate strides: b is often a slice of a wider buffer.
         _tok_stride(q), _tok_stride(k), _tok_stride(v),
         _tok_stride(a), _tok_stride(b),
         1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
         # (use_initial_state, varlen, disable_state_update)
         1 if use_h0 else 0,
-        # varlen must be off without cu_seqlens: the kernel would read through
-        # the null pointer.
+        # varlen must be off without cu_seqlens: the kernel would read null.
         0 if cu_seqlens is None else 1,
         1,
         _stream(),
@@ -181,15 +178,13 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
            snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step=None,
            store=None, store_row=None):
     """Write the full-run snapshot to row (prev_step+1) % cache_steps."""
-    # store/store_row are per-batch, not per-layer: the handoff caller computes
-    # them once per step and passes them in; the fallback keeps the old path.
+    # store/store_row are per-batch: the handoff caller computes them once.
     n = int(snap_idx.shape[0])
     if store is None:
         store = torch.full((n,), draft_token_num - 1, dtype=torch.int32,
                            device=snap_idx.device)
-    # Slot ids come from snap_idx: cache_indices holds flat h0 rows here
-    # (slot*D+prev) and indexing prev_step with them reads out of bounds, which
-    # a captured graph turns into a VMFault.
+    # Slot ids come from snap_idx; cache_indices holds flat h0 rows here and
+    # indexing prev_step with them reads out of bounds (VMFault in a graph).
     if store_row is None:
         if prev_step is None:
             # No state handoff: write the full-accept row (draft_token_num - 1).

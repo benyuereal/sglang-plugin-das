@@ -1,18 +1,9 @@
 """HCU overlay on sglang's GDN backend.
 
-The upstream module is imported and its namespace copied in wholesale, so
-everything this file does not redefine is upstream code. Only these are ours,
-each for one reason:
-
-- ``forward_decode``      decode step: B+ commit/handoff, the HIP recurrent
-                          entry, and the HCU causal-conv path.
-- ``forward_extend``      prefill/verify: B+ seed and stash, the HIP verify
-                          entry, and the HCU conv.
-- ``_convolve_prefill``   HCU causal_conv1d instead of the Triton conv.
-- ``conv_update``         the same swap for the single-token update.
-
-When a change here is general rather than HCU-specific it belongs upstream:
-see flash-attention-das ``fix/varlen-layout`` for the pattern.
+Everything not redefined here is upstream code. Ours: ``forward_decode``
+(B+ commit/handoff, HIP recurrent, HCU conv), ``forward_extend`` (verify
+kernel entries; prefill stays upstream), ``_convolve_prefill`` and
+``conv_update`` (HCU causal_conv1d). General fixes belong upstream.
 """
 
 from __future__ import annotations
@@ -24,6 +15,10 @@ from sglang.srt.utils import get_bool_env_var
 globals().update({name: value for name, value in vars(upstream).items()
                   if not name.startswith("__")})
 _is_hcu = is_hcu()
+# Keep the original in a tuple: the hook registry propagates its patch to every
+# module attribute that *is* the original function, and a direct alias would be
+# rewritten to the wrapper -- calling it would recurse into this file.
+_UPSTREAM_FORWARD_EXTEND = (upstream.GDNAttnBackend.forward_extend,)
 _use_hcu_causal_conv1d = False
 if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
     try:
@@ -323,8 +318,6 @@ def conv_update(x, conv_state, weight, bias=None, activation=None, **kwargs):
     """Triton causal_conv1d_update, or its HIP twin under SGLANG_GDN_HIP_CONV=1."""
     if _is_hcu:
         try:
-            from hcu_sglang.layers.attention.linear import gdn_recurrent
-
             if gdn_recurrent.conv_enabled():
                 out = gdn_recurrent.conv_update(
                     x, conv_state, weight, bias, activation, **kwargs
@@ -353,136 +346,79 @@ def forward_extend(
     b: torch.Tensor,
     **kwargs,
 ):
-    assert isinstance(mixed_qkv, torch.Tensor)
-    seq_len = mixed_qkv.shape[0]
-
-    if _is_hip and seq_len == 0:
-        return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
-
-    is_target_verify = forward_batch.forward_mode.is_target_verify()
-    forward_metadata = self.forward_metadata
-
-    query_start_loc = forward_metadata.query_start_loc
-    cache_indices = forward_metadata.mamba_cache_indices
-    retrieve_next_token = forward_metadata.retrieve_next_token
-    retrieve_next_sibling = forward_metadata.retrieve_next_sibling
-    retrieve_parent_token = forward_metadata.retrieve_parent_token
-
-    mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-    conv_states = mamba_cache_params.conv[0]
-    ssm_states = mamba_cache_params.temporal
-    if self.mis_metadata is not None:
-        if is_target_verify:
-            raise ValueError("GDN MIS does not support target verify")
-        return self._forward_extend_mis(
-            layer=layer,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-            conv_states=conv_states,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-        )
-    if is_target_verify:
-        assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
-        intermediate_state_cache = mamba_cache_params.intermediate_ssm
-        intermediate_conv_window_cache = (
-            mamba_cache_params.intermediate_conv_window[0]
-        )
-        # The mask is only read by the PP stable-rows path; computing it per
-        # layer otherwise costs one elementwise launch per GDN layer per step.
-        stable_rows = pp_spec_stable_rows_enabled()
-        valid_rows = (
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0
-            if stable_rows
-            else None
-        )
-        intermediate_state_indices = select_verify_intermediate_state_indices(
-            self.verify_intermediate_state_indices,
-            forward_batch.req_pool_indices,
-            valid_rows,
-            self.req_to_token_pool.size,
-        )
-        mamba_pool = self.req_to_token_pool.mamba_pool
-        use_replayssm_fold = (
-            mamba_cache_params.replayssm_rawv is not None
-            and getattr(mamba_pool, "replayssm_spec_fold", False)
-            and not getattr(mamba_pool, "replayssm_is_kda", False)
-        )
-        use_replayssm_spec = (
-            mamba_cache_params.replayssm_d is not None
-            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
-            and not getattr(mamba_pool, "replayssm_is_kda", False)
-        )
-
-    # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-    # chunk_gated_delta_rule) write state back in place assuming a contiguous
-    # slot layout, so they silently drop the write to the strided envelope
-    # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-    # scatter the result back. No-op for the default contiguous pool.
-    # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
-    # proper indexed writes and handle non-contiguous pools directly via
-    # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-    # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-    # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-    # int64 indexing, like packed_decode / causal_conv1d_update already do.
-    needs_state_gather = (
-        self.requires_contiguous_prefill_state
-        and (not is_target_verify)
-        and (not is_cpu())
-        and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+    """Prefill stays upstream; target verify takes the B+/HIP entries."""
+    if _verify_kernel_path(self, layer, forward_batch, mixed_qkv):
+        return _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b)
+    core_attn_out = _UPSTREAM_FORWARD_EXTEND[0](
+        self, layer, forward_batch, mixed_qkv, a, b, **kwargs
     )
-    if needs_state_gather:
-        conv_states_contig = conv_states[cache_indices].contiguous()
-        ssm_states_contig = ssm_states[cache_indices].contiguous()
-        state_cache_indices = torch.arange(
-            cache_indices.shape[0],
-            device=cache_indices.device,
-            dtype=cache_indices.dtype,
+    # Real prefill only: seeding on the MTP draft extend would copy the whole
+    # state (6 GiB per step) for slots that already have a live handoff row.
+    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    inter = getattr(mamba_cache, "intermediate_ssm", None)
+    if inter is not None and forward_batch.forward_mode.is_extend_without_speculative():
+        gdn_commit.seed_prev(
+            self,
+            self.forward_metadata.mamba_cache_indices,
+            mamba_cache,
+            int(inter.shape[1]),
         )
-    else:
-        conv_states_contig = conv_states
-        ssm_states_contig = ssm_states
-        state_cache_indices = cache_indices
+    return core_attn_out
 
-    if is_target_verify:
-        batch_size = seq_len // forward_batch.spec_info.draft_token_num
-        draft_token_num = forward_batch.spec_info.draft_token_num
-        mixed_qkv_reshaped = mixed_qkv.view(
-            batch_size, draft_token_num, -1
-        ).transpose(1, 2)
-        mixed_qkv_processed = conv_update(
-            mixed_qkv_reshaped,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices[:batch_size],
-            intermediate_conv_window=intermediate_conv_window_cache,
-            intermediate_state_indices=intermediate_state_indices[:batch_size],
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            retrieve_parent_token=retrieve_parent_token,
-        )
-        mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-    else:
-        if forward_metadata.has_mamba_track_mask:
-            mixed_qkv_to_track = mixed_qkv[
-                forward_metadata.track_conv_indices
-            ].transpose(1, 2)
-            conv_states[forward_metadata.conv_states_mask_indices] = (
-                mixed_qkv_to_track
-            )
 
-        mixed_qkv = self._convolve_prefill(
-            layer,
-            forward_batch,
-            mixed_qkv,
-            conv_states_contig,
-            state_cache_indices,
-        )
+def _verify_kernel_path(self, layer, forward_batch, mixed_qkv) -> bool:
+    """Only target verify, only with a kernel entry, and never on ReplaySSM."""
+    if not forward_batch.forward_mode.is_target_verify():
+        return False
+    if not (_gdn_recurrent_enabled() or _gdn_hip_kernel_enabled()):
+        return False
+    if self.mis_metadata is not None or not isinstance(mixed_qkv, torch.Tensor):
+        return False
+    if mixed_qkv.shape[0] == 0:
+        return False
+    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    return mamba_cache.replayssm_d is None and mamba_cache.replayssm_rawv is None
 
-    actual_seq_len = mixed_qkv.shape[0]
+
+def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
+    seq_len = int(mixed_qkv.shape[0])
+    draft_token_num = int(forward_batch.spec_info.draft_token_num)
+    batch_size = seq_len // draft_token_num
+    meta = self.forward_metadata
+    query_start_loc = meta.query_start_loc
+    cache_indices = meta.mamba_cache_indices
+    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    conv_states = mamba_cache.conv[0]
+    ssm_states = mamba_cache.temporal
+    intermediate_state_cache = mamba_cache.intermediate_ssm
+    assert intermediate_state_cache is not None, (
+        "recurrent target_verify requires intermediate_ssm, "
+        "which is not allocated under --enable-linear-replayssm-spec"
+    )
+    # The mask is only read by the PP stable-rows path; computing it per
+    # layer otherwise costs one elementwise launch per GDN layer per step.
+    intermediate_indices = select_verify_intermediate_state_indices(
+        self.verify_intermediate_state_indices,
+        forward_batch.req_pool_indices,
+        cache_indices[: query_start_loc.shape[0] - 1] >= 0
+        if pp_spec_stable_rows_enabled()
+        else None,
+        self.req_to_token_pool.size,
+    )
+    mixed_qkv = conv_update(
+        mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2),
+        conv_states,
+        layer.conv_weights,
+        layer.bias,
+        layer.activation,
+        conv_state_indices=cache_indices[:batch_size],
+        intermediate_conv_window=mamba_cache.intermediate_conv_window[0],
+        intermediate_state_indices=intermediate_indices[:batch_size],
+        retrieve_next_token=meta.retrieve_next_token,
+        retrieve_next_sibling=meta.retrieve_next_sibling,
+        retrieve_parent_token=meta.retrieve_parent_token,
+    ).transpose(1, 2).view(seq_len, -1)
+
     qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
     if (
         (is_cuda() or is_hip() or is_xpu())
@@ -500,244 +436,72 @@ def forward_extend(
         )
     else:
         query, key, value = torch.split(
-            mixed_qkv,
-            [layer.q_dim, layer.k_dim, layer.v_dim],
-            dim=-1,
+            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
         )
-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        query = query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
 
-    if is_target_verify:
-        # ReplaySSM verify protocols: fold-every-commit (ring-write during
-        # verify, fold on commit), circular ring, or the snapshotting
-        # fallback when neither ring is allocated.
-        if use_replayssm_fold:
-            core_attn_out = self._replayssm_fold_target_verify(
-                layer=layer,
-                query=query,
-                key=key,
-                value=value,
-                a=a,
-                b=b,
-                layer_cache=mamba_cache_params,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-        elif use_replayssm_spec:
-            core_attn_out = self._replayssm_target_verify(
-                layer=layer,
-                query=query,
-                key=key,
-                value=value,
-                a=a,
-                b=b,
-                mamba_pool=mamba_pool,
-                layer_cache=mamba_cache_params,
-                cache_indices=cache_indices,
-                replay_indices=forward_batch.req_pool_indices,
-                query_start_loc=query_start_loc,
-                draft_token_num=forward_batch.spec_info.draft_token_num,
-            )
-        else:
-            # The recurrent fallback needs the per-draft snapshots, which
-            # the pool gates OFF under --enable-linear-replayssm-spec (the
-            # same flag that makes `use_replayssm_spec` true above), so
-            # this branch is unreachable with a None buffer by
-            # construction -- keep it loud rather than silently frozen.
-            assert intermediate_state_cache is not None, (
-                "recurrent target_verify fallback requires intermediate_ssm, "
-                "which is not allocated under --enable-linear-replayssm-spec"
-            )
-            if _gdn_recurrent_enabled():
-                from hcu_sglang.layers.attention.linear import (
-                    gdn_commit,
-                    gdn_recurrent,
-                )
-
-                n = batch_size
-                if gdn_commit.stash(
-                    self, layer, query, key, value, a, b, draft_token_num
-                ):
-                    flat = intermediate_state_cache.reshape(
-                        -1, *intermediate_state_cache.shape[2:]
-                    )
-                    store_arg = store_row_arg = None
-                    if gdn_commit.handoff_enabled():
-                        # Slot-indexed scratch rows: the committed row then has a
-                        # stable address, so commit only moves an int32 pointer.
-                        # Row stride is the allocated cache_steps, not the
-                        # runtime draft-token count (adaptive steps vary it).
-                        cache_steps = int(intermediate_state_cache.shape[1])
-                        slots = cache_indices[:n].to(torch.int32)
-                        snap_idx = slots
-                        gdn_commit.begin_verify_step(self, layer.layer_id)
-                        sh = gdn_commit.shared_step_values(
-                            self,
-                            slots,
-                            mamba_cache_params,
-                            cache_steps,
-                            int(draft_token_num),
-                        )
-                        h0_src = flat
-                        h0_idx = sh["rows"][cache_steps]["h0"]
-                        store_arg = sh["store"]
-                        store_row_arg = sh["rows"][cache_steps]["store_row"]
-                        prev_arg = gdn_commit.state(self).prev
-                    else:
-                        snap_idx = intermediate_state_indices[:n].to(torch.int32)
-                        h0_src = ssm_states
-                        h0_idx = cache_indices[:n].to(torch.int32)
-                        prev_arg = None
-                    gdn_commit.state(self).snap_idx = snap_idx
-                    hip_out = query.new_empty(
-                        (1, query.shape[1], value.shape[2], value.shape[3])
-                    )
-                    gdn_recurrent.verify(
-                        query,
-                        key,
-                        value,
-                        a,
-                        b,
-                        layer.A_log,
-                        layer.dt_bias,
-                        query_start_loc[: n + 1],
-                        h0_src,
-                        h0_idx,
-                        flat,
-                        snap_idx,
-                        int(intermediate_state_cache.shape[1]),
-                        int(draft_token_num),
-                        hip_out,
-                        prev_step=prev_arg,
-                        store=store_arg,
-                        store_row=store_row_arg,
-                    )
-                    return hip_out
-            if _gdn_hip_kernel_enabled():
-                from hcu_sglang.layers.attention.linear import gdn_recurrent
-
-                if not _HIP_LOG["done"]:
-                    rank0_log("GDN HIP kernel-only verify path active")
-                    _HIP_LOG["done"] = True
-
-                n = batch_size
-                flat = intermediate_state_cache.reshape(
-                    -1, *intermediate_state_cache.shape[2:]
-                )
-                hip_out = query.new_empty(
-                    (1, query.shape[1], value.shape[2], value.shape[3])
-                )
-                gdn_recurrent.verify_full(
-                    query,
-                    key,
-                    value,
-                    a,
-                    b,
-                    layer.A_log,
-                    layer.dt_bias,
-                    query_start_loc[: n + 1],
-                    ssm_states,
-                    cache_indices[:n].to(torch.int32),
-                    flat,
-                    intermediate_state_indices[:n].to(torch.int32),
-                    int(intermediate_state_cache.shape[1]),
-                    int(draft_token_num),
-                    hip_out,
-                )
-                return hip_out
-            core_attn_out = self.kernel_dispatcher.target_verify(
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
-                stable_rows=pp_spec_stable_rows_enabled(),
-            )
-    else:
-        g, beta = self._prefill_gates(layer, a, b)
-        h_track_buf = None
-        if (
-            forward_metadata.has_mamba_track_mask
-            and forward_metadata.track_ssm_h_src.numel() > 0
-            and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
-        ):
-            # Snapshot-capable kernels can supply just the selected FP32
-            # checkpoint instead of materializing all per-chunk states.
-            assert forward_metadata.track_chunk_idx is not None
-            h_track_buf = torch.empty(
-                (len(cache_indices), *ssm_states.shape[1:]),
-                dtype=torch.float32,
-                device=ssm_states.device,
-            )
-        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+    if _gdn_recurrent_enabled():
+        hip_out = gdn_commit.verify_step(
+            backend=self,
+            layer=layer,
             q=query,
             k=key,
             v=value,
-            g=g,
-            beta=beta,
-            ssm_states=ssm_states_contig,
-            cache_indices=state_cache_indices,
+            a=a,
+            b=b,
+            draft_token_num=draft_token_num,
+            n=batch_size,
+            snap_cache=intermediate_state_cache,
+            cache_indices=cache_indices,
+            intermediate_indices=intermediate_indices,
+            mamba_cache=mamba_cache,
+            ss_states=ssm_states,
             query_start_loc=query_start_loc,
-            state_checkpoint_cu_starts=(
-                forward_metadata.state_checkpoint_cu_starts
-            ),
-            num_state_checkpoints=forward_metadata.num_state_checkpoints,
-            state_checkpoint_every_n_tokens=(
-                forward_metadata.state_checkpoint_every_n_tokens
-            ),
-            output=kwargs.get("linear_attn_output"),
-            layer_id=layer.layer_id,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            track_state=h_track_buf,
-            track_chunk_idx=(
-                forward_metadata.track_chunk_idx
-                if h_track_buf is not None
-                else None
-            ),
         )
-
-        if is_npu() and last_recurrent_state is not None:
-            last_recurrent_state = last_recurrent_state.to(
-                ssm_states.dtype, copy=False
-            )
-            ssm_states[cache_indices] = last_recurrent_state
-
-        if needs_state_gather:
-            # Scatter the in-place-updated contiguous copies back to the
-            # strided envelope pool (advanced indexing handles the strides).
-            conv_states[cache_indices] = conv_states_contig
-            ssm_states[cache_indices] = ssm_states_contig
-
-        if forward_metadata.has_mamba_track_mask:
-            self._track_mamba_state_extend(
-                forward_batch,
-                h,
-                ssm_states,
-                forward_metadata,
-                h_track_buf=h_track_buf,
-            )
-
-        from hcu_sglang.layers.attention.linear import gdn_commit
-
-        # Real prefill only: the MTP draft extend also takes this branch, and
-        # seeding there copies the whole state (6 GiB per draft step) for slots
-        # that already have a live handoff row.
-        inter = getattr(mamba_cache_params, "intermediate_ssm", None)
-        if inter is not None and forward_batch.forward_mode.is_extend_without_speculative():
-            gdn_commit.seed_prev(
-                self, cache_indices, mamba_cache_params, int(inter.shape[1])
-            )
-
-    return core_attn_out
+        if hip_out is not None:
+            return hip_out
+    if _gdn_hip_kernel_enabled():
+        if not _HIP_LOG["done"]:
+            rank0_log("GDN HIP kernel-only verify path active")
+            _HIP_LOG["done"] = True
+        flat = intermediate_state_cache.reshape(
+            -1, *intermediate_state_cache.shape[2:]
+        )
+        hip_out = query.new_empty((1, query.shape[1], value.shape[2], value.shape[3]))
+        gdn_recurrent.verify_full(
+            query,
+            key,
+            value,
+            a,
+            b,
+            layer.A_log,
+            layer.dt_bias,
+            query_start_loc[: batch_size + 1],
+            ssm_states,
+            cache_indices[:batch_size].to(torch.int32),
+            flat,
+            intermediate_indices[:batch_size].to(torch.int32),
+            int(intermediate_state_cache.shape[1]),
+            draft_token_num,
+            hip_out,
+        )
+        return hip_out
+    return self.kernel_dispatcher.target_verify(
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        q=query,
+        k=key,
+        v=value,
+        a=a,
+        b=b,
+        ssm_states=ssm_states,
+        cache_indices=cache_indices,
+        query_start_loc=query_start_loc,
+        intermediate_states_buffer=intermediate_state_cache,
+        intermediate_state_indices=intermediate_indices,
+        cache_steps=forward_batch.spec_info.draft_token_num,
+        retrieve_parent_token=meta.retrieve_parent_token,
+        stable_rows=pp_spec_stable_rows_enabled(),
+    )

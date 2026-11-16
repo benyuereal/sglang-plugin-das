@@ -111,11 +111,8 @@ class CommitState:
         self.tmp64_buf = {}
 
 def state(backend) -> CommitState:
-    # The adaptive spec controller builds a second attention backend for its
-    # other step count and swaps it into the model runner between batches, so
-    # backend-local state would separate the committed-row pointer written by
-    # prefill from the one verify reads. The pointer is slot-indexed pool
-    # state; key it on the request pool every backend on this runner shares.
+    # The adaptive controller swaps a second backend in between batches, so
+    # key the pointer on the shared request pool, not on the backend.
     pool = getattr(backend, "req_to_token_pool", None)
     owner = backend if pool is None else pool
     st = getattr(owner, "_gdn_commit", None)
@@ -313,14 +310,12 @@ def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) 
 def _commit_prev(backend, st, state_indices, last_correct, T: int, cache_steps: int):
     idx = state_indices.to(torch.int64)
     last = last_correct.to(torch.int64)
-    # Rows are rotated here, not in the forward: the forward's Python tensors
-    # keep the capture batch's length, the commit sees the live batch.
+    # Rotate here: the forward keeps the capture batch's length, this sees live.
     prev = st.prev.index_select(0, idx.clamp_min(0)).to(torch.int64)
     store_row = torch.remainder(prev + 1, cache_steps)
     keep = torch.where(last < T - 1, last, store_row).to(torch.int32)
-    # Boolean-mask indexing (idx[valid]) sizes its output on the device, which
-    # stalls the host behind the whole decode step; route invalid slots to the
-    # buffer's discard row instead.
+    # idx[valid] sizes its output on the device and stalls the host; route
+    # invalid slots to the buffer's discard row instead.
     discard = torch.full_like(idx, st.prev.numel() - 1)
     put_idx = torch.where(idx >= 0, idx, discard)
     st.prev.index_copy_(0, put_idx, keep)
@@ -441,6 +436,49 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         logger.warning("[gdn-bplus] stash failed", exc_info=True)
         return False
 
+def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n,
+                snap_cache, cache_indices, intermediate_indices,
+                mamba_cache, ss_states, query_start_loc):
+    """Write this step's snapshot row and hand the truncated rows to ``stash``.
+
+    Returns the kernel output, or None when the chain declined.
+    """
+    if not stash(backend, layer, q, k, v, a, b, draft_token_num):
+        return None
+    flat = snap_cache.reshape(-1, *snap_cache.shape[2:])
+    store_arg = store_row_arg = None
+    if handoff_enabled():
+        # Slot-indexed scratch rows give the committed row a stable address,
+        # so commit only moves an int32 pointer; stride is the allocated
+        # cache_steps, not the runtime draft-token count.
+        cache_steps = int(snap_cache.shape[1])
+        slots = cache_indices[:n].to(torch.int32)
+        snap_idx = slots
+        begin_verify_step(backend, layer.layer_id)
+        sh = shared_step_values(
+            backend, slots, mamba_cache, cache_steps, int(draft_token_num)
+        )
+        h0_src = flat
+        h0_idx = sh["rows"][cache_steps]["h0"]
+        store_arg = sh["store"]
+        store_row_arg = sh["rows"][cache_steps]["store_row"]
+        prev_arg = state(backend).prev
+    else:
+        snap_idx = intermediate_indices[:n].to(torch.int32)
+        h0_src = ss_states
+        h0_idx = cache_indices[:n].to(torch.int32)
+        prev_arg = None
+    state(backend).snap_idx = snap_idx
+    out = q.new_empty((1, q.shape[1], v.shape[2], v.shape[3]))
+    gdn_recurrent.verify(
+        q, k, v, a, b, layer.A_log, layer.dt_bias,
+        query_start_loc[: n + 1],
+        h0_src, h0_idx, flat, snap_idx,
+        int(snap_cache.shape[1]), int(draft_token_num), out,
+        prev_step=prev_arg, store=store_arg, store_row=store_row_arg,
+    )
+    return out
+
 def compensate_from_stash(backend, state_indices, last_correct) -> bool:
     """Replay the stash for the truncated slots, before the upstream scatter."""
     if not enabled():
@@ -450,8 +488,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         return False
     handoff = handoff_enabled()
     try:
-        # Graph replay skips the verify forward's Python, so anything it
-        # recorded describes the last captured bucket; prefer the live value.
+        # Graph replay skips verify's Python: prefer the live value.
         T = int(st.live_T or st.capture_T)
         if T <= 1:
             return False
@@ -468,8 +505,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     return False
                 snap32 = st.snap_idx.to(torch.int32)
             else:
-                # Default verify rows are batch positions; rebuild them for the
-                # live batch instead of reusing the capture bucket's view.
+                # Default verify rows are batch positions; rebuild for the live batch.
                 snap32 = torch.arange(
                     n, dtype=torch.int32, device=state_indices.device
                 )
@@ -488,13 +524,10 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
             slots_now = state_indices.to(torch.int32)
             prev_now = None
         skip_full = os.environ.get("SGLANG_GDN_HIP_BPLUS_SKIP_FULL", "1") != "0"
-        # A full accept already committed the row verify wrote; replay only the
-        # truncated slots, so their h0 read is not paid for. Same index tensor
-        # for every layer: the row stride does not depend on the layer.
-        # ``neg`` is built unconditionally: ``torch.where`` raises on a None
-        # third argument, and the per-layer except would then drop every layer's
-        # row. With the switch off it is the row's own index, so a full accept
-        # still replays.
+        # A full accept already committed verify's row, so replay only the
+        # truncated slots. ``neg`` is built unconditionally: ``torch.where``
+        # rejects None, and the per-layer except would drop every layer.
+        # With the switch off a full accept still replays.
         neg = torch.full_like(idx32, -1) if skip_full else idx32
         h0_by_stride = {}
         h0_plain = None
