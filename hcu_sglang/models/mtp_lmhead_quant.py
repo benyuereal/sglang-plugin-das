@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 _SCHEME_ENV = "SGLANG_MTP_LMHEAD_QUANT"
 _DEFAULT_SCHEME = "fp8_e4m3"
 
-
 @dataclass(frozen=True)
 class HeadQuantScheme:
     """One way of storing the draft head, plus how to prepare it."""
@@ -62,7 +61,6 @@ class HeadQuantScheme:
         )
         xq = (xf / scale).clamp(-self.amax, self.amax).to(self.dtype)
         return xq, scale
-
 
 class DraftHeadQuantMethod:
     def __init__(self, base, weight_q, weight_scale, gemm, max_m, scheme):
@@ -99,7 +97,6 @@ class DraftHeadQuantMethod:
         )
         return out
 
-
 class DraftHeadQuantProxy:
     """Stands in for the draft head; only quant_method is replaced."""
 
@@ -116,7 +113,6 @@ class DraftHeadQuantProxy:
     def weight(self) -> torch.Tensor:
         return self._base.weight
 
-
 _SCHEMES = {
     "fp8_e4m3": HeadQuantScheme(
         name="fp8_e4m3",
@@ -125,7 +121,6 @@ _SCHEMES = {
         block=MTP_LMHEAD_QUANT_BLOCK,
     ),
 }
-
 
 def active_scheme() -> Optional[HeadQuantScheme]:
     name = os.environ.get(_SCHEME_ENV, _DEFAULT_SCHEME).strip().lower()
@@ -139,7 +134,6 @@ def active_scheme() -> Optional[HeadQuantScheme]:
         )
         scheme = _SCHEMES[_DEFAULT_SCHEME]
     return scheme
-
 
 def quantize(weight: torch.Tensor, scheme: HeadQuantScheme):
     """The quantized head and its per-row scale, or None to keep bf16."""

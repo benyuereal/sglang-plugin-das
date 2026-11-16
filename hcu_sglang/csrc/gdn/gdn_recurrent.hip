@@ -494,11 +494,8 @@ static void launch_prenorm(const void* q, const void* k, const void* v,
       (const float*)kn, (const float*)eg_buf, (const float*)beta_buf,
       stride_qn, stride_ab);
 }
-
-// ---------------------------------------------------------------------------
 // norm pass：每个 wave 一个 (token, head)，算 q/k 的 l2norm（fp32 稠密输出）
 // 以及该 head 对应的 hratio 个 hv 的 eg/beta。算术表达式与 verify 核逐条一致。
-// ---------------------------------------------------------------------------
 __global__ __launch_bounds__(256, 2) void gdn_verify_norm_pass_kernel(
     const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k,
     const hip_bfloat16* __restrict__ a, const hip_bfloat16* __restrict__ b,
@@ -593,10 +590,7 @@ __global__ __launch_bounds__(256, 2) void gdn_verify_norm_pass_kernel(
     }
   }
 }
-
-// ---------------------------------------------------------------------------
 // host 入口（ctypes 直接调）
-// ---------------------------------------------------------------------------
 template <bool BPLUS, bool STATE_ONLY>
 static void launch(const void* q, const void* k, const void* v, const void* a,
                    const void* b, const void* A_log, const void* dt_bias,
@@ -775,10 +769,7 @@ extern "C" void gdn_recurrent_update_bplus_state_multi(
                      softplus_threshold, use_initial_state, varlen,
                      disable_state_update, (hipStream_t)stream);
 }
-
-// ---------------------------------------------------------------------------
 // norm pass 入口：q/k/eg/beta 一次算完（48 层每层一次 launch）。
-// ---------------------------------------------------------------------------
 extern "C" void gdn_verify_norm_pass(
     const void* q, const void* k, const void* a, const void* b,
     const void* A_log, const void* dt_bias, void* qn, void* kn, void* eg_out,
@@ -824,8 +815,6 @@ extern "C" void gdn_recurrent_update_bplus_prenorm(
         (hipStream_t)stream);
   }
 }
-
-// ---------------------------------------------------------------------------
 // causal conv1d update (one GDN layer per launch), bitwise vs the Triton
 // `_causal_conv1d_update_kernel` for KERNEL_WIDTH=4 / bf16.
 //
@@ -840,8 +829,6 @@ extern "C" void gdn_recurrent_update_bplus_prenorm(
 //
 // Strides are runtime ints (the Triton wrapper passes them as constexpr), so a
 // non-contiguous window / conv_state / x keeps working.
-// ---------------------------------------------------------------------------
-
 #ifndef GDN_CONV_MAX_T
 #define GDN_CONV_MAX_T 16
 #endif
@@ -1030,9 +1017,6 @@ __global__ __launch_bounds__(GDN_CONV_BLOCK, 2) void gdn_causal_conv1d_update_ke
     }
   }
 }
-
-
-// ---------------------------------------------------------------------------
 // Fast path for the production layout: one feature per thread (maximum warp
 // count, the shape that measured fastest), x/o/weight axes stride 1.
 //
@@ -1043,8 +1027,6 @@ __global__ __launch_bounds__(GDN_CONV_BLOCK, 2) void gdn_causal_conv1d_update_ke
 // vectors and the compute threads only touch shared memory for them.
 // Three barriers per launch: one after the conv_state row is loaded, one after
 // the window tiles are written, one before conv_state is copied back.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Fast path for the production layout: one feature per thread (the shape that
 // measured fastest; every wider per-thread feature block lost parallelism),
 // with x/o/weight axes stride 1.
@@ -1056,7 +1038,6 @@ __global__ __launch_bounds__(GDN_CONV_BLOCK, 2) void gdn_causal_conv1d_update_ke
 // straight from the history registers: staging it through shared memory was
 // measured 14us/layer slower, as the L2 already merges the partial-sector
 // stores before they reach DRAM.
-// ---------------------------------------------------------------------------
 template <int BLOCK>
 __global__ __launch_bounds__(BLOCK, 2) void gdn_conv_update_fast_kernel(
     const hip_bfloat16* __restrict__ x, const hip_bfloat16* __restrict__ w,

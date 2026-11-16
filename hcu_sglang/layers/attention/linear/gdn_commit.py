@@ -18,10 +18,8 @@ from typing import NamedTuple
 from hcu_sglang.constants import SEED_SCRATCH_MIN_ROWS, SLOT_BUFFER_SLACK
 from hcu_sglang.layers.attention.linear import gdn_recurrent
 
-
 # The compensate kernel writes one output row per layer launch.
 _LAYER_OUT_LEADING = (1, 1)
-
 
 class HeadDims(NamedTuple):
     """Per-layer head layout, as the recurrent kernel indexes it."""
@@ -59,7 +57,6 @@ class HeadDims(NamedTuple):
         return self.vh, self.vv
 
 logger = logging.getLogger(__name__)
-
 
 class CommitState:
     """Per-backend scratch, kept off the nn.Module so plain attributes work."""
@@ -113,7 +110,6 @@ class CommitState:
         self.tmp32_buf = {}
         self.tmp64_buf = {}
 
-
 def state(backend) -> CommitState:
     # The adaptive spec controller builds a second attention backend for its
     # other step count and swaps it into the model runner between batches, so
@@ -127,13 +123,10 @@ def state(backend) -> CommitState:
         st = owner._gdn_commit = CommitState()
     return st
 
-
 def enabled() -> bool:
     return os.environ.get("SGLANG_GDN_HIP_BPLUS") == "1"
 
-
 _HANDOFF_OK = None
-
 
 def handoff_enabled() -> bool:
     """Zero-copy state handoff: verify reads h0 from the committed row."""
@@ -146,21 +139,17 @@ def handoff_enabled() -> bool:
         )
     return _HANDOFF_OK
 
-
 def _slot_ids(slots) -> torch.Tensor:
     return slots.to(torch.int64).clamp_min(0)
 
-
 def _head_dims(*tensors) -> list[int]:
     return [int(t.shape[2]) * int(t.shape[3]) for t in tensors]
-
 
 def _prev_buf(backend, slots, size: int) -> torch.Tensor:
     st = state(backend)
     if st.prev is None or int(st.prev.numel()) < size:
         st.prev = torch.full((size,), -1, dtype=torch.int32, device=slots.device)
     return st.prev
-
 
 def seed_prev(
     backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int
@@ -193,19 +182,14 @@ def seed_prev(
     flat.index_copy_(0, s64 * int(cache_steps), st.seed_scratch[:n])
     prev_buf.index_fill_(0, s64, 0)
 
-
-
 def _step_buffer(st, name: str, rows: int, dtype, device) -> torch.Tensor:
-    """Persistent scratch, one buffer per size: captures bake buffer addresses
-    into the graph, so a larger eager batch must never replace a buffer that a
-    captured graph still points at."""
+    """Persistent scratch, one buffer per size: captures bake buffer addresses"""
     bufs = getattr(st, name)
     buf = bufs.get(rows)
     if buf is None or buf.dtype != dtype or buf.device != device:
         buf = torch.empty(rows, dtype=dtype, device=device)
         bufs[rows] = buf
     return buf
-
 
 def _stride_buffer(st, name: str, stride: int, rows: int, dtype, device):
     bufs = getattr(st, name)
@@ -216,14 +200,8 @@ def _stride_buffer(st, name: str, stride: int, rows: int, dtype, device):
         bufs[key] = buf
     return buf
 
-
 def begin_verify_step(backend, layer_id: int) -> None:
-    """Rotate the per-step cache at the start of a verify forward.
-
-    GDN layers run once each in ascending id order inside one forward, so a
-    layer id that does not advance marks a new forward (and a graph capture
-    starts at the model's first layer again).
-    """
+    """Rotate the per-step cache at the start of a verify forward."""
     st = state(backend)
     lid = int(layer_id)
     if lid <= st.step_lid:
@@ -231,17 +209,10 @@ def begin_verify_step(backend, layer_id: int) -> None:
         st.step_cache = None
     st.step_lid = lid
 
-
 def shared_step_values(
     backend, slots: torch.Tensor, mamba_cache_params, cache_steps: int, T: int
 ) -> dict:
-    """Per-batch tensors every layer of this verify forward uses unchanged.
-
-    verify used to derive them per layer: 48x the same six launches. They are
-    index arithmetic only, so computing them once is bit-identical. The buffers
-    are persistent because a captured graph keeps their addresses, and each
-    stride keeps its own row so a layer with a different allocation still works.
-    """
+    """Per-batch tensors every layer of this verify forward uses unchanged."""
     st = state(backend)
     n = int(slots.numel())
     rows = int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK
@@ -279,7 +250,6 @@ def shared_step_values(
         sh["rows"][int(cache_steps)] = ent
     return sh
 
-
 def _step_store_row(st, sh, cache_steps: int) -> torch.Tensor:
     n = sh["n"]
     dev = sh["prev"].device
@@ -290,7 +260,6 @@ def _step_store_row(st, sh, cache_steps: int) -> torch.Tensor:
     torch.add(sh["prev"], 1, out=tmp)
     torch.remainder(tmp, int(cache_steps), out=row)
     return row
-
 
 def _step_h0(st, s64, prev32, cache_steps: int) -> torch.Tensor:
     n = int(s64.numel())
@@ -307,10 +276,8 @@ def _step_h0(st, s64, prev32, cache_steps: int) -> torch.Tensor:
     h0.copy_(tmp)
     return h0
 
-
 def step_h0(backend, slots: torch.Tensor, cache_steps: int):
-    """The cached h0 rows for this batch, or None when this forward did not
-    compute them (commit-side fallback then does the arithmetic itself)."""
+    """The cached h0 rows for this batch, or None when this forward did not"""
     st = state(backend)
     sh = st.step_cache
     if sh is None or sh["gen"] != st.step_gen:
@@ -320,11 +287,9 @@ def step_h0(backend, slots: torch.Tensor, cache_steps: int):
     ent = sh["rows"].get(int(cache_steps))
     return None if ent is None else ent["h0"]
 
-
 def h0_rows(slots: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.Tensor:
     rows = _slot_ids(slots) * row_stride + prev.to(torch.int64).clamp_min(0)
     return rows.to(torch.int32)
-
 
 def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) -> bool:
     """Advance the committed row; no state copy."""
@@ -345,7 +310,6 @@ def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) 
         logger.info("[gdn-bplus] handoff commit active (scatter skipped)")
     return True
 
-
 def _commit_prev(backend, st, state_indices, last_correct, T: int, cache_steps: int):
     idx = state_indices.to(torch.int64)
     last = last_correct.to(torch.int64)
@@ -361,7 +325,6 @@ def _commit_prev(backend, st, state_indices, last_correct, T: int, cache_steps: 
     put_idx = torch.where(idx >= 0, idx, discard)
     st.prev.index_copy_(0, put_idx, keep)
 
-
 def _same_storage_in_order(tensors, offsets) -> bool:
     base = tensors[0].untyped_storage().data_ptr()
     esz = tensors[0].element_size()
@@ -371,7 +334,6 @@ def _same_storage_in_order(tensors, offsets) -> bool:
         if int(t.data_ptr()) - int(tensors[0].data_ptr()) != off * esz:
             return False
     return True
-
 
 def _fused_qkv_view(q, k, v, n: int, T: int):
     """[n, T, W] view over one fused q|k|v buffer, or None when they are apart."""
@@ -395,20 +357,17 @@ def _fused_qkv_view(q, k, v, n: int, T: int):
         return None
     return torch.as_strided(q, (n, T, W), (T * W, W, 1))
 
-
 def _max_slots(backend) -> int:
     st = state(backend)
     if st.max_slots <= 0:
         st.max_slots = int(backend.req_to_token_pool.size)
     return st.max_slots
 
-
 def _stash_entries(backend):
     st = state(backend)
     if st.stash is None:
         st.stash = {}
     return st.stash
-
 
 def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
     ents = _stash_entries(backend)
@@ -446,7 +405,6 @@ def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
     ent["dt_bias"] = layer.dt_bias
     return ent, max_slots
 
-
 def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
     if not enabled():
         return False
@@ -483,7 +441,6 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         logger.warning("[gdn-bplus] stash failed", exc_info=True)
         return False
 
-
 def compensate_from_stash(backend, state_indices, last_correct) -> bool:
     """Replay the stash for the truncated slots, before the upstream scatter."""
     if not enabled():
@@ -499,15 +456,89 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         if T <= 1:
             return False
         n = int(state_indices.shape[0])
-        plan = _replay_plan(st, state_indices=state_indices,
-                            last_correct=last_correct, T=T, n=n, handoff=handoff)
-        if plan is None:
-            return False
-        snap32, idx32, trunc, store_step = plan
+        if handoff:
+            snap32 = state_indices.to(torch.int32)
+        else:
+            from sglang.srt.layers.attention.linear.utils import (
+                pp_spec_stable_rows_enabled,
+            )
+
+            if pp_spec_stable_rows_enabled():
+                if int(st.snap_idx.numel()) != n:
+                    return False
+                snap32 = st.snap_idx.to(torch.int32)
+            else:
+                # Default verify rows are batch positions; rebuild them for the
+                # live batch instead of reusing the capture bucket's view.
+                snap32 = torch.arange(
+                    n, dtype=torch.int32, device=state_indices.device
+                )
+
+        idx32 = state_indices.to(torch.int32)
+        last32 = last_correct.to(torch.int32)
+        trunc = (idx32 > 0) & (last32 >= 0) & (last32 < T - 1)
+        store_step = torch.where(
+            trunc, last32, torch.full_like(last32, -1)
+        ).to(torch.int32)
         D = T
         m = n * D
-        rows = _collect_rows(backend, st, handoff=handoff,
-                             state_indices=state_indices, idx32=idx32, trunc=trunc)
+        if handoff:
+            if st.prev is None:
+                return False
+            slots_now = state_indices.to(torch.int32)
+            prev_now = None
+        skip_full = os.environ.get("SGLANG_GDN_HIP_BPLUS_SKIP_FULL", "1") != "0"
+        # A full accept already committed the row verify wrote; replay only the
+        # truncated slots, so their h0 read is not paid for. Same index tensor
+        # for every layer: the row stride does not depend on the layer.
+        # ``neg`` is built unconditionally: ``torch.where`` raises on a None
+        # third argument, and the per-layer except would then drop every layer's
+        # row. With the switch off it is the row's own index, so a full accept
+        # still replays.
+        neg = torch.full_like(idx32, -1) if skip_full else idx32
+        h0_by_stride = {}
+        h0_plain = None
+        rows = []
+        for lid, ent in list(st.stash.items()):
+            try:
+                layer_cache = ent.get("layer_cache")
+                if layer_cache is None:
+                    layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
+                    ent["layer_cache"] = layer_cache
+                inter = layer_cache.intermediate_ssm
+                if inter is None:
+                    st.commit_failed = True
+                    continue
+                flat = ent.get("flat")
+                if flat is None:
+                    flat = inter.reshape(-1, *inter.shape[2:])
+                    ent["flat"] = flat
+                stride = int(inter.shape[1])
+                if handoff:
+                    ssm = flat
+                    h0_idx = h0_by_stride.get(stride)
+                    if h0_idx is None:
+                        h0_idx = step_h0(backend, slots_now, stride)
+                        if h0_idx is None:
+                            if prev_now is None:
+                                prev_now = st.prev.index_select(
+                                    0, slots_now.to(torch.int64).clamp_min(0)
+                                ).to(torch.int32)
+                            h0_idx = h0_rows(slots_now, prev_now, stride)
+                        if skip_full:
+                            h0_idx = torch.where(trunc, h0_idx, neg)
+                        h0_by_stride[stride] = h0_idx
+                else:
+                    ssm = layer_cache.temporal
+                    if h0_plain is None:
+                        h0_plain = torch.where(trunc, idx32, neg)
+                    h0_idx = h0_plain
+                rows.append((ent, ssm, flat, h0_idx, stride, lid))
+            except Exception:  # noqa: BLE001 - optional path
+                logger.warning("[gdn-bplus] compensate failed for layer %s",
+                               lid, exc_info=True)
+                st.commit_failed = True
+                continue
         if not rows:
             return False
         if _multi_enabled() and gdn_recurrent.has_multi():
@@ -516,139 +547,41 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     return True
             except Exception:  # noqa: BLE001 - per-layer path is the fallback
                 logger.warning("[gdn-bplus] multi compensate failed", exc_info=True)
-        return _compensate_per_layer(st, rows=rows, n=n, D=D, m=m,
-                                     store_step=store_step, snap32=snap32)
+        for ent, ssm, flat, h0_idx, cache_steps, lid in rows:
+            try:
+                dims = HeadDims.from_entry(ent)
+                a_dim = int(ent["a"].shape[-1])
+                b_dim = int(ent["b"].shape[-1])
+                gdn_recurrent.compensate(
+                    ent["q"][:m].view(n, D, *dims.q),
+                    ent["k"][:m].view(n, D, *dims.k),
+                    ent["v"][:m].view(n, D, *dims.v),
+                    ent["a"][:m].view(n, D, a_dim),
+                    ent["b"][:m].view(n, D, b_dim),
+                    ent["A_log"],
+                    ent["dt_bias"],
+                    ssm,
+                    h0_idx,
+                    flat,
+                    snap32,
+                    cache_steps,
+                    store_step,
+                    n,
+                    D,
+                    ent["out"],
+                )
+            except Exception:  # noqa: BLE001 - optional path
+                logger.warning("[gdn-bplus] compensate failed for layer %s",
+                               lid, exc_info=True)
+                st.commit_failed = True
+                continue
+        return True
     except Exception:  # noqa: BLE001
         logger.warning("[gdn-bplus] compensate_from_stash failed", exc_info=True)
         return False
 
-
-def _replay_plan(st, *, state_indices, last_correct, T, n, handoff):
-    """Verify row indices, the truncation mask and the per-slot store step."""
-    if handoff:
-        snap32 = state_indices.to(torch.int32)
-    else:
-        from sglang.srt.layers.attention.linear.utils import (
-            pp_spec_stable_rows_enabled,
-        )
-
-        if pp_spec_stable_rows_enabled():
-            if int(st.snap_idx.numel()) != n:
-                return None
-            snap32 = st.snap_idx.to(torch.int32)
-        else:
-            # Default verify rows are batch positions; rebuild them for the
-            # live batch instead of reusing the capture bucket's view.
-            snap32 = torch.arange(
-                n, dtype=torch.int32, device=state_indices.device
-            )
-
-    idx32 = state_indices.to(torch.int32)
-    last32 = last_correct.to(torch.int32)
-    trunc = (idx32 > 0) & (last32 >= 0) & (last32 < T - 1)
-    store_step = torch.where(
-        trunc, last32, torch.full_like(last32, -1)
-    ).to(torch.int32)
-    return snap32, idx32, trunc, store_step
-
-
-def _collect_rows(backend, st, *, handoff, state_indices, idx32, trunc):
-    """Per-layer (entry, ssm, flat, h0 index, stride, layer id) rows."""
-    if handoff:
-        if st.prev is None:
-            return []
-        slots_now = state_indices.to(torch.int32)
-        prev_now = None
-    skip_full = os.environ.get("SGLANG_GDN_HIP_BPLUS_SKIP_FULL", "1") != "0"
-    # A full accept already committed the row verify wrote; replay only the
-    # truncated slots, so their h0 read is not paid for. Same index tensor
-    # for every layer: the row stride does not depend on the layer.
-    # ``neg`` is built unconditionally: ``torch.where`` raises on a None
-    # third argument, and the per-layer except would then drop every layer's
-    # row. With the switch off it is the row's own index, so a full accept
-    # still replays.
-    neg = torch.full_like(idx32, -1) if skip_full else idx32
-    h0_by_stride = {}
-    h0_plain = None
-    rows = []
-    for lid, ent in list(st.stash.items()):
-        try:
-            layer_cache = ent.get("layer_cache")
-            if layer_cache is None:
-                layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
-                ent["layer_cache"] = layer_cache
-            inter = layer_cache.intermediate_ssm
-            if inter is None:
-                st.commit_failed = True
-                continue
-            flat = ent.get("flat")
-            if flat is None:
-                flat = inter.reshape(-1, *inter.shape[2:])
-                ent["flat"] = flat
-            stride = int(inter.shape[1])
-            if handoff:
-                ssm = flat
-                h0_idx = h0_by_stride.get(stride)
-                if h0_idx is None:
-                    h0_idx = step_h0(backend, slots_now, stride)
-                    if h0_idx is None:
-                        if prev_now is None:
-                            prev_now = st.prev.index_select(
-                                0, slots_now.to(torch.int64).clamp_min(0)
-                            ).to(torch.int32)
-                        h0_idx = h0_rows(slots_now, prev_now, stride)
-                    if skip_full:
-                        h0_idx = torch.where(trunc, h0_idx, neg)
-                    h0_by_stride[stride] = h0_idx
-            else:
-                ssm = layer_cache.temporal
-                if h0_plain is None:
-                    h0_plain = torch.where(trunc, idx32, neg)
-                h0_idx = h0_plain
-            rows.append((ent, ssm, flat, h0_idx, stride, lid))
-        except Exception:  # noqa: BLE001 - optional path
-            logger.warning("[gdn-bplus] compensate failed for layer %s",
-                           lid, exc_info=True)
-            st.commit_failed = True
-            continue
-    return rows
-
-
-def _compensate_per_layer(st, *, rows, n, D, m, store_step, snap32) -> bool:
-    for ent, ssm, flat, h0_idx, cache_steps, lid in rows:
-        try:
-            dims = HeadDims.from_entry(ent)
-            a_dim = int(ent["a"].shape[-1])
-            b_dim = int(ent["b"].shape[-1])
-            gdn_recurrent.compensate(
-                ent["q"][:m].view(n, D, *dims.q),
-                ent["k"][:m].view(n, D, *dims.k),
-                ent["v"][:m].view(n, D, *dims.v),
-                ent["a"][:m].view(n, D, a_dim),
-                ent["b"][:m].view(n, D, b_dim),
-                ent["A_log"],
-                ent["dt_bias"],
-                ssm,
-                h0_idx,
-                flat,
-                snap32,
-                cache_steps,
-                store_step,
-                n,
-                D,
-                ent["out"],
-            )
-        except Exception:  # noqa: BLE001 - optional path
-            logger.warning("[gdn-bplus] compensate failed for layer %s",
-                           lid, exc_info=True)
-            st.commit_failed = True
-            continue
-    return True
-
-
 def _multi_enabled() -> bool:
     return os.environ.get("SGLANG_GDN_HIP_BPLUS_MULTI", "1") != "0"
-
 
 def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     """One launch covers every layer when their layout matches the table."""

@@ -30,7 +30,6 @@ _BV = 32  # 与 gdn_recurrent.hip 的 BV 一致
 _SOFTPLUS_BETA = 1.0
 _SOFTPLUS_THRESHOLD = 20.0
 
-
 _LIB = None
 _ERR = None
 _FFI = None
@@ -38,14 +37,12 @@ _HEADER_TEXT = None
 _PRENORM_BUF = {}
 _CONV_LAST_REASON = None
 
-
 def _header_text() -> str:
     """The cdef source, read once; the FFI object parses it at load time."""
     global _HEADER_TEXT
     if _HEADER_TEXT is None:
         _HEADER_TEXT = _HEADER.read_text(encoding="utf-8")
     return _HEADER_TEXT
-
 
 def lib():
     global _LIB, _ERR, _FFI
@@ -71,46 +68,29 @@ def lib():
         raise RuntimeError(_ERR) from e
     return _LIB
 
-
 def _ffi():
     """The FFI instance that declared the header; loads the .so on first use."""
     lib()
     return _FFI
 
-
 def enabled() -> bool:
     return os.environ.get("SGLANG_GDN_HIP_BPLUS") == "1"
-
 
 def enabled_kernel() -> bool:
     return os.environ.get("SGLANG_GDN_HIP_KERNEL") == "1"
 
-
 def prenorm_enabled() -> bool:
-    """Hoist q/k l2norm + gating out of the 12x-redundant verify CTAs.
-
-    Needs the norm-pass entry; a .so built before that entry silently keeps the
-    old path instead of failing a serving start.
-    """
+    """Hoist q/k l2norm + gating out of the 12x-redundant verify CTAs."""
     if os.environ.get("SGLANG_GDN_HIP_PRENORM") != "1":
         return False
     return getattr(lib(), "gdn_verify_norm_pass", None) is not None
-
 
 def prenorm_gate_enabled() -> bool:
     """Also hoist softplus/sigmoid gating to per-(token,hv) eg/beta buffers."""
     return os.environ.get("SGLANG_GDN_HIP_PRENORM_GATE", "1") == "1"
 
-
 def prenorm_buffers(rows: int, h: int, kdim: int, hv: int, device):
-    """Persistent scratch, one entry per size.
-
-    A captured graph bakes these addresses, so a later eager batch must never
-    replace an existing entry; ``rows`` is the pool's slot*D budget and stays
-    constant for the life of the process.  The buffer is consumed by the norm
-    pass of the very next verify launch on the same stream, so one shared
-    scratch serves every GDN layer.
-    """
+    """Persistent scratch, one entry per size."""
     key = (int(rows), int(h), int(kdim), int(hv), str(device))
     ent = _PRENORM_BUF.get(key)
     if ent is None:
@@ -121,7 +101,6 @@ def prenorm_buffers(rows: int, h: int, kdim: int, hv: int, device):
         ent = (qn, kn, eg, beta)
         _PRENORM_BUF[key] = ent
     return ent
-
 
 def _norm_pass(q, k, a, b, A_log, dt_bias, qn, kn, eg, beta, hv):
     h = int(q.shape[-2])
@@ -136,11 +115,9 @@ def _norm_pass(q, k, a, b, A_log, dt_bias, qn, kn, eg, beta, hv):
         _stream(),
     )
 
-
 def _tok_stride(x: torch.Tensor) -> int:
     """Stride between tokens: q/k/v are (1, seq, H, D), a/b are (seq, HV)."""
     return int(x.stride(1)) if x.dim() >= 3 else int(x.stride(0))
-
 
 # The kernel takes A_log/dt_bias as const float*, but under bf16 weights dt_bias
 # is bf16 [HV]: reading it as float* runs off the buffer and every head's decay
@@ -157,17 +134,14 @@ def _f32(x: torch.Tensor) -> torch.Tensor:
             pass
     return hit[0]
 
-
 def _ptr(tensor):
     """Typed device pointer, or the null pointer the kernels skip when absent."""
     ffi = _ffi()
     return ffi.NULL if tensor is None else ffi.cast("void *", tensor.data_ptr())
 
-
 def _stream():
     """The current torch stream as the kernels' opaque void* handle."""
     return _ffi().cast("void *", int(torch.cuda.current_stream().cuda_stream))
-
 
 def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
           o, snap_buf, snap_idx, cache_steps, store_step, store_row, n_seq,
@@ -203,16 +177,10 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
         _stream(),
     )
 
-
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
            snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step=None,
            store=None, store_row=None):
-    """Write the full-run snapshot to row (prev_step+1) % cache_steps.
-
-    Never row draft_token_num-1: that is the row the commit points at after a
-    full accept, and the next verify reads it as h0. Each slot has one live row,
-    so the rotated one is dead and the write touches nothing being read.
-    """
+    """Write the full-run snapshot to row (prev_step+1) % cache_steps."""
     # store/store_row are per-batch, not per-layer: the handoff caller computes
     # them once per step and passes them in; the fallback keeps the old path.
     n = int(snap_idx.shape[0])
@@ -265,12 +233,10 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
           cache_steps, store, store_row, n, draft_token_num, v.shape[-2],
           q.shape[-2], k.shape[-1], v.shape[-1])
 
-
 def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
                 cache_indices, snap_flat, snap_idx, cache_steps,
                 draft_token_num, o):
-    """Full-snapshot entry, for the A/B only: same kernel and inputs, every step
-    written, so the row B+ writes must be torch.equal to it."""
+    """Full-snapshot entry, for the A/B only: same kernel and inputs, every step"""
     n = int(snap_idx.shape[0])
     lib().gdn_recurrent_update_nofma(
         _ptr(q), _ptr(k), _ptr(v), _ptr(a), _ptr(b),
@@ -287,7 +253,6 @@ def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
         _stream(),
     )
 
-
 def compensate(q, k, v, a, b, A_log, dt_bias, ssm_states, h0_rows,
                snap_flat, snap_idx, cache_steps, store_step, n_seq,
                tok_per_seq, o):
@@ -298,15 +263,12 @@ def compensate(q, k, v, a, b, A_log, dt_bias, ssm_states, h0_rows,
           store_step, None, n_seq, tok_per_seq, v.shape[-2], q.shape[-2],
           k.shape[-1], v.shape[-1], use_h0=True)
 
-
 def f32(x: torch.Tensor) -> torch.Tensor:
     """Cached fp32 view of A_log/dt_bias for the pointer table."""
     return _f32(x)
 
-
 def has_multi() -> bool:
     return getattr(lib(), "gdn_recurrent_update_bplus_state_multi", None) is not None
-
 
 def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
                      n_seq, tok_per_seq, hv, h, kdim, vdim):
@@ -325,7 +287,6 @@ def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
         _stream(),
     )
 
-
 # ---------------------------------------------------------------------------
 # causal_conv1d update (target verify): same tensor interface as the Triton
 # `causal_conv1d_update`. Returns None when this call falls outside what the
@@ -336,11 +297,9 @@ _CONV_MAX_T = 16
 # Conv kernel width the HIP entry implements (state_len >= width - 1).
 _CONV_WIDTH = 4
 
-
 def conv_last_reason():
     """Why the last conv_update() call stayed on Triton (None if it ran)."""
     return _CONV_LAST_REASON
-
 
 def conv_enabled() -> bool:
     """SGLANG_GDN_HIP_CONV=1 and the loaded .so exports the conv entry."""
@@ -348,11 +307,9 @@ def conv_enabled() -> bool:
         return False
     return getattr(lib(), "gdn_causal_conv1d_update", None) is not None
 
-
 def _conv_seqlen(x) -> int:
     """2D x is (batch, dim); the wrapper unsqueezes it to (batch, dim, 1)."""
     return int(x.size(-1)) if x.dim() == 3 else 1
-
 
 def _conv_shape_problem(x, weight, conv_state, seqlen) -> str | None:
     if x.dim() not in (2, 3):
@@ -370,7 +327,6 @@ def _conv_shape_problem(x, weight, conv_state, seqlen) -> str | None:
         return f"state_len={conv_state.size(2)}"
     return None
 
-
 def _conv_dtype_problem(x, weight, conv_state, bias) -> str | None:
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         return f"dtype x={x.dtype} w={weight.dtype}"
@@ -380,7 +336,6 @@ def _conv_dtype_problem(x, weight, conv_state, bias) -> str | None:
         return f"bias={bias.dtype}/contig={bias.is_contiguous()}"
     return None
 
-
 def _conv_state_problem(cache_seqlens, num_accept_tokens, conv_state_indices) -> str | None:
     if cache_seqlens is not None or num_accept_tokens is not None:
         return "circular / multi-accept conv_state is not implemented"
@@ -389,7 +344,6 @@ def _conv_state_problem(cache_seqlens, num_accept_tokens, conv_state_indices) ->
     ):
         return f"conv_state_indices={conv_state_indices.dtype}"
     return None
-
 
 def _conv_window_problem(window, window_indices, seqlen, dim) -> str | None:
     if window is None:
@@ -407,7 +361,6 @@ def _conv_window_problem(window, window_indices, seqlen, dim) -> str | None:
         return "window needs int32 intermediate_state_indices"
     return None
 
-
 def _conv_tree_problem(next_token, next_sibling, parent_token, seqlen) -> str | None:
     if next_token is None:
         if next_sibling is not None or parent_token is not None:
@@ -423,7 +376,6 @@ def _conv_tree_problem(next_token, next_sibling, parent_token, seqlen) -> str | 
     if int(next_token.size(1)) < seqlen:
         return f"tree width={next_token.size(1)} < seqlen={seqlen}"
     return None
-
 
 def conv_unsupported_reason(x, conv_state, weight, bias, activation,
                             cache_seqlens, conv_state_indices,
@@ -446,7 +398,6 @@ def conv_unsupported_reason(x, conv_state, weight, bias, activation,
         else f"pad_slot_id={pad_slot_id!r}",
     )
     return next((reason for reason in problems if reason), None)
-
 
 def conv_update(x, conv_state, weight, bias=None, activation=None,
                 cache_seqlens=None, conv_state_indices=None,

@@ -18,15 +18,12 @@ from hcu_sglang.models import mtp_lmhead_quant as mtp_head
 
 logger = logging.getLogger(__name__)
 
-
 def _mtp_lmhead_fp8_enabled() -> bool:
     value = os.environ.get("SGLANG_MTP_LMHEAD_FP8", "0")
     return value.strip().lower() not in ("", "0", "false", "off")
 
-
 def _should_use_fp8_draft_head(model) -> bool:
-    """Cheap gates first: a captured stream cannot allocate, and the proxy must
-    not wrap itself."""
+    """Cheap gates first: a captured stream cannot allocate, and the proxy must"""
     head = getattr(model, "lm_head", None)
     weight = getattr(head, "weight", None)
     logits_processor = getattr(model, "logits_processor", None)
@@ -47,13 +44,11 @@ def _should_use_fp8_draft_head(model) -> bool:
         )
     )
 
-
 def _install_draft_head(*, model, head, weight_q, weight_scale, gemm, max_m, scheme):
     method = mtp_head.DraftHeadQuantMethod(
         head, weight_q, weight_scale, gemm, max_m, scheme
     )
     object.__setattr__(model, "lm_head", mtp_head.DraftHeadQuantProxy(head, method))
-
 
 def install(model) -> bool:
     if not _should_use_fp8_draft_head(model):
@@ -92,14 +87,12 @@ def install(model) -> bool:
     )
     return True
 
-
 def _drop_proxy(model) -> None:
     try:
         if isinstance(getattr(model, "lm_head", None), mtp_head.DraftHeadQuantProxy):
             object.__delattr__(model, "lm_head")
     except Exception:  # noqa: BLE001
         pass
-
 
 def _around_set_lm_head(original, self, target_lm_head):
     out = original(self, target_lm_head)
@@ -111,7 +104,6 @@ def _around_set_lm_head(original, self, target_lm_head):
         logger.warning("[mtp_draft_lmhead_fp8] install failed", exc_info=True)
     return out
 
-
 def _around_set_embed_and_head(original, self, embed, head):
     _drop_proxy(self)
     self._mtp_fp8_installed = False
@@ -122,12 +114,10 @@ def _around_set_embed_and_head(original, self, embed, head):
         logger.warning("[mtp_draft_lmhead_fp8] reinstall failed", exc_info=True)
     return out
 
-
 _AROUND_HOOKS = (
     ("set_lm_head_from_target", _around_set_lm_head),
     ("set_embed_and_head", _around_set_embed_and_head),
 )
-
 
 def register() -> bool:
     if not _mtp_lmhead_fp8_enabled():
