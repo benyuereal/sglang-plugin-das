@@ -20,18 +20,18 @@ from hcu_sglang.server_args_hooks import _declare_values
 from hcu_sglang.speculative_dspark import _handle_dspark
 from hcu_sglang.utils.detection import is_hcu
 
-# Import failure is the probe: transformers must not report torchaudio as
-# available on images where loading it raises.
-try:
-    import torchaudio  # noqa: F401
-except (ImportError, OSError):
+
+def _torchaudio_loads() -> bool:
+    """Import failure is the probe: transformers must not report torchaudio as
+    available on images where loading it raises."""
     try:
-        import transformers.utils as _transformers_utils
-        import transformers.utils.import_utils as _transformers_import_utils
-    except ImportError:
-        _transformers_utils = _transformers_import_utils = None
-else:
-    _transformers_utils = _transformers_import_utils = None
+        import torchaudio  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+_TORCHAUDIO_LOADS = _torchaudio_loads()
 
 logger = logging.getLogger(__name__)
 
@@ -164,10 +164,15 @@ def around_tbo_filter_batch(
 
 
 def patch_broken_torchaudio_availability() -> None:
-    if _transformers_import_utils is None:
+    if _TORCHAUDIO_LOADS:
         return
-    _transformers_import_utils.is_torchaudio_available = lambda: False
-    _transformers_utils.is_torchaudio_available = lambda: False
+    try:
+        import transformers.utils as utils
+        import transformers.utils.import_utils as import_utils
+    except ImportError:
+        return
+    utils.is_torchaudio_available = lambda: False
+    import_utils.is_torchaudio_available = lambda: False
 
 
 def register_hooks() -> None:
