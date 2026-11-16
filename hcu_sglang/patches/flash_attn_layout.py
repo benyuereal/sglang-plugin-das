@@ -11,8 +11,8 @@ Retire it once the shipped wheel carries the fix (flash-attention-das).
 
 from __future__ import annotations
 
+import inspect
 import os
-from typing import List, Optional
 
 import torch
 
@@ -117,76 +117,51 @@ def _num_splits() -> int:
     return int(raw) if raw else 0
 
 
-def vllm_flash_attn_varlen_func(
-    q,
-    k,
-    v,
-    max_seqlen_q,
-    cu_seqlens_q,
-    max_seqlen_k,
-    cu_seqlens_k=None,
-    seqused_k=None,
-    q_v=None,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size: Optional[List[int]] = None,
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    block_table=None,
-    return_softmax_lse=False,
-    out=None,
-    is_prefix_cache=True,
-    scheduler_metadata=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    kv_cache_dtype="auto",
-    fa_version=None,
-    s_aux=None,
-):
-    """flash_attn's vLLM wrapper with the layout and split width made explicit."""
-    from flash_attn import flash_attn_varlen_func as _varlen
+_ORIGINAL = None
+_ARG_NAMES = None
+# The vLLM wrapper keeps these for its own compatibility surface and never
+# forwards them to the varlen entry.
+_NOT_FORWARDED = frozenset({"is_prefix_cache", "kv_cache_dtype"})
 
-    if q_descale is None and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
-    kwargs = dict(
-        max_seqlen_q=max_seqlen_q,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_k=max_seqlen_k,
-        cu_seqlens_k=cu_seqlens_k,
-        seqused_k=seqused_k,
-        q_v=q_v,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        softcap=softcap,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_attn_probs=return_attn_probs,
-        block_table=block_table,
-        return_softmax_lse=return_softmax_lse,
-        out=out,
-        scheduler_metadata=scheduler_metadata,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        num_splits=_num_splits(),
-        s_aux=s_aux,
-        cp_world_size=1,
-        cp_rank=0,
-        cp_tot_seqused_k=None,
+
+def _bound_kwargs(args, kwargs) -> dict:
+    global _ARG_NAMES
+
+    if _ARG_NAMES is None:
+        _ARG_NAMES = tuple(inspect.signature(_ORIGINAL).parameters)
+    bound = dict(zip(_ARG_NAMES, args))
+    bound.update(kwargs)
+    return bound
+
+
+def vllm_flash_attn_varlen_func(*args, **kwargs):
+    """flash_attn's vLLM wrapper with the layout and split width made explicit."""
+    import flash_attn
+
+    bound = _bound_kwargs(args, kwargs)
+    layout = _choose_layout(
+        bound["q"],
+        bound["k"],
+        bound["v"],
+        bound.get("max_seqlen_q"),
+        bound.get("cu_seqlens_q"),
+        bound.get("block_table"),
+        bound.get("window_size"),
+        bound.get("softcap", 0.0),
+        seqused_k=bound.get("seqused_k"),
     )
-    if fa_version is not None:
-        kwargs["fa_version"] = fa_version
-    kwargs["layout"] = _choose_layout(
-        q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap,
-        seqused_k=seqused_k,
-    )
-    return _varlen(q, k, v, **kwargs)
+    if layout == _CUSTOM:
+        return _ORIGINAL(*args, **kwargs)
+
+    forwarded = {k: v for k, v in bound.items() if k not in _NOT_FORWARDED}
+    if forwarded.get("q_descale") is None and bound["q"].dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        forwarded["q_descale"] = torch.ones(1, dtype=torch.float32, device=bound["q"].device)
+    forwarded["layout"] = layout
+    forwarded["num_splits"] = _num_splits()
+    return flash_attn.flash_attn_varlen_func(**forwarded)
 
 
 def install() -> bool:
@@ -198,8 +173,11 @@ def install() -> bool:
         import flash_attn
     except ImportError:
         return False
+    global _ORIGINAL
+
     if not hasattr(flash_attn, "vllm_flash_attn_varlen_func"):
         return False
+    _ORIGINAL = flash_attn.vllm_flash_attn_varlen_func
     flash_attn.vllm_flash_attn_varlen_func = vllm_flash_attn_varlen_func
     _INSTALLED = True
     return True

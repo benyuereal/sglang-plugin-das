@@ -1,3 +1,20 @@
+"""HCU overlay on sglang's GDN backend.
+
+The upstream module is imported and its namespace copied in wholesale, so
+everything this file does not redefine is upstream code. Only these are ours,
+each for one reason:
+
+- ``forward_decode``      decode step: B+ commit/handoff, the HIP recurrent
+                          entry, and the HCU causal-conv path.
+- ``forward_extend``      prefill/verify: B+ seed and stash, the HIP verify
+                          entry, and the HCU conv.
+- ``_convolve_prefill``   HCU causal_conv1d instead of the Triton conv.
+- ``conv_update``         the same swap for the single-token update.
+
+When a change here is general rather than HCU-specific it belongs upstream:
+see flash-attention-das ``fix/varlen-layout`` for the pattern.
+"""
+
 from __future__ import annotations
 import sglang.srt.layers.attention.linear.gdn_backend as upstream
 from hcu_sglang.utils.detection import is_hcu
