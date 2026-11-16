@@ -2874,3 +2874,43 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+
+## 2026-11-16 交付分支结构整理（行为不变）
+
+**改动范围**（`qwen3.8-27b-perf`，五个提交，按主题分开）
+
+- `refactor(imports)`：`speculative_compat.py`、`server_args_hooks.py` 的函数内 import 全部提到模块级；
+  `_declare_values` / `_resolving_view` 里探测 `ServerArgs._declare` / `_resolved` 的分支删除——
+  钉死的 0.5.22 两个方法都不存在，分支恒为假。
+- `refactor(mtp)`：`models/qwen3_5_mtp_fp8.py` 的 fp8 草稿头安装拆成
+  gate / quantize / prepare / install 四段；hook 前缀字符串移入 `constants.QWEN3_5_MTP_HOOK_BASE`。
+- `refactor(gemm)`：`layers/hbird_hooks.py`、`layers/gemm/registry.py` 按
+  enablement / provider 缓存 / 权重转换 / workspace 预热分段。**对 hbird 的 import 仍保持惰性**：
+  没有私有仓时插件照常 import 与起服务，只在 `register` 阶段跳过 shim。
+- `refactor(norm)`：`layers/norm_activation.py` 只保留 silu hook（lightop 优先，缺失时回退上游实现）。
+  Triton 的 silu 与 gemma add-rmsnorm 两个核删除：前者在 decode 形状不如 lightop（9.8 µs vs 32.1 µs），
+  后者端到端只值 0.04 ms/步且改变数值路径。
+- `fix(fa)`：新增 `patches/flash_attn_layout.py`，替换 `flash_attn.vllm_flash_attn_varlen_func`——
+  该包装把 `layout="custom"` 写死，导致分页 NHD 池走不到直通 paged 核、decode 退回 split-KV。
+  替换后按池 stride 选 `bshd`/`bhsd`，并把 `SGLANG_HCU_FA_NUM_SPLITS` 透传进去；
+  `layers/attention/flashattention_interface.py` 里那套路由判断随之删除。
+
+**实际验证（GPU6/9160，40 请求单波 2k/2k）**
+
+- `python3 ci/l0_gate.py`：passed（717 个 Python 文件，errors 为空）。
+- `python3 -m unittest discover -s tests`：266 项，14 failures / 3 errors / 17 skipped，
+  与改动前 HEAD 完全一致（失败项为既存问题，未逐项归因）。
+- 无 hbird 环境（去掉两个 hbird PYTHONPATH 项）下 `import hcu_sglang.layers.gemm.registry` 通过，
+  `register()` 返回 True 且两个 hook 正常注册。
+- 重构后 `bench_fapatch_r{1,2}.log`：1303.52 / 1304.96 tok/s，TPOT 23.28 / 23.27（均 40/40）。
+  相对交付基线 23.17~23.21 高 0.08 ms，其中约 0.04 ms 来自删除 add-rms 核，其余为补丁包装层与测试噪声。
+- 侧证：`perf/silu_ab.py`、`perf/norm_ab.py`、`perf/norm_native_ab.py` 三组微基准，
+  以及 `bench_noaddrms_r{1,2}.log` 的端到端 A/B（23.24 / 23.22）。
+
+**未验证项**
+
+- FA 补丁未在真实 prefill 长序列与 MTP verify 大 q 行数下逐项核对布局分支，只由 40/40 吞吐与
+  逐请求成功数间接确认未落到错误路径。
+- `flash-attention-das` 分支 `fix/varlen-layout`（`ca3e6cb`）只做了 `py_compile`，
+  未在该仓内构建 wheel 验证。
+- 删除两个 Triton 核后未重跑 T=0 的 sha 逐位比对；改动的数值路径仅由 HumanEval 口径之外的历史证据支撑。
