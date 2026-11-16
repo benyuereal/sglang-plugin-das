@@ -1,11 +1,11 @@
-"""Install the hbird GEMM hooks: model conversion and the lm_head fast path.
+"""Register the alternative GEMM: weight conversion and the lm_head fast path.
 
 The linear-layer seam itself comes from hbird-gemm's sitecustomize
 (``HBIRD_GEMM_SGLANG_SHIM=1`` + ``HBIRD_GEMM_HOME/plugins`` on PYTHONPATH).
 These two hooks are the pieces 0.5.18 patched into the source tree.
 
-Importing this module never requires hbird-gemm; when the backend is unset or
-absent, ``register`` leaves the model on the upstream GEMM.
+Importing this module never requires the private backend; when it is unset
+or absent, ``register`` leaves the model on the upstream GEMM.
 """
 
 import logging
@@ -14,7 +14,7 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 from hcu_sglang.constants import BYTES_PER_GIB
 
-from . import gemm
+from hcu_sglang.layers.gemm import registry as gemm
 
 _LOG = logging.getLogger(__name__)
 _installed = False

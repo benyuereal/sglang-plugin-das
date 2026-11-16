@@ -141,16 +141,17 @@ def _convert_one(backend, model, name, module, stats):
 
 
 def _eligible_weight(module):
+    """The weight to pack, or None when this module keeps the upstream GEMM."""
     weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
-        return None
-    if not weight.is_cuda or weight.dtype != torch.bfloat16:
-        return None
-    if getattr(module, "bias", None) is not None:
-        return None
-    if type(module).__name__ in _EMBEDDINGS:
-        return None
-    return weight
+    packable = (
+        isinstance(weight, torch.Tensor)
+        and weight.dim() == 2
+        and weight.is_cuda
+        and weight.dtype == torch.bfloat16
+        and module._parameters.get("bias") is None
+        and type(module).__name__ not in _EMBEDDINGS
+    )
+    return weight if packable else None
 
 
 def _keep_lm_head(backend, name, weight, stats):
@@ -227,22 +228,25 @@ def lm_head_linear(hidden_states, lm_head, embedding_bias, use_fp32_lm_head):
 
 def _lm_head_weight(hidden_states, lm_head, embedding_bias, use_fp32_lm_head):
     """The bf16 weight to hand the backend, or None to keep the caller's GEMM."""
-    if use_fp32_lm_head or embedding_bias is not None:
-        return None
-    method = getattr(lm_head, "quant_method", None)
-    if method is not None and type(method).__module__.startswith("hcu_sglang."):
-        return None  # a method we installed (the fp8 draft head) owns this GEMM
     weight = getattr(lm_head, "weight", None)
-    if weight is None or weight.dtype != torch.bfloat16:
-        return None
-    if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_cuda:
-        return None
-    if not hidden_states.is_contiguous():
-        return None  # the caller's path owns the copy; never add one here
-    k = int(weight.shape[1])
+    method = getattr(lm_head, "quant_method", None)
+    # A method we installed (the fp8 draft head) owns this GEMM.
+    ours = method is not None and type(method).__module__.startswith("hcu_sglang.")
+    # A non-contiguous hidden state is the caller's to copy; never add one here.
     # No M cap: verify runs bs * draft rows and extend prunes to one token per
     # sequence, so M is bounded by MAX_BS. Capping at DECODE_MAX_M sent
     # M = 144/160 to hipBLASLt, 1.85x slower (measured, CUDA graph).
-    if hidden_states.shape[-1] != k or hidden_states.numel() == 0:
-        return None
-    return weight
+    usable = (
+        not use_fp32_lm_head
+        and embedding_bias is None
+        and not ours
+        and isinstance(weight, torch.Tensor)
+        and weight.dtype == torch.bfloat16
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_cuda
+        and hidden_states.is_contiguous()
+        and hidden_states.numel() > 0
+        and weight.dim() == 2
+        and hidden_states.shape[-1] == int(weight.shape[1])
+    )
+    return weight if usable else None
