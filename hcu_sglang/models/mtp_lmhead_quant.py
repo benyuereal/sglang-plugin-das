@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 _SCHEME_ENV = "SGLANG_MTP_LMHEAD_QUANT"
 _DEFAULT_SCHEME = "fp8_e4m3"
-_MTP_HBIRD_MAX_M_DEFAULT = 192
 
 
 @dataclass(frozen=True)

@@ -48,41 +48,34 @@ def _direct_paged_layout(
     seqused_k=None,
 ) -> str:
     """The wheel's direct paged kernel covers decode and MTP-packed verify."""
-    if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+    if not (isinstance(k, torch.Tensor) and isinstance(v, torch.Tensor)):
         return _CUSTOM
     if max_seqlen_q is None or softcap != 0.0:
         return _CUSTOM
     if window_size is not None and tuple(window_size) != (-1, -1):
         return _CUSTOM
-    if q.ndim != 3 or k.ndim != 4 or v.ndim != 4:
+    if q.ndim != 3 or k.dim() != 4 or v.dim() != 4:
         return _CUSTOM
-    if block_table is None or cu_seqlens_q is None:
-        return _CUSTOM
-    if not torch.is_tensor(seqused_k):
+    if block_table is None or cu_seqlens_q is None or not torch.is_tensor(seqused_k):
         return _CUSTOM
     page_size = k.shape[1]
     nheads_q, head_dim_qk = q.shape[-2], q.shape[-1]
     nheads_kv = k.shape[-2]
-    if (
-        page_size != PAGED_DECODE_PAGE_SIZE
-        or nheads_kv <= 0
-        or head_dim_qk != v.shape[-1]
-    ):
-        return _CUSTOM
-    if nheads_q % nheads_kv:
-        return _CUSTOM
-    bs = cu_seqlens_q.numel() - 1
     # The paged entry reshapes q to [bs, max_seqlen_q, heads, dim] and ignores
     # cu_seqlens_q, so q must be exactly the packed decode/verify rows.
-    if q.shape[0] != bs * max_seqlen_q:
+    packed = (
+        page_size == PAGED_DECODE_PAGE_SIZE
+        and nheads_kv > 0
+        and head_dim_qk == v.shape[-1]
+        and nheads_q % nheads_kv == 0
+        and q.shape[0] == (cu_seqlens_q.numel() - 1) * max_seqlen_q
+    )
+    if not packed:
         return _CUSTOM
-    if max_seqlen_q == 1:
-        return "bshd"
-    if 1 < max_seqlen_q < PAGED_VERIFY_MAX_Q and (
+    verify_ok = 1 < max_seqlen_q < PAGED_VERIFY_MAX_Q and (
         max_seqlen_q * nheads_q <= PAGED_VERIFY_Q_ROWS_PER_KV_HEAD * nheads_kv
-    ):
-        return "bshd"
-    return _CUSTOM
+    )
+    return "bshd" if max_seqlen_q == 1 or verify_ok else _CUSTOM
 
 
 def _layout_enabled() -> bool:
