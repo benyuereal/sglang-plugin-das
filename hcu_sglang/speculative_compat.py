@@ -6,9 +6,32 @@ import logging
 from typing import Any, Callable
 
 import torch
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.environ import envs
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 
+from hcu_sglang import eagle_sampling
+from hcu_sglang.layers.attention.linear import gdn_bplus
+from hcu_sglang.server_args_hooks import _declare_values
+from hcu_sglang.speculative_dspark import _handle_dspark
 from hcu_sglang.utils.detection import is_hcu
+
+# Import failure is the probe: transformers must not report torchaudio as
+# available on images where loading it raises.
+try:
+    import torchaudio  # noqa: F401
+except (ImportError, OSError):
+    try:
+        import transformers.utils as _transformers_utils
+        import transformers.utils.import_utils as _transformers_import_utils
+    except ImportError:
+        _transformers_utils = _transformers_import_utils = None
+else:
+    _transformers_utils = _transformers_import_utils = None
 
 logger = logging.getLogger(__name__)
 
@@ -16,8 +39,6 @@ logger = logging.getLogger(__name__)
 def around_handle_dspark(original: Callable[..., None], server_args: Any) -> None:
     if not is_hcu():
         return original(server_args)
-    from hcu_sglang.speculative_dspark import _handle_dspark
-
     return _handle_dspark(server_args)
 
 
@@ -45,10 +66,6 @@ def around_handle_eagle_family(
     result = original(server_args, *args, **kwargs)
     if not is_hcu():
         return result
-    from sglang.srt.arg_groups.model_override_base import resolving_view
-
-    from hcu_sglang.server_args_hooks import _declare_values
-
     if not envs.SGLANG_HCU_AUTO_REJECTION_SAMPLING.get():
         return result
     view = resolving_view(server_args)
@@ -88,8 +105,6 @@ def around_commit_mamba_states(
         target_worker.model_runner.attn_backend, "linear_attn_backend", None
     )
     if linear is not None:
-        from hcu_sglang.layers.attention.linear import gdn_bplus
-
         gdn_bplus.state(linear).live_T = int(draft_token_num)
     return original(
         target_worker, batch, accept_lens, accept_index, draft_token_num, *args, **kwargs
@@ -97,11 +112,6 @@ def around_commit_mamba_states(
 
 
 def _get_dspark_ragged_settings():
-    from sglang.srt.speculative.ragged_verify import (
-        RaggedVerifyMode,
-        read_ragged_verify_mode,
-    )
-
     return (
         read_ragged_verify_mode(),
         RaggedVerifyMode.STATIC,
@@ -154,23 +164,13 @@ def around_tbo_filter_batch(
 
 
 def patch_broken_torchaudio_availability() -> None:
-    try:
-        import torchaudio  # noqa: F401
-    except (ImportError, OSError):
-        try:
-            import transformers.utils as transformers_utils
-            import transformers.utils.import_utils as import_utils
-        except ImportError:
-            return
-        import_utils.is_torchaudio_available = lambda: False
-        transformers_utils.is_torchaudio_available = lambda: False
+    if _transformers_import_utils is None:
+        return
+    _transformers_import_utils.is_torchaudio_available = lambda: False
+    _transformers_utils.is_torchaudio_available = lambda: False
 
 
 def register_hooks() -> None:
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
-    from hcu_sglang import eagle_sampling
-
     eagle_sampling.register_hooks()
     patch_broken_torchaudio_availability()
     HookRegistry.register(
