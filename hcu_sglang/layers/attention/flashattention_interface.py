@@ -2,17 +2,10 @@
 
 from __future__ import annotations
 
-import os
-
 from typing import Optional, Union
 
 import torch
 
-from hcu_sglang.constants import (
-    PAGED_DECODE_PAGE_SIZE,
-    PAGED_VERIFY_MAX_Q,
-    PAGED_VERIFY_Q_ROWS_PER_KV_HEAD,
-)
 from hcu_sglang.utils.detection import is_hcu
 
 
@@ -86,57 +79,6 @@ def _to_hnd_buffers(k_cache, v_cache):
     if not (k.is_contiguous() and v.is_contiguous()):
         k, v = k.contiguous(), v.contiguous()
     return k, v
-
-
-def _direct_paged_eligible(
-    q,
-    k_cache,
-    v_cache,
-    cu_seqlens_q,
-    max_seqlen_q,
-    page_table,
-    cache_seqlens,
-    window_size,
-    softcap,
-) -> bool:
-    """Whether the wheel's layout="bshd" branch reaches its direct paged kernel.
-
-    The NHD pool is [pages, page_size, heads, dim], which is exactly the bshd
-    interpretation: page size from dim 1, head count from dim -2. The wheel
-    keeps decode and MTP-packed verify (q rows == bs * max_seqlen_q) on the
-    paged kernel only for page size 64 and q/v head dims that match.
-    """
-    if not _paged_bshd_enabled() or _layout_enabled():
-        return False
-    if max_seqlen_q is None or softcap != 0.0:
-        return False
-    if window_size is not None and tuple(window_size) != (-1, -1):
-        return False
-    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.ndim != 4:
-        return False
-    if page_table is None or not torch.is_tensor(cache_seqlens):
-        return False
-    page_size = k_cache.shape[1]
-    nheads_q, head_dim_qk = q.shape[-2], q.shape[-1]
-    nheads_kv = k_cache.shape[-2]
-    if (
-        page_size != PAGED_DECODE_PAGE_SIZE
-        or nheads_kv <= 0
-        or head_dim_qk != v_cache.shape[-1]
-    ):
-        return False
-    if nheads_q % nheads_kv:
-        return False
-    bs = cu_seqlens_q.numel() - 1
-    # q must be exactly the packed decode/MTP rows: the paged entry reshapes
-    # it to [bs, max_seqlen_q, heads, dim] and ignores cu_seqlens_q.
-    if q.shape[0] != bs * max_seqlen_q:
-        return False
-    return max_seqlen_q == 1 or (
-        1 < max_seqlen_q < PAGED_VERIFY_MAX_Q
-        and max_seqlen_q * nheads_q
-        <= PAGED_VERIFY_Q_ROWS_PER_KV_HEAD * nheads_kv
-    )
 
 
 def flash_attn_with_kvcache(
@@ -244,33 +186,14 @@ def flash_attn_with_kvcache(
             v_descale=v_descale,
             return_softmax_lse=return_softmax_lse,
         )
-        # Split-KV width for the wheel's varlen entry only: the vllm wrapper has
-        # no such kwarg, and unset keeps the wheel's auto sizing (0).
-        forced_splits = os.environ.get("SGLANG_HCU_FA_NUM_SPLITS", "").strip()
-        fa3_kwargs = varlen_kwargs if not forced_splits else {
-            **varlen_kwargs, "num_splits": int(forced_splits)
-        }
         if hnd_layout:
             # bhsd is HND K/V with the page tokens contiguous per head; the
             # vllm wrapper hardcodes "custom" (transposed V), which this pool
             # is not, so the varlen entry is the only correct route here.
-            result = fa3_varlen_func(layout="bhsd", **fa3_kwargs)
-        elif _direct_paged_eligible(
-            q,
-            k_cache,
-            v_cache,
-            cu_seqlens_q,
-            max_seqlen_q,
-            page_table,
-            cache_seqlens,
-            window_size,
-            softcap,
-        ):
-            # bshd selects the wheel's direct paged attention kernel for
-            # decode and MTP verify; the vllm wrapper hardcodes "custom",
-            # which misreads NHD pool shapes and falls back to split-KV.
-            result = fa3_varlen_func(layout="bshd", **fa3_kwargs)
+            result = fa3_varlen_func(layout="bhsd", **varlen_kwargs)
         else:
+            # The wheel's layout choice is replaced at import by
+            # hcu_sglang.patches.flash_attn_layout.
             result = vllm_flash_attn_varlen_func(fa_version=2, **varlen_kwargs)
         return _apply_out(result, out, return_softmax_lse)
 
