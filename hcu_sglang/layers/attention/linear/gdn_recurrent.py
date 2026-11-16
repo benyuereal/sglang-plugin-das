@@ -226,6 +226,14 @@ def _f32(x: torch.Tensor) -> torch.Tensor:
     return hit[0]
 
 
+_NULL_PTR = 0  # absent optional tensors are passed as a null pointer
+
+
+def _ptr(tensor):
+    """Data pointer, or the null pointer the kernels check when it is absent."""
+    return _NULL_PTR if tensor is None else tensor.data_ptr()
+
+
 def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
           o, snap_buf, snap_idx, cache_steps, store_step, store_row, n_seq,
           tok_per_seq, hv, h, kdim, vdim, use_h0=None):
@@ -236,13 +244,13 @@ def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
     getattr(lib(), fn)(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
         _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
-        0 if cu_seqlens is None else cu_seqlens.data_ptr(),
+        _ptr(cu_seqlens),
         h0_source.data_ptr(), h0_indices.data_ptr(), o.data_ptr(),
-        0 if snap_buf is None else snap_buf.data_ptr(),
-        0 if snap_idx is None else snap_idx.data_ptr(),
+        _ptr(snap_buf),
+        _ptr(snap_idx),
         int(cache_steps),
-        0 if store_step is None else store_step.data_ptr(),
-        0 if store_row is None else store_row.data_ptr(),
+        _ptr(store_step),
+        _ptr(store_row),
         int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
         int(hv // h),
         # a and b carry separate strides: b is often a slice of a wider buffer
@@ -297,13 +305,13 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
         getattr(lib(), "gdn_recurrent_update_bplus_prenorm")(
             q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(),
             b.data_ptr(), _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
-            0 if cu_seqlens is None else cu_seqlens.data_ptr(),
+            _ptr(cu_seqlens),
             ssm_states.data_ptr(), cache_indices.data_ptr(), o.data_ptr(),
-            0 if snap_flat is None else snap_flat.data_ptr(),
-            0 if snap_idx is None else snap_idx.data_ptr(),
+            _ptr(snap_flat),
+            _ptr(snap_idx),
             int(cache_steps),
-            0 if store is None else store.data_ptr(),
-            0 if store_row is None else store_row.data_ptr(),
+            _ptr(store),
+            _ptr(store_row),
             n, int(draft_token_num), hv, kdim, int(v.shape[-1]),
             int(hv // h),
             _tok_stride(q), _tok_stride(k), _tok_stride(v),
@@ -330,7 +338,7 @@ def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
     getattr(lib(), "gdn_recurrent_update_nofma")(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), a.data_ptr(), b.data_ptr(),
         _f32(A_log).data_ptr(), _f32(dt_bias).data_ptr(),
-        0 if cu_seqlens is None else cu_seqlens.data_ptr(),
+        _ptr(cu_seqlens),
         ssm_states.data_ptr(), cache_indices.data_ptr(), o.data_ptr(),
         snap_flat.data_ptr(), snap_idx.data_ptr(),
         int(cache_steps), int(n), int(draft_token_num), int(v.shape[-2]),
@@ -370,7 +378,7 @@ def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
         h0_indices.data_ptr(),
         snap_idx.data_ptr(),
         int(cache_steps),
-        0 if store_step is None else store_step.data_ptr(),
+        _ptr(store_step),
         int(layer_ptrs.shape[0]),
         int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
         int(hv // h),
@@ -505,7 +513,7 @@ def conv_update(x, conv_state, weight, bias=None, activation=None,
     pad = 0 if pad_slot_id is None else int(pad_slot_id)
 
     def ptr(t):
-        return 0 if t is None else t.data_ptr()
+        return _ptr(t)
 
     def stride2(t):
         return (0, 0) if t is None else (int(t.stride(0)), int(t.stride(1)))

@@ -322,20 +322,20 @@ def _gdn_hip_kernel_enabled() -> bool:
     if not _is_hcu:
         return False
     try:
-        from hcu_sglang.layers.attention.linear import gdn_hip_bplus
+        from hcu_sglang.layers.attention.linear import gdn_recurrent
 
-        return gdn_hip_bplus.enabled_kernel()
+        return gdn_recurrent.enabled_kernel()
     except Exception:
         return False
 
 
-def _gdn_hip_bplus_enabled() -> bool:
+def _gdn_recurrent_enabled() -> bool:
     if not _is_hcu:
         return False
     try:
-        from hcu_sglang.layers.attention.linear import gdn_bplus
+        from hcu_sglang.layers.attention.linear import gdn_commit
 
-        return gdn_bplus.enabled()
+        return gdn_commit.enabled()
     except Exception:
         return False
 
@@ -351,10 +351,10 @@ def conv_update(x, conv_state, weight, bias=None, activation=None, **kwargs):
     """
     if _is_hcu:
         try:
-            from hcu_sglang.layers.attention.linear import gdn_hip_bplus
+            from hcu_sglang.layers.attention.linear import gdn_recurrent
 
-            if gdn_hip_bplus.conv_enabled():
-                out = gdn_hip_bplus.conv_update(
+            if gdn_recurrent.conv_enabled():
+                out = gdn_recurrent.conv_update(
                     x, conv_state, weight, bias, activation, **kwargs
                 )
                 if out is not None:
@@ -364,7 +364,7 @@ def conv_update(x, conv_state, weight, bias=None, activation=None, **kwargs):
                     rank0_log(
                         "SGLANG_GDN_HIP_CONV=1 but this conv call is outside "
                         "the HIP kernel "
-                        f"({gdn_hip_bplus.conv_last_reason()}); using Triton."
+                        f"({gdn_recurrent.conv_last_reason()}); using Triton."
                     )
         except Exception as exc:  # noqa: BLE001 - never fail a forward here
             if not _CONV_HIP_LOG["done"]:
@@ -580,21 +580,21 @@ def forward_extend(
                 "recurrent target_verify fallback requires intermediate_ssm, "
                 "which is not allocated under --enable-linear-replayssm-spec"
             )
-            if _gdn_hip_bplus_enabled():
+            if _gdn_recurrent_enabled():
                 from hcu_sglang.layers.attention.linear import (
-                    gdn_bplus,
-                    gdn_hip_bplus,
+                    gdn_commit,
+                    gdn_recurrent,
                 )
 
                 n = batch_size
-                if gdn_bplus.stash(
+                if gdn_commit.stash(
                     self, layer, query, key, value, a, b, draft_token_num
                 ):
                     flat = intermediate_state_cache.reshape(
                         -1, *intermediate_state_cache.shape[2:]
                     )
                     store_arg = store_row_arg = None
-                    if gdn_bplus.handoff_enabled():
+                    if gdn_commit.handoff_enabled():
                         # Slot-indexed scratch rows: the committed row then has a
                         # stable address, so commit only moves an int32 pointer.
                         # Row stride is the allocated cache_steps, not the
@@ -602,8 +602,8 @@ def forward_extend(
                         cache_steps = int(intermediate_state_cache.shape[1])
                         slots = cache_indices[:n].to(torch.int32)
                         snap_idx = slots
-                        gdn_bplus.begin_verify_step(self, layer.layer_id)
-                        sh = gdn_bplus.shared_step_values(
+                        gdn_commit.begin_verify_step(self, layer.layer_id)
+                        sh = gdn_commit.shared_step_values(
                             self,
                             slots,
                             mamba_cache_params,
@@ -614,17 +614,17 @@ def forward_extend(
                         h0_idx = sh["rows"][cache_steps]["h0"]
                         store_arg = sh["store"]
                         store_row_arg = sh["rows"][cache_steps]["store_row"]
-                        prev_arg = gdn_bplus.state(self).prev
+                        prev_arg = gdn_commit.state(self).prev
                     else:
                         snap_idx = intermediate_state_indices[:n].to(torch.int32)
                         h0_src = ssm_states
                         h0_idx = cache_indices[:n].to(torch.int32)
                         prev_arg = None
-                    gdn_bplus.state(self).snap_idx = snap_idx
+                    gdn_commit.state(self).snap_idx = snap_idx
                     hip_out = query.new_empty(
                         (1, query.shape[1], value.shape[2], value.shape[3])
                     )
-                    gdn_hip_bplus.verify(
+                    gdn_recurrent.verify(
                         query,
                         key,
                         value,
@@ -646,7 +646,7 @@ def forward_extend(
                     )
                     return hip_out
             if _gdn_hip_kernel_enabled():
-                from hcu_sglang.layers.attention.linear import gdn_hip_bplus
+                from hcu_sglang.layers.attention.linear import gdn_recurrent
 
                 if not _HIP_LOG["done"]:
                     rank0_log("GDN HIP kernel-only verify path active")
@@ -659,7 +659,7 @@ def forward_extend(
                 hip_out = query.new_empty(
                     (1, query.shape[1], value.shape[2], value.shape[3])
                 )
-                gdn_hip_bplus.verify_full(
+                gdn_recurrent.verify_full(
                     query,
                     key,
                     value,
@@ -758,14 +758,14 @@ def forward_extend(
                 h_track_buf=h_track_buf,
             )
 
-        from hcu_sglang.layers.attention.linear import gdn_bplus
+        from hcu_sglang.layers.attention.linear import gdn_commit
 
         # Real prefill only: the MTP draft extend also takes this branch, and
         # seeding there copies the whole state (6 GiB per draft step) for slots
         # that already have a live handoff row.
         inter = getattr(mamba_cache_params, "intermediate_ssm", None)
         if inter is not None and forward_batch.forward_mode.is_extend_without_speculative():
-            gdn_bplus.seed_prev(
+            gdn_commit.seed_prev(
                 self, cache_indices, mamba_cache_params, int(inter.shape[1])
             )
 

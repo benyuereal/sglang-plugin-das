@@ -1,20 +1,63 @@
-"""GDN B+ commit chain: verify stores only the last snapshot row, and the
-commit replays the stash for the truncated slots. The handoff variant points
-verify at the committed row, valid only with --disable-radix-cache.
+"""Commit only the accepted step's GDN state.
+
+Verify keeps a single snapshot row; the commit replays the stash for the slots
+the accept truncated, so the 6 GiB state copy is not needed. The handoff
+variant points verify at the committed row and is valid only with
+``--disable-radix-cache``.
+
+"B+" is the original name of this path and survives in the kernel entry points
+and SGLANG_GDN_HIP_BPLUS; the module is named after what it does.
 """
 
 import logging
 import os
 
 import torch
+from typing import NamedTuple
 
 from hcu_sglang.constants import SEED_SCRATCH_MIN_ROWS, SLOT_BUFFER_SLACK
-from hcu_sglang.layers.attention.linear import gdn_hip_bplus
+from hcu_sglang.layers.attention.linear import gdn_recurrent
+
+
+class HeadDims(NamedTuple):
+    """Per-layer head layout, as the recurrent kernel indexes it."""
+
+    qh: int
+    qk: int
+    kh: int
+    kk: int
+    vh: int
+    vv: int
+
+    @classmethod
+    def of(cls, q, k, v) -> "HeadDims":
+        return cls(q.shape[2], q.shape[3], k.shape[2], k.shape[3],
+                   v.shape[2], v.shape[3])
+
+    @classmethod
+    def from_entry(cls, ent) -> "HeadDims":
+        dims = ent["dims"]
+        return dims if isinstance(dims, HeadDims) else cls(*dims)
+
+    def matches(self, ent) -> bool:
+        return self == self.from_entry(ent)
+
+    @property
+    def q(self):
+        return self.qh, self.qk
+
+    @property
+    def k(self):
+        return self.kh, self.kk
+
+    @property
+    def v(self):
+        return self.vh, self.vv
 
 logger = logging.getLogger(__name__)
 
 
-class BplusState:
+class CommitState:
     """Per-backend scratch, kept off the nn.Module so plain attributes work."""
 
     __slots__ = (
@@ -67,7 +110,7 @@ class BplusState:
         self.tmp64_buf = {}
 
 
-def state(backend) -> BplusState:
+def state(backend) -> CommitState:
     # The adaptive spec controller builds a second attention backend for its
     # other step count and swaps it into the model runner between batches, so
     # backend-local state would separate the committed-row pointer written by
@@ -75,9 +118,9 @@ def state(backend) -> BplusState:
     # state; key it on the request pool every backend on this runner shares.
     pool = getattr(backend, "req_to_token_pool", None)
     owner = backend if pool is None else pool
-    st = getattr(owner, "_gdn_bplus", None)
+    st = getattr(owner, "_gdn_commit", None)
     if st is None:
-        st = owner._gdn_bplus = BplusState()
+        st = owner._gdn_commit = CommitState()
     return st
 
 
@@ -379,9 +422,7 @@ def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
         qkv = torch.zeros((rows, qd + kd + vd), dtype=q.dtype, device=dev)
         ent = {
             "rows": rows,
-            "qh": q.shape[2], "qk": q.shape[3],
-            "kh": k.shape[2], "kk": k.shape[3],
-            "vh": v.shape[2], "vv": v.shape[3],
+            "dims": HeadDims.of(q, k, v),
             "qkv": qkv,
             "q": qkv[:, :qd],
             "k": qkv[:, qd:qd + kd],
@@ -533,7 +574,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 continue
         if not rows:
             return False
-        if _multi_enabled() and gdn_hip_bplus.has_multi():
+        if _multi_enabled() and gdn_recurrent.has_multi():
             try:
                 if _compensate_multi(st, rows, n, D, m, store_step, snap32):
                     return True
@@ -541,10 +582,10 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 logger.warning("[gdn-bplus] multi compensate failed", exc_info=True)
         for ent, ssm, flat, h0_idx, cache_steps, lid in rows:
             try:
-                gdn_hip_bplus.compensate(
-                    ent["q"][:m].view(n, D, ent["qh"], ent["qk"]),
-                    ent["k"][:m].view(n, D, ent["kh"], ent["kk"]),
-                    ent["v"][:m].view(n, D, ent["vh"], ent["vv"]),
+                gdn_recurrent.compensate(
+                    ent["q"][:m].view(n, D, *HeadDims.from_entry(ent).q),
+                    ent["k"][:m].view(n, D, *HeadDims.from_entry(ent).k),
+                    ent["v"][:m].view(n, D, *HeadDims.from_entry(ent).v),
                     ent["a"][:m].view(n, D, -1),
                     ent["b"][:m].view(n, D, -1),
                     ent["A_log"],
@@ -578,7 +619,7 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     if len(rows) < 2:
         return False
     ent0 = rows[0][0]
-    dims = tuple(int(ent0[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv"))
+    dims = HeadDims.from_entry(ent0)
     qh, qk, kh, kk, vh, vv = dims
     cache_steps = rows[0][4]
     qv = ent0["q"][:m].view(n, D, qh, qk)
@@ -597,7 +638,7 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     if table is None or st.ml_key != key:
         cells = []
         for ent, ssm, flat, h0_idx, cs, _ in rows:
-            if tuple(int(ent[k]) for k in ("qh", "qk", "kh", "kk", "vh", "vv")) != dims:
+            if not dims.matches(ent):
                 return False
             if (
                 cs != cache_steps
@@ -611,8 +652,8 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
                     ent["q"].data_ptr(), ent["k"].data_ptr(),
                     ent["v"].data_ptr(), ent["a"].data_ptr(),
                     ent["b"].data_ptr(),
-                    gdn_hip_bplus.f32(ent["A_log"]).data_ptr(),
-                    gdn_hip_bplus.f32(ent["dt_bias"]).data_ptr(),
+                    gdn_recurrent.f32(ent["A_log"]).data_ptr(),
+                    gdn_recurrent.f32(ent["dt_bias"]).data_ptr(),
                     ssm.data_ptr(), ent["out"].data_ptr(), flat.data_ptr(),
                     *strides,
                 ]
@@ -622,7 +663,7 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
         )
         st.ml_table = table
         st.ml_key = key
-    gdn_hip_bplus.compensate_multi(
+    gdn_recurrent.compensate_multi(
         table, rows[0][3], snap32, cache_steps, store_step,
         n, D, vh, qh, kk, vv,
     )

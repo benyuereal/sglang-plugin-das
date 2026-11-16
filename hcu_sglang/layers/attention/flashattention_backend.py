@@ -35,9 +35,6 @@ _PREPARE_TARGET = (
 
 
 def register() -> None:
-    from hcu_sglang.compat import flash_attn
-
-    flash_attn.install_varlen_layout()
     hooks = (
         (_INIT_TARGET, around_init),
         ("sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend.get_paged_mha_kv_cache", around_get_paged_mha_kv_cache),

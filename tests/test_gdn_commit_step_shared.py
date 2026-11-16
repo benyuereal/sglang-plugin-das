@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from hcu_sglang.layers.attention.linear import gdn_bplus, gdn_hip_bplus
+from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
 
 CACHE_STEPS = 12
 OTHER_STEPS = 16
@@ -43,19 +43,19 @@ def _old_per_layer(prev_buf, slots, cache_steps, draft):
 class SharedStepTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
-        gdn_bplus._HANDOFF_OK = None
+        gdn_commit._HANDOFF_OK = None
         self.backend = types.SimpleNamespace()
         self.params = _params()
         self.prev_buf = torch.randint(
             -1, CACHE_STEPS, (POOL_ROWS + 3,), dtype=torch.int32
         )
-        gdn_bplus.state(self.backend).prev = self.prev_buf
+        gdn_commit.state(self.backend).prev = self.prev_buf
         self.slots = torch.randint(0, POOL_ROWS, (BATCH,), dtype=torch.int32)
         self.slots[3] = -1
         self.slots[9] = -1
 
     def tearDown(self):
-        gdn_bplus._HANDOFF_OK = None
+        gdn_commit._HANDOFF_OK = None
 
     def assertBitEqual(self, got, want):
         self.assertEqual(got.dtype, want.dtype)
@@ -63,7 +63,7 @@ class SharedStepTest(unittest.TestCase):
         self.assertTrue(torch.equal(got, want))
 
     def shared(self, slots=None, cache_steps=CACHE_STEPS, draft=DRAFT):
-        return gdn_bplus.shared_step_values(
+        return gdn_commit.shared_step_values(
             self.backend,
             self.slots if slots is None else slots,
             self.params,
@@ -74,7 +74,7 @@ class SharedStepTest(unittest.TestCase):
     def test_every_layer_matches_the_per_layer_arithmetic(self):
         sh = None
         for lid in range(6):
-            gdn_bplus.begin_verify_step(self.backend, lid)
+            gdn_commit.begin_verify_step(self.backend, lid)
             sh = self.shared()
             s64, prev, store, store_row, h0 = _old_per_layer(
                 self.prev_buf, self.slots, CACHE_STEPS, DRAFT
@@ -86,19 +86,19 @@ class SharedStepTest(unittest.TestCase):
             self.assertBitEqual(sh["rows"][CACHE_STEPS]["h0"], h0)
 
     def test_shared_tensors_are_reused_within_a_forward(self):
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         first = self.shared()
-        gdn_bplus.begin_verify_step(self.backend, 1)
+        gdn_commit.begin_verify_step(self.backend, 1)
         second = self.shared()
         self.assertIs(first, second)
         self.assertIs(first["s64"], second["s64"])
         self.assertIs(first["store"], second["store"])
 
     def test_a_new_forward_recomputes_from_the_committed_buffer(self):
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         self.shared()
         self.prev_buf.random_(-1, CACHE_STEPS)
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         sh = self.shared()
         _, prev, _, store_row, h0 = _old_per_layer(
             self.prev_buf, self.slots, CACHE_STEPS, DRAFT
@@ -108,9 +108,9 @@ class SharedStepTest(unittest.TestCase):
         self.assertBitEqual(sh["rows"][CACHE_STEPS]["h0"], h0)
 
     def test_each_stride_keeps_its_own_rows(self):
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         sh = self.shared()
-        gdn_bplus.begin_verify_step(self.backend, 1)
+        gdn_commit.begin_verify_step(self.backend, 1)
         self.shared(cache_steps=OTHER_STEPS)
         for steps in (CACHE_STEPS, OTHER_STEPS):
             _, _, _, store_row, h0 = _old_per_layer(
@@ -122,30 +122,30 @@ class SharedStepTest(unittest.TestCase):
     def test_draft_width_changes_the_store_row_buffer(self):
         # Adaptive speculation varies the width between forwards, never inside
         # one: the new forward is what re-fills the store row.
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         self.shared(draft=3)
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         sh = self.shared(draft=DRAFT)
         store = torch.full((BATCH,), DRAFT - 1, dtype=torch.int32)
         self.assertBitEqual(sh["store"], store)
 
     def test_step_h0_only_matches_the_batch_it_was_computed_for(self):
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         self.shared()
-        self.assertIsNotNone(gdn_bplus.step_h0(self.backend, self.slots, CACHE_STEPS))
+        self.assertIsNotNone(gdn_commit.step_h0(self.backend, self.slots, CACHE_STEPS))
         shorter = self.slots[:8]
-        self.assertIsNone(gdn_bplus.step_h0(self.backend, shorter, CACHE_STEPS))
+        self.assertIsNone(gdn_commit.step_h0(self.backend, shorter, CACHE_STEPS))
         other = self.slots.clone()
-        self.assertIsNone(gdn_bplus.step_h0(self.backend, other, CACHE_STEPS))
-        self.assertIsNone(gdn_bplus.step_h0(self.backend, self.slots, OTHER_STEPS))
+        self.assertIsNone(gdn_commit.step_h0(self.backend, other, CACHE_STEPS))
+        self.assertIsNone(gdn_commit.step_h0(self.backend, self.slots, OTHER_STEPS))
 
     def test_h0_rows_fallback_matches_the_cached_rows(self):
-        gdn_bplus.begin_verify_step(self.backend, 0)
+        gdn_commit.begin_verify_step(self.backend, 0)
         sh = self.shared()
         s64, prev, _, _, h0 = _old_per_layer(
             self.prev_buf, self.slots, CACHE_STEPS, DRAFT
         )
-        self.assertBitEqual(gdn_bplus.h0_rows(self.slots, prev, CACHE_STEPS), h0)
+        self.assertBitEqual(gdn_commit.h0_rows(self.slots, prev, CACHE_STEPS), h0)
         self.assertBitEqual(sh["rows"][CACHE_STEPS]["h0"], h0)
 
     def test_verify_forwards_the_precomputed_rows_untouched(self):
@@ -160,8 +160,8 @@ class SharedStepTest(unittest.TestCase):
         snap_idx = torch.zeros(BATCH, dtype=torch.int32)
         store = torch.full((BATCH,), DRAFT - 1, dtype=torch.int32)
         store_row = torch.zeros(BATCH, dtype=torch.int32)
-        with patch.object(gdn_hip_bplus, "_call", fake_call):
-            gdn_hip_bplus.verify(
+        with patch.object(gdn_recurrent, "_call", fake_call):
+            gdn_recurrent.verify(
                 q, q, v, q, q, q, q, None, v, snap_idx, v, snap_idx,
                 CACHE_STEPS, DRAFT, v, prev_step=self.prev_buf,
                 store=store, store_row=store_row,
@@ -179,8 +179,8 @@ class SharedStepTest(unittest.TestCase):
         q = torch.zeros(1, BATCH * DRAFT, 2, 8)
         v = torch.zeros(1, BATCH * DRAFT, 4, 6)
         snap_idx = self.slots.to(torch.int32)
-        with patch.object(gdn_hip_bplus, "_call", fake_call):
-            gdn_hip_bplus.verify(
+        with patch.object(gdn_recurrent, "_call", fake_call):
+            gdn_recurrent.verify(
                 q, q, v, q, q, q, q, None, v, snap_idx, v, snap_idx,
                 CACHE_STEPS, DRAFT, v, prev_step=self.prev_buf,
             )
@@ -208,16 +208,16 @@ class SharedStepTest(unittest.TestCase):
         put_idx = torch.where(idx >= 0, idx, discard)
         want.index_copy_(0, put_idx, keep)
 
-        gdn_bplus.state(self.backend).prev = self.prev_buf.clone()
+        gdn_commit.state(self.backend).prev = self.prev_buf.clone()
         env = {
             "SGLANG_GDN_HIP_BPLUS": "1",
             "SGLANG_GDN_HIP_HANDOFF": "1",
             "SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK": "1",
         }
         with patch.dict(os.environ, env):
-            ok = gdn_bplus.commit_prev(self.backend, idx, last, T, CACHE_STEPS)
+            ok = gdn_commit.commit_prev(self.backend, idx, last, T, CACHE_STEPS)
         self.assertTrue(ok)
-        self.assertBitEqual(gdn_bplus.state(self.backend).prev, want)
+        self.assertBitEqual(gdn_commit.state(self.backend).prev, want)
 
 
 if __name__ == "__main__":

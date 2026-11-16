@@ -15,7 +15,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 
 from hcu_sglang import eagle_sampling
-from hcu_sglang.layers.attention.linear import gdn_bplus
+from hcu_sglang.layers.attention.linear import gdn_commit
 from hcu_sglang.server_args_hooks import _declare_values
 from hcu_sglang.speculative_dspark import _handle_dspark
 from hcu_sglang.utils.detection import is_hcu
@@ -105,7 +105,7 @@ def around_commit_mamba_states(
         target_worker.model_runner.attn_backend, "linear_attn_backend", None
     )
     if linear is not None:
-        gdn_bplus.state(linear).live_T = int(draft_token_num)
+        gdn_commit.state(linear).live_T = int(draft_token_num)
     return original(
         target_worker, batch, accept_lens, accept_index, draft_token_num, *args, **kwargs
     )

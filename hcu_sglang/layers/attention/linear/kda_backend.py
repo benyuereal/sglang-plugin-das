@@ -1615,9 +1615,9 @@ class _HybridMethods:
             return
 
         linear = self.linear_attn_backend
-        from hcu_sglang.layers.attention.linear import gdn_bplus
+        from hcu_sglang.layers.attention.linear import gdn_commit
 
-        gdn_bplus.compensate_from_stash(
+        gdn_commit.compensate_from_stash(
             linear, state_indices_tensor, last_correct_step_indices
         )
         if self._handoff_moved_the_pointer(
@@ -1651,19 +1651,19 @@ class _HybridMethods:
         self, linear, mamba_caches, state_indices, last_correct, src_indices_raw
     ) -> bool:
         """B+ handoff: the commit only moves the row pointer, not the state."""
-        from hcu_sglang.layers.attention.linear import gdn_bplus
+        from hcu_sglang.layers.attention.linear import gdn_commit
 
         # Pipeline-parallel rows are request-pool indices; the pointer
         # arithmetic below assumes the forward's own row layout.
-        if not gdn_bplus.handoff_enabled() or src_indices_raw is not None:
+        if not gdn_commit.handoff_enabled() or src_indices_raw is not None:
             return False
         # Host int on purpose: .item() would serialize the CPU behind the
         # verify every decode step; the captured width is the fallback.
-        state = gdn_bplus.state(linear)
+        state = gdn_commit.state(linear)
         steps = int(state.live_T or state.capture_T)
         if steps <= 1:
             return False
-        return gdn_bplus.commit_prev(
+        return gdn_commit.commit_prev(
             linear,
             state_indices,
             last_correct,

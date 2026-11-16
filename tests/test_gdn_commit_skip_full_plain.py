@@ -20,7 +20,7 @@ from unittest import mock
 
 import torch
 
-from hcu_sglang.layers.attention.linear import gdn_bplus, gdn_hip_bplus
+from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
 
 
 
@@ -48,13 +48,13 @@ def _stash_entry():
         "layer_cache": layer_cache,
         "q": qkv, "k": qkv, "v": qkv, "a": qkv, "b": qkv,
         "A_log": torch.zeros(1), "dt_bias": torch.zeros(1), "out": torch.zeros(1),
-        "qh": 1, "qk": 1, "kh": 1, "kk": 1, "vh": 1, "vv": 1,
+        "dims": gdn_commit.HeadDims(qh=1, qk=1, kh=1, kk=1, vh=1, vv=1),
     }
 
 
 def _backend():
     backend = types.SimpleNamespace()
-    st = gdn_bplus.state(backend)
+    st = gdn_commit.state(backend)
     st.stash = {0: _stash_entry()}
     st.snap_idx = torch.zeros(N, dtype=torch.int32)
     st.capture_T = T
@@ -66,13 +66,13 @@ def _backend():
 
 class PlainCompensateTest(unittest.TestCase):
     def setUp(self):
-        self._handoff_ok = gdn_bplus._HANDOFF_OK
+        self._handoff_ok = gdn_commit._HANDOFF_OK
         self._linutils = _lin_utils()
         self._pp = getattr(self._linutils, "pp_spec_stable_rows_enabled", None)
         self._had_pp = hasattr(self._linutils, "pp_spec_stable_rows_enabled")
 
     def tearDown(self):
-        gdn_bplus._HANDOFF_OK = self._handoff_ok
+        gdn_commit._HANDOFF_OK = self._handoff_ok
         if self._had_pp:
             setattr(self._linutils, "pp_spec_stable_rows_enabled", self._pp)
         else:
@@ -87,7 +87,7 @@ class PlainCompensateTest(unittest.TestCase):
                 "SGLANG_GDN_HIP_BPLUS_MULTI": "0",  # skip the multi launcher
             }
         )
-        gdn_bplus._HANDOFF_OK = None  # re-evaluate with the env above
+        gdn_commit._HANDOFF_OK = None  # re-evaluate with the env above
         self._linutils.pp_spec_stable_rows_enabled = lambda: False
         backend = _backend()
         state_indices = torch.tensor([1, 2], dtype=torch.int64)
@@ -99,9 +99,9 @@ class PlainCompensateTest(unittest.TestCase):
             recorded["called"] = True
 
         with mock.patch.dict("os.environ", env), mock.patch.object(
-            gdn_hip_bplus, "compensate", fake_compensate
+            gdn_recurrent, "compensate", fake_compensate
         ):
-            ok = gdn_bplus.compensate_from_stash(backend, state_indices, last_correct)
+            ok = gdn_commit.compensate_from_stash(backend, state_indices, last_correct)
         self.assertTrue(ok)
         self.assertTrue(recorded.get("called"))
         return recorded["h0"]
