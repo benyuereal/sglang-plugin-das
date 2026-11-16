@@ -2890,10 +2890,17 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `refactor(norm)`：`layers/norm_activation.py` 只保留 silu hook（lightop 优先，缺失时回退上游实现）。
   Triton 的 silu 与 gemma add-rmsnorm 两个核删除：前者在 decode 形状不如 lightop（9.8 µs vs 32.1 µs），
   后者端到端只值 0.04 ms/步且改变数值路径。
-- `fix(fa)`：新增 `compat/flash_attn.py`，替换 `flash_attn.vllm_flash_attn_varlen_func`——
+- `fix(fa)`（**后已被 `084b210` 取代**）：新增 `compat/flash_attn.py`，替换 `flash_attn.vllm_flash_attn_varlen_func`——
   该包装把 `layout="custom"` 写死，导致分页 NHD 池走不到直通 paged 核、decode 退回 split-KV。
   替换后按池 stride 选 `bshd`/`bhsd`，并把 `SGLANG_HCU_FA_NUM_SPLITS` 透传进去；
   `layers/attention/flashattention_interface.py` 里那套路由判断随之删除。
+
+> **后续（同日 `084b210`）**：插件侧补丁已删除，改为给**预装 wheel** 的 Python 打补丁
+> （`patches/apply_flash_attn_layout.sh` + `patches/0001-flash-attn-varlen-layout.patch`，原件备份在
+> `/workspace/work/fa_backup_20261116/`）。原因是自建 wheel 与预装包构建配置不同（split-core，
+> `.so` 239 MB vs 504 MB），整包替换会掉 12%（1143 tok/s / TPOT 26.32），混装则起不来。
+> 打补丁后实测 **1303.68 tok/s / TPOT 23.25**，与插件补丁时（1303.94 / 23.26）等价。
+> 部署验收判据见 `DELIVERY.md` §5：TPOT 必须 23.2 ms 量级，25+ 说明补丁没生效。
 
 **实际验证（GPU6/9160，40 请求单波 2k/2k）**
 
