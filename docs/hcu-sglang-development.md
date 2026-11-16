@@ -2884,13 +2884,13 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
   钉死的 0.5.22 两个方法都不存在，分支恒为假。
 - `refactor(mtp)`：`models/qwen3_5_mtp_fp8.py` 的 fp8 草稿头安装拆成
   gate / quantize / prepare / install 四段；hook 前缀字符串移入 `constants.QWEN3_5_MTP_HOOK_BASE`。
-- `refactor(gemm)`：`layers/hbird_hooks.py`、`layers/gemm/registry.py` 按
+- `refactor(gemm)`：`layers/gemm/hooks.py`（原 `layers/hbird_hooks.py`）、`layers/gemm/registry.py` 按
   enablement / provider 缓存 / 权重转换 / workspace 预热分段。**对 hbird 的 import 仍保持惰性**：
   没有私有仓时插件照常 import 与起服务，只在 `register` 阶段跳过 shim。
 - `refactor(norm)`：`layers/norm_activation.py` 只保留 silu hook（lightop 优先，缺失时回退上游实现）。
   Triton 的 silu 与 gemma add-rmsnorm 两个核删除：前者在 decode 形状不如 lightop（9.8 µs vs 32.1 µs），
   后者端到端只值 0.04 ms/步且改变数值路径。
-- `fix(fa)`：新增 `patches/flash_attn_layout.py`，替换 `flash_attn.vllm_flash_attn_varlen_func`——
+- `fix(fa)`：新增 `compat/flash_attn.py`，替换 `flash_attn.vllm_flash_attn_varlen_func`——
   该包装把 `layout="custom"` 写死，导致分页 NHD 池走不到直通 paged 核、decode 退回 split-KV。
   替换后按池 stride 选 `bshd`/`bhsd`，并把 `SGLANG_HCU_FA_NUM_SPLITS` 透传进去；
   `layers/attention/flashattention_interface.py` 里那套路由判断随之删除。
@@ -2914,3 +2914,18 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `flash-attention-das` 分支 `fix/varlen-layout`（`ca3e6cb`）只做了 `py_compile`，
   未在该仓内构建 wheel 验证。
 - 删除两个 Triton 核后未重跑 T=0 的 sha 逐位比对；改动的数值路径仅由 HumanEval 口径之外的历史证据支撑。
+
+**结构收尾（同日）**：补三处归属调整，行为不变。
+
+- `layers/hbird_hooks.py` → `layers/gemm/hooks.py`：它注册的是"换用哪个 GEMM 后端"，
+  具体后端按部署决定，因此归属 gemm 包，模块名不再绑定某个厂商。
+- `patches/flash_attn_layout.py` → `compat/flash_attn.py`：`compat/` 本来就是给
+  "已装 wheel 缺能力" 收口的目录（`compat/aiter.py` 同例），不另开 `patches/`。
+- `models/qwen3_5_mtp_fp8.py` 拆成三层：`models/mtp_lmhead_quant.py` 只负责量化
+  （scheme 表：dtype / 分块 / 逐行 scale，当前 `fp8_e4m3`，由 `SGLANG_MTP_LMHEAD_QUANT` 选择）、
+  `layers/gemm/quant_lm_head.py` 只负责为量化后的权重准备 GEMM 后端、
+  原文件只保留"何时装、怎么重装"的模型侧逻辑。
+
+验证：`ci/l0_gate.py` passed；单测 266 项仍为 14F/3E/17 skipped（与改动前一致）；
+重启 9160 后 `logs/serve_9160_move.log` 打出 `[quant_lm_head] head on packed tiles: 1.18 GiB B,
+192 M workspaces`，40/40 bench `logs/bench_moved_r1.log` = 1303.44 tok/s / TPOT 23.27。
