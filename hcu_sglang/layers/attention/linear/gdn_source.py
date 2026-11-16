@@ -218,12 +218,7 @@ def forward_decode(
         assert isinstance(mixed_qkv, torch.Tensor)
 
     if not conv_already_applied:
-        conv_update = (
-            causal_conv1d_update_hcu
-            if _use_hcu_causal_conv1d
-            else causal_conv1d_update
-        )
-        mixed_qkv = conv_update(
+        mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
             layer.conv_weights,
@@ -288,6 +283,7 @@ def forward_decode(
     return (core_attn_out, z) if return_z else core_attn_out
 
 def _convolve_prefill(
+    original,
     self,
     layer: RadixLinearAttention,
     forward_batch: ForwardBatch,
@@ -295,22 +291,27 @@ def _convolve_prefill(
     conv_states: torch.Tensor,
     cache_indices: torch.Tensor,
 ) -> torch.Tensor:
-    block_table = self.forward_metadata.conv_block_table
-    use_hcu_conv = _use_hcu_causal_conv1d and block_table is None
-    conv_fn = causal_conv1d_fn_hcu if use_hcu_conv else causal_conv1d_fn
-    conv_kwargs = {"initial_states" if use_hcu_conv else "conv_states": conv_states}
-    if block_table is not None:
-        conv_kwargs["block_table"] = block_table
-    return conv_fn(
+    """HCU conv1d for prefill; the upstream implementation otherwise.
+
+    The HCU library takes the conv state as ``initial_states`` and has no block
+    table, so a pooled (paged) conv state stays on the upstream call.
+    """
+    if not _use_hcu_causal_conv1d:
+        return original(self, layer, forward_batch, mixed_qkv, conv_states,
+                        cache_indices)
+    if self.forward_metadata.conv_block_table is not None:
+        return original(self, layer, forward_batch, mixed_qkv, conv_states,
+                        cache_indices)
+    return causal_conv1d_fn_hcu(
         mixed_qkv.transpose(0, 1),
         layer.conv_weights,
         layer.bias,
         activation=layer.activation,
+        initial_states=conv_states,
         has_initial_state=forward_batch.extend_prefix_lens > 0,
         cache_indices=cache_indices,
         query_start_loc=self.forward_metadata.query_start_loc,
         seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        **conv_kwargs,
     ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
 

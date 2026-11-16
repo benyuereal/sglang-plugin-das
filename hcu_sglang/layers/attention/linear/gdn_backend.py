@@ -44,6 +44,9 @@ def _install_conv_hook() -> None:
     import sglang.srt.layers.attention.linear.gdn_backend as upstream_gdn
 
     upstream_gdn.causal_conv1d_update = gdn_source.conv_update
+    # gdn_source copied upstream's namespace at import, before this patch, so
+    # point its own binding at the dispatcher as well.
+    gdn_source.causal_conv1d_update = gdn_source.conv_update
 
 
 def replacement_forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
@@ -67,5 +70,5 @@ def around_convolve_prefill(
         return original(self, layer, forward_batch, mixed_qkv, conv_states,
                         cache_indices)
     return gdn_source._convolve_prefill(
-        self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
+        original, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
     )
