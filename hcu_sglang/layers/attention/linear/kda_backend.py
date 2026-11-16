@@ -95,6 +95,11 @@ def _run_causal_conv1d_update(
         conv_state_indices=conv_state_indices,
     )
 
+# Captured before register_hooks rebinds the class: the non-HCU path is the
+# upstream implementation, unchanged.
+_ORIG_FORWARD_DECODE = K.KDAAttnBackend.forward_decode
+
+
 class _DispatcherMethods:
     def __init__(
         self,
@@ -410,258 +415,20 @@ class _KdaMethods:
 
     def forward_decode(
         self,
-        layer: RadixLinearAttention,
-        forward_batch: ForwardBatch,
-        mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
-        a: torch.Tensor,
-        b: torch.Tensor,
+        layer,
+        forward_batch,
+        mixed_qkv,
+        a,
+        b,
         **kwargs,
     ):
         if self.use_hcu_kda:
             return self._hcu_forward_decode(
                 layer, forward_batch, mixed_qkv, a, b, **kwargs
             )
-
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states = layer_cache.conv[0]
-        ssm_states = layer_cache.temporal
-        query_start_loc = self.forward_metadata.query_start_loc
-        cache_indices = self.forward_metadata.mamba_cache_indices
-
-        # ReplaySSM is mostly a GDN bandwidth optimization. It remains wired for
-        # KDA correctness paths, but packed decode is faster for KDA today.
-        replayssm_write_pos = getattr(
-            self.forward_metadata, "replayssm_write_pos", None
+        return _ORIG_FORWARD_DECODE(
+            self, layer, forward_batch, mixed_qkv, a, b, **kwargs
         )
-        replayssm_force_flush = getattr(
-            self.forward_metadata, "replayssm_force_flush", None
-        )
-        replayssm_d = layer_cache.replayssm_d
-        replayssm_k = layer_cache.replayssm_k
-        replayssm_g = layer_cache.replayssm_g
-
-        deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
-        if replayssm_d is None and deferred_f_b and is_gfx95_supported():
-            fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
-            fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
-            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
-            if fused_static is not None and onorm_gate is not None:
-                f_b_weight, norm_weight, norm_eps, a_log = fused_static
-                conv_state_view = conv_states.transpose(-1, -2)
-                output_gate = onorm_gate.view(
-                    onorm_gate.shape[0], layer.num_v_heads, layer.head_v_dim
-                )
-                out = mixed_qkv.new_empty(
-                    (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
-                )
-                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
-                    a,
-                    f_b_weight,
-                    mixed_qkv,
-                    b,
-                    conv_state_view,
-                    ssm_states,
-                    cache_indices,
-                    output_gate,
-                    norm_weight,
-                ):
-                    core_attn_out = kda_fused_decode_aiter_hip.run(
-                        f_a=a,
-                        f_b_weight=f_b_weight,
-                        mixed_qkv=mixed_qkv,
-                        conv_weight=layer.conv_weights,
-                        conv_state=conv_state_view,
-                        raw_beta=b,
-                        A_log=a_log,
-                        dt_bias=layer.dt_bias,
-                        lower_bound=float(layer.lower_bound),
-                        state=ssm_states,
-                        state_indices=cache_indices,
-                        output_gate=output_gate,
-                        norm_weight=norm_weight,
-                        norm_eps=norm_eps,
-                        out=out,
-                    )
-                else:
-                    core_attn_out = None
-                    if not getattr(KDAAttnBackend, "_hip_fused_reject_logged", False):
-                        KDAAttnBackend._hip_fused_reject_logged = True
-                        rank0_log(
-                            "K3 HIP fused KDA rejected: "
-                            f"backend={fused_backend}, "
-                            f"f_a={tuple(a.shape)}/{a.dtype}/{a.stride()}, "
-                            f"mixed={tuple(mixed_qkv.shape)}/{mixed_qkv.dtype}/"
-                            f"{mixed_qkv.stride()}, beta={tuple(b.shape)}/{b.dtype}/"
-                            f"{b.stride()}, conv={tuple(conv_state_view.shape)}/"
-                            f"{conv_state_view.dtype}/{conv_state_view.stride()}, "
-                            f"state={tuple(ssm_states.shape)}/{ssm_states.dtype}/"
-                            f"{ssm_states.stride()}, indices={cache_indices.dtype}/"
-                            f"{cache_indices.stride()}, gate={tuple(output_gate.shape)}/"
-                            f"{output_gate.dtype}/{output_gate.stride()}, "
-                            f"norm={norm_weight.dtype}/{norm_weight.stride()}"
-                        )
-
-                if core_attn_out is not None:
-                    layer._k3_onorm_consumed = True
-                    self._track_mamba_state_decode(
-                        forward_batch,
-                        conv_states,
-                        ssm_states,
-                        cache_indices,
-                        layer.layer_id,
-                    )
-                    return core_attn_out
-
-            # The model deferred f_b only after publishing static fallback
-            # weights. Materialize the original gate before entering the
-            # unchanged conv + packed-KDA fallback chain.
-            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
-
-            if fused_static is None:
-                raise RuntimeError("K3 deferred f_b is missing fallback weights")
-            a = kimi_k3_tiny_gemm(
-                a,
-                fused_static[0].view(
-                    layer.num_v_heads * layer.head_v_dim, layer.head_v_dim
-                ),
-            )
-
-        # Fully fused decode step: conv1d update + delta-rule recurrence +
-        # gated RMSNorm in one kernel. Engages only when the model handed off
-        # the output-norm gate for this forward (attempt-and-verify stash,
-        # see kimi_k3.py) and the shapes are covered; the model applies the
-        # norm itself whenever the stash is left unconsumed.
-        if replayssm_d is None:
-            fused_static = getattr(layer, "_k3_fused_decode_args", None)
-            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
-            if (
-                fused_static is not None
-                and onorm_gate is not None
-                and mixed_qkv.shape[0] == cache_indices.shape[0]
-                and b.ndim == 3
-                and kda_fused_decode.covered(
-                    mixed_qkv,
-                    a,
-                    b[0],
-                    conv_states,
-                    ssm_states,
-                    cache_indices,
-                    onorm_gate,
-                )
-            ):
-                if self._fused_override_notice is not None:
-                    rank0_log(self._fused_override_notice)
-                    self._fused_override_notice = None
-                w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
-                core_attn_out = kda_fused_decode.kda_fused_decode(
-                    mixed_qkv,
-                    a,
-                    b[0],
-                    conv_states,
-                    w_q_t,
-                    w_k_t,
-                    w_v_t,
-                    conv_bias,
-                    a_log,
-                    layer.dt_bias,
-                    onorm_gate,
-                    onorm_w,
-                    ssm_states,
-                    cache_indices,
-                    scale=layer.head_k_dim**-0.5,
-                    onorm_eps=onorm_eps,
-                    lower_bound=layer.lower_bound,
-                )
-                layer._k3_onorm_consumed = True
-                self._track_mamba_state_decode(
-                    forward_batch,
-                    conv_states,
-                    ssm_states,
-                    cache_indices,
-                    layer.layer_id,
-                )
-                return core_attn_out
-            elif fused_static is not None and onorm_gate is not None:
-                # One-shot diagnostics: the model offered the handoff but the
-                # runtime shapes were rejected (decode stays on the unfused
-                # chain, which is correct but slower).
-                if not getattr(KDAAttnBackend, "_fused_reject_logged", False):
-                    KDAAttnBackend._fused_reject_logged = True
-                    rank0_log(
-                        "KDA fused decode rejected by covered(): "
-                        f"mixed_qkv {tuple(mixed_qkv.shape)}/{mixed_qkv.dtype} "
-                        f"stride {mixed_qkv.stride()}, "
-                        f"conv_states {tuple(conv_states.shape)} "
-                        f"stride {conv_states.stride()}, "
-                        f"ssm_states {tuple(ssm_states.shape)}/{ssm_states.dtype}, "
-                        f"b {tuple(b.shape)}, indices {cache_indices.dtype}"
-                    )
-
-        qkv = _run_causal_conv1d_update(
-            mixed_qkv,
-            conv_states.transpose(-1, -2),
-            layer.conv_weights,
-            layer.bias,
-            activation="silu",
-            conv_state_indices=cache_indices,
-        )
-
-        # The packed kernel assumes one token per request.
-        if self.kernel_dispatcher.supports_packed_decode and (
-            getattr(layer, "lower_bound", None) is None
-            or self.kernel_dispatcher.supports_packed_decode_safe_gate
-        ):
-            assert qkv.shape[0] == cache_indices.shape[0], (
-                "KDA packed decode requires one token per sequence (T=1): "
-                f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
-            )
-            core_attn_out = self.kernel_dispatcher.packed_decode(
-                mixed_qkv=qkv,
-                a=a,
-                b=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                scale=layer.head_k_dim**-0.5,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                num_v_heads=layer.num_v_heads,
-                head_v_dim=layer.head_v_dim,
-                lower_bound=layer.lower_bound,
-                replayssm_d=replayssm_d,
-                replayssm_k=replayssm_k,
-                replayssm_g=replayssm_g,
-                replayssm_write_pos=replayssm_write_pos,
-                replayssm_force_flush=replayssm_force_flush,
-            )
-            self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
-            )
-            return core_attn_out
-
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
-        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
-        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
-        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
-
-        core_attn_out = self.kernel_dispatcher.decode(
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            lower_bound=layer.lower_bound,
-        )
-
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
-        )
-
-        return core_attn_out
 
     def forward_extend(
         self,
@@ -1650,6 +1417,30 @@ class _BaseMethods:
                 replayssm_force_flush=replayssm_force_flush,
             )
 
+def _scatter_conv_windows(mamba_caches, state_indices, last_correct):
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        _conv_multi_eligible,
+        fused_conv_window_scatter_multi,
+    )
+
+    pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
+    if not pairs:
+        return
+    if _conv_multi_eligible(pairs):
+        fused_conv_window_scatter_multi(
+            pairs, state_indices, last_correct, None, None
+        )
+        return
+    for conv_states, intermediate_conv_window in pairs:
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window,
+            state_indices,
+            last_correct,
+            None,
+        )
+
+
 class _HybridMethods:
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
@@ -1823,71 +1614,30 @@ class _HybridMethods:
             )
             return
 
-        _linear = getattr(self, "linear_attn_backend", None)
-        if _linear is not None:
-            from hcu_sglang.layers.attention.linear import gdn_bplus
+        linear = self.linear_attn_backend
+        from hcu_sglang.layers.attention.linear import gdn_bplus
 
-            gdn_bplus.compensate_from_stash(
-                _linear, state_indices_tensor, last_correct_step_indices
-            )
-            # Handoff: verify/compensate already wrote the committed rows, so
-            # only the pointer moves and the 6 GiB ssm copy is skipped.
-            if gdn_bplus.handoff_enabled() and src_indices_raw is None:
-                # Host int: .item() here would serialize the CPU behind the
-                # verify every decode step. The forward's own record is
-                # capture-time only, so prefer the live width.
-                _st = gdn_bplus.state(_linear)
-                T = int(_st.live_T or _st.capture_T)
-                _cp_ok = T > 1 and gdn_bplus.commit_prev(
-                    _linear,
-                    state_indices_tensor,
-                    last_correct_step_indices,
-                    T,
-                    int(mamba_caches.intermediate_ssm.shape[2]),
-                )
-                if _cp_ok:
-                    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-                        _conv_multi_eligible,
-                        fused_conv_window_scatter_multi,
-                    )
-
-                    pairs = list(
-                        zip(mamba_caches.conv, mamba_caches.intermediate_conv_window)
-                    )
-                    if pairs:
-                        if _conv_multi_eligible(pairs):
-                            fused_conv_window_scatter_multi(
-                                pairs,
-                                state_indices_tensor,
-                                last_correct_step_indices,
-                                None,
-                                None,
-                            )
-                        else:
-                            for conv_states, intermediate_conv_window in pairs:
-                                fused_conv_window_scatter_with_mask(
-                                    conv_states,
-                                    intermediate_conv_window,
-                                    state_indices_tensor,
-                                    last_correct_step_indices,
-                                    None,
-                                )
-                    self._update_ple_state_after_mtp_verify(
-                        state_indices_tensor,
-                        last_correct_step_indices,
-                        mamba_track_indices,
-                        mamba_steps_to_track,
-                        src_indices_raw,
-                    )
-                    return
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
+        gdn_bplus.compensate_from_stash(
+            linear, state_indices_tensor, last_correct_step_indices
         )
+        if self._handoff_moved_the_pointer(
+            linear, mamba_caches, state_indices_tensor, last_correct_step_indices,
+            src_indices_raw,
+        ):
+            # Verify already wrote the committed rows, so the 6 GiB ssm copy is
+            # skipped and only the conv windows still need the accept rollback.
+            _scatter_conv_windows(
+                mamba_caches, state_indices_tensor, last_correct_step_indices
+            )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
@@ -1895,6 +1645,30 @@ class _HybridMethods:
             mamba_track_indices,
             mamba_steps_to_track,
             src_indices_raw,
+        )
+
+    def _handoff_moved_the_pointer(
+        self, linear, mamba_caches, state_indices, last_correct, src_indices_raw
+    ) -> bool:
+        """B+ handoff: the commit only moves the row pointer, not the state."""
+        from hcu_sglang.layers.attention.linear import gdn_bplus
+
+        # Pipeline-parallel rows are request-pool indices; the pointer
+        # arithmetic below assumes the forward's own row layout.
+        if not gdn_bplus.handoff_enabled() or src_indices_raw is not None:
+            return False
+        # Host int on purpose: .item() would serialize the CPU behind the
+        # verify every decode step; the captured width is the fallback.
+        state = gdn_bplus.state(linear)
+        steps = int(state.live_T or state.capture_T)
+        if steps <= 1:
+            return False
+        return gdn_bplus.commit_prev(
+            linear,
+            state_indices,
+            last_correct,
+            steps,
+            int(mamba_caches.intermediate_ssm.shape[2]),
         )
 
 class _MetadataMethods:
@@ -2078,13 +1852,16 @@ def register_hooks():
     K._hcu_causal_conv1d_update = _hcu_causal_conv1d_update
     K._run_causal_conv1d_fn = _run_causal_conv1d_fn
     K._run_causal_conv1d_update = _run_causal_conv1d_update
+    # The upstream module resolves this global at call time and expects the
+    # platform to override it; our wrapper falls back to the original.
+    K.causal_conv1d_update = _run_causal_conv1d_update
     for name, decorators in [('__init__', [])]:
         setattr(K.KDAKernelDispatcher, name, _bind(vars(_DispatcherMethods)[name], K, K.KDAKernelDispatcher, name, decorators))
     for name, decorators in [('__init__', []), ('init_forward_metadata', []), ('forward_decode', []), ('forward_extend', []), ('_hcu_forward_decode', []), ('_hcu_forward_extend', [])]:
         setattr(K.KDAAttnBackend, name, _bind(vars(_KdaMethods)[name], K, K.KDAAttnBackend, name, decorators))
     for name, decorators in [('__init__', []), ('_forward_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('_replay_metadata', [])]:
         setattr(H.MambaAttnBackendBase, name, _bind(vars(_BaseMethods)[name], H, H.MambaAttnBackendBase, name, decorators))
-    for name, decorators in [('get_indexer_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('forward', []), ('update_mamba_state_after_mtp_verify', [])]:
+    for name, decorators in [('get_indexer_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('forward', []), ('update_mamba_state_after_mtp_verify', []), ('_handoff_moved_the_pointer', [])]:
         setattr(H.HybridLinearAttnBackend, name, _bind(vars(_HybridMethods)[name], H, H.HybridLinearAttnBackend, name, decorators))
     for name, decorators in [('prepare_mixed', ['classmethod'])]:
         setattr(MD.Mamba2Metadata, name, _bind(vars(_MetadataMethods)[name], MD, MD.Mamba2Metadata, name, decorators))
