@@ -206,6 +206,6 @@ def register() -> None:
     speculative_dspark.register_hooks()
     from hcu_sglang.layers.gemm import hooks as gemm_hooks
     gemm_hooks.register()
-    from hcu_sglang.models import qwen3_5_mtp_fp8
-    qwen3_5_mtp_fp8.register()
+    from hcu_sglang.models import qwen3_5_mtp_lmhead_quant
+    qwen3_5_mtp_lmhead_quant.register()
     logger.info("[hcu_sglang] optimization hooks registered")

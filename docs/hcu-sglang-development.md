@@ -2882,7 +2882,7 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `refactor(imports)`：`speculative_compat.py`、`server_args_hooks.py` 的函数内 import 全部提到模块级；
   `_declare_values` / `_resolving_view` 里探测 `ServerArgs._declare` / `_resolved` 的分支删除——
   钉死的 0.5.22 两个方法都不存在，分支恒为假。
-- `refactor(mtp)`：`models/qwen3_5_mtp_fp8.py` 的 fp8 草稿头安装拆成
+- `refactor(mtp)`：`models/qwen3_5_mtp_lmhead_quant.py` 的 fp8 草稿头安装拆成
   gate / quantize / prepare / install 四段；hook 前缀字符串移入 `constants.QWEN3_5_MTP_HOOK_BASE`。
 - `refactor(gemm)`：`layers/gemm/hooks.py`（原 `layers/hbird_hooks.py`）、`layers/gemm/registry.py` 按
   enablement / provider 缓存 / 权重转换 / workspace 预热分段。**对 hbird 的 import 仍保持惰性**：
@@ -2921,7 +2921,7 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
   具体后端按部署决定，因此归属 gemm 包，模块名不再绑定某个厂商。
 - `patches/flash_attn_layout.py` → `compat/flash_attn.py`：`compat/` 本来就是给
   "已装 wheel 缺能力" 收口的目录（`compat/aiter.py` 同例），不另开 `patches/`。
-- `models/qwen3_5_mtp_fp8.py` 拆成三层：`models/mtp_lmhead_quant.py` 只负责量化
+- `models/qwen3_5_mtp_lmhead_quant.py` 拆成三层：`models/mtp_lmhead_quant.py` 只负责量化
   （scheme 表：dtype / 分块 / 逐行 scale，当前 `fp8_e4m3`，由 `SGLANG_MTP_LMHEAD_QUANT` 选择）、
   `layers/gemm/quant_lm_head.py` 只负责为量化后的权重准备 GEMM 后端、
   原文件只保留"何时装、怎么重装"的模型侧逻辑。
