@@ -15,7 +15,7 @@ import torch
 # the per-layer `gdn_bw_ship.so` is kernel-only lineage and has no multi entry,
 # so it is never the default here.
 _DEFAULT_SO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "lib", "gdn_bplus_multi.so"
+    os.path.dirname(os.path.abspath(__file__)), "lib", "gdn_recurrent_hip.so"
 )
 _BV = 32  # 与 gdn_recurrent.hip 的 BV 一致
 # softplus(beta * x + threshold) literals the recurrent kernel expects; they
