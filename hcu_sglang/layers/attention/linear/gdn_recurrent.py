@@ -395,6 +395,8 @@ def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
 # ---------------------------------------------------------------------------
 
 _CONV_MAX_T = 16
+# Conv kernel width the HIP entry implements (state_len >= width - 1).
+_CONV_WIDTH = 4
 
 
 def conv_last_reason():
@@ -409,6 +411,82 @@ def conv_enabled() -> bool:
     return getattr(lib(), "gdn_causal_conv1d_update", None) is not None
 
 
+def _conv_seqlen(x) -> int:
+    """2D x is (batch, dim); the wrapper unsqueezes it to (batch, dim, 1)."""
+    return int(x.size(-1)) if x.dim() == 3 else 1
+
+
+def _conv_shape_problem(x, weight, conv_state, seqlen) -> str | None:
+    if x.dim() not in (2, 3):
+        return f"x.dim={x.dim()}"
+    if weight.dim() != 2 or int(weight.size(1)) != _CONV_WIDTH:
+        return f"weight={tuple(weight.shape)}"
+    if conv_state.dim() != 3:
+        return f"conv_state.dim={conv_state.dim()}"
+    if not 1 <= seqlen <= _CONV_MAX_T:
+        return f"seqlen={seqlen}"
+    dim = int(x.size(1))
+    if dim != int(weight.size(0)) or dim != int(conv_state.size(1)):
+        return f"dim mismatch x={dim} w={weight.size(0)} state={conv_state.size(1)}"
+    if int(conv_state.size(2)) < _CONV_WIDTH - 1:
+        return f"state_len={conv_state.size(2)}"
+    return None
+
+
+def _conv_dtype_problem(x, weight, conv_state, bias) -> str | None:
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        return f"dtype x={x.dtype} w={weight.dtype}"
+    if conv_state.dtype != torch.bfloat16:
+        return f"conv_state.dtype={conv_state.dtype}"
+    if bias is not None and (bias.dtype != torch.bfloat16 or not bias.is_contiguous()):
+        return f"bias={bias.dtype}/contig={bias.is_contiguous()}"
+    return None
+
+
+def _conv_state_problem(cache_seqlens, num_accept_tokens, conv_state_indices) -> str | None:
+    if cache_seqlens is not None or num_accept_tokens is not None:
+        return "circular / multi-accept conv_state is not implemented"
+    if conv_state_indices is not None and (
+        conv_state_indices.dtype != torch.int32 or conv_state_indices.dim() != 1
+    ):
+        return f"conv_state_indices={conv_state_indices.dtype}"
+    return None
+
+
+def _conv_window_problem(window, window_indices, seqlen, dim) -> str | None:
+    if window is None:
+        return None
+    if window.dtype != torch.bfloat16 or window.dim() != 4:
+        return f"window={window.dtype}/{window.dim()}d"
+    # A warmup call can carry more window steps than tokens; only the first
+    # `seqlen` rows are touched.
+    if int(window.size(1)) < seqlen or (int(window.size(2)), int(window.size(3))) != (
+        dim,
+        _CONV_WIDTH,
+    ):
+        return f"window shape={tuple(window.shape)}"
+    if window_indices is None or window_indices.dtype != torch.int32:
+        return "window needs int32 intermediate_state_indices"
+    return None
+
+
+def _conv_tree_problem(next_token, next_sibling, parent_token, seqlen) -> str | None:
+    if next_token is None:
+        if next_sibling is not None or parent_token is not None:
+            return "sibling/parent passed without retrieve_next_token"
+        return None
+    if next_sibling is None or parent_token is None:
+        return "tree arrays incomplete"
+    if next_token.dtype not in (torch.int32, torch.int64):
+        return f"tree index dtype={next_token.dtype}"
+    for other in (next_sibling, parent_token):
+        if other.dtype != next_token.dtype or tuple(other.shape) != tuple(next_token.shape):
+            return "tree arrays must share dtype and shape"
+    if int(next_token.size(1)) < seqlen:
+        return f"tree width={next_token.size(1)} < seqlen={seqlen}"
+    return None
+
+
 def conv_unsupported_reason(x, conv_state, weight, bias, activation,
                             cache_seqlens, conv_state_indices,
                             num_accept_tokens, intermediate_conv_window,
@@ -416,67 +494,20 @@ def conv_unsupported_reason(x, conv_state, weight, bias, activation,
                             retrieve_next_sibling, retrieve_parent_token,
                             pad_slot_id):
     """Short reason this call must stay on Triton; None when HIP can run it."""
-    if x.dim() not in (2, 3):
-        return f"x.dim={x.dim()}"
-    if weight.dim() != 2 or int(weight.size(1)) != 4:
-        return f"weight={tuple(weight.shape)}"
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        return f"dtype x={x.dtype} w={weight.dtype}"
-    if conv_state.dtype != torch.bfloat16:
-        return f"conv_state.dtype={conv_state.dtype}"
-    if bias is not None and (bias.dtype != torch.bfloat16 or not bias.is_contiguous()):
-        return f"bias={bias.dtype}/contig={bias.is_contiguous()}"
-    if cache_seqlens is not None or num_accept_tokens is not None:
-        return "circular / multi-accept conv_state is not implemented"
-    if conv_state.dim() != 3:
-        return f"conv_state.dim={conv_state.dim()}"
-    # 2D x is (batch, dim); the wrapper unsqueezes it to (batch, dim, 1).
-    seqlen = int(x.size(-1)) if x.dim() == 3 else 1
-    if seqlen < 1 or seqlen > _CONV_MAX_T:
-        return f"seqlen={seqlen}"
-    dim = int(x.size(1))
-    if dim != int(weight.size(0)) or dim != int(conv_state.size(1)):
-        return (f"dim mismatch x={dim} w={weight.size(0)} "
-                f"state={conv_state.size(1)}")
-    if int(conv_state.size(2)) < 3:
-        return f"state_len={conv_state.size(2)}"
-    if conv_state_indices is not None and (
-        conv_state_indices.dtype != torch.int32 or conv_state_indices.dim() != 1
-    ):
-        return f"conv_state_indices={conv_state_indices.dtype}"
-    if intermediate_conv_window is not None:
-        win = intermediate_conv_window
-        if win.dtype != torch.bfloat16 or win.dim() != 4:
-            return f"window={win.dtype}/{win.dim()}d"
-        # A dummy/warmup call can carry more window steps than tokens; only
-        # the first `seqlen` rows are touched.
-        if int(win.size(1)) < seqlen or (int(win.size(2)), int(win.size(3))) != (
-            dim,
-            3,
-        ):
-            return f"window shape={tuple(win.shape)}"
-        if intermediate_state_indices is None or (
-            intermediate_state_indices.dtype != torch.int32
-        ):
-            return "window needs int32 intermediate_state_indices"
-    if retrieve_next_token is None:
-        if retrieve_next_sibling is not None or retrieve_parent_token is not None:
-            return "sibling/parent passed without retrieve_next_token"
-    else:
-        if retrieve_next_sibling is None or retrieve_parent_token is None:
-            return "tree arrays incomplete"
-        if retrieve_next_token.dtype not in (torch.int32, torch.int64):
-            return f"tree index dtype={retrieve_next_token.dtype}"
-        for other in (retrieve_next_sibling, retrieve_parent_token):
-            if other.dtype != retrieve_next_token.dtype or tuple(
-                other.shape
-            ) != tuple(retrieve_next_token.shape):
-                return "tree arrays must share dtype and shape"
-        if int(retrieve_next_token.size(1)) < seqlen:
-            return f"tree width={retrieve_next_token.size(1)} < seqlen={seqlen}"
-    if pad_slot_id is not None and not isinstance(pad_slot_id, int):
-        return f"pad_slot_id={pad_slot_id!r}"
-    return None
+    seqlen = _conv_seqlen(x)
+    dim = int(x.size(1)) if x.dim() in (2, 3) else 0
+    problems = (
+        _conv_shape_problem(x, weight, conv_state, seqlen),
+        _conv_dtype_problem(x, weight, conv_state, bias),
+        _conv_state_problem(cache_seqlens, num_accept_tokens, conv_state_indices),
+        _conv_window_problem(intermediate_conv_window, intermediate_state_indices,
+                             seqlen, dim),
+        _conv_tree_problem(retrieve_next_token, retrieve_next_sibling,
+                           retrieve_parent_token, seqlen),
+        None if pad_slot_id is None or isinstance(pad_slot_id, int)
+        else f"pad_slot_id={pad_slot_id!r}",
+    )
+    return next((reason for reason in problems if reason), None)
 
 
 def conv_update(x, conv_state, weight, bias=None, activation=None,

@@ -19,6 +19,10 @@ from hcu_sglang.constants import SEED_SCRATCH_MIN_ROWS, SLOT_BUFFER_SLACK
 from hcu_sglang.layers.attention.linear import gdn_recurrent
 
 
+# The compensate kernel writes one output row per layer launch.
+_LAYER_OUT_LEADING = (1, 1)
+
+
 class HeadDims(NamedTuple):
     """Per-layer head layout, as the recurrent kernel indexes it."""
 
@@ -430,7 +434,9 @@ def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
             "a": torch.zeros((rows, a.shape[-1]), dtype=a.dtype, device=dev),
             "b": torch.zeros((rows, b.shape[-1]), dtype=b.dtype, device=dev),
             "out": torch.zeros(
-                (1, 1, v.shape[2], v.shape[3]), dtype=v.dtype, device=dev
+                (*_LAYER_OUT_LEADING, *HeadDims.of(q, k, v).v),
+                dtype=v.dtype,
+                device=dev,
             ),
             "A_log": None,
             "dt_bias": None,
@@ -457,9 +463,12 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         if ent is None or n > max_slots:
             return False
         m = n * D
+        qkv_width = int(ent["qkv"].shape[-1])
+        a_width = int(ent["a"].shape[-1])
+        b_width = int(ent["b"].shape[-1])
         src = _fused_qkv_view(q, k, v, n, T)
         if src is not None:
-            ent["qkv"][:m].view(n, D, -1)[:, :T].copy_(src)
+            ent["qkv"][:m].view(n, D, qkv_width)[:, :T].copy_(src)
         else:
             qd, kd, vd = _head_dims(q, k, v)
             W = qd + kd + vd
@@ -467,8 +476,8 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
             dest[:, :T, :qd].copy_(q.reshape(n, T, -1))
             dest[:, :T, qd:qd + kd].copy_(k.reshape(n, T, -1))
             dest[:, :T, qd + kd:W].copy_(v.reshape(n, T, -1))
-        ent["a"][:m].view(n, D, -1)[:, :T].copy_(a.reshape(n, T, -1))
-        ent["b"][:m].view(n, D, -1)[:, :T].copy_(b.reshape(n, T, -1))
+        ent["a"][:m].view(n, D, a_width)[:, :T].copy_(a.reshape(n, T, a_width))
+        ent["b"][:m].view(n, D, b_width)[:, :T].copy_(b.reshape(n, T, b_width))
         return True
     except Exception:  # noqa: BLE001 - never take serving down
         logger.warning("[gdn-bplus] stash failed", exc_info=True)
@@ -569,7 +578,8 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     h0_idx = h0_plain
                 rows.append((ent, ssm, flat, h0_idx, stride, lid))
             except Exception:  # noqa: BLE001 - optional path
-                logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
+                logger.warning("[gdn-bplus] compensate failed for layer %s",
+                               lid, exc_info=True)
                 st.commit_failed = True
                 continue
         if not rows:
@@ -582,12 +592,15 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 logger.warning("[gdn-bplus] multi compensate failed", exc_info=True)
         for ent, ssm, flat, h0_idx, cache_steps, lid in rows:
             try:
+                dims = HeadDims.from_entry(ent)
+                a_dim = int(ent["a"].shape[-1])
+                b_dim = int(ent["b"].shape[-1])
                 gdn_recurrent.compensate(
-                    ent["q"][:m].view(n, D, *HeadDims.from_entry(ent).q),
-                    ent["k"][:m].view(n, D, *HeadDims.from_entry(ent).k),
-                    ent["v"][:m].view(n, D, *HeadDims.from_entry(ent).v),
-                    ent["a"][:m].view(n, D, -1),
-                    ent["b"][:m].view(n, D, -1),
+                    ent["q"][:m].view(n, D, *dims.q),
+                    ent["k"][:m].view(n, D, *dims.k),
+                    ent["v"][:m].view(n, D, *dims.v),
+                    ent["a"][:m].view(n, D, a_dim),
+                    ent["b"][:m].view(n, D, b_dim),
                     ent["A_log"],
                     ent["dt_bias"],
                     ssm,
@@ -601,7 +614,8 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                     ent["out"],
                 )
             except Exception:  # noqa: BLE001 - optional path
-                logger.warning("[gdn-bplus] compensate failed for layer %s", lid)
+                logger.warning("[gdn-bplus] compensate failed for layer %s",
+                               lid, exc_info=True)
                 st.commit_failed = True
                 continue
         return True
@@ -627,8 +641,8 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
         int(qv.stride(1)),
         int(ent0["k"][:m].view(n, D, kh, kk).stride(1)),
         int(ent0["v"][:m].view(n, D, vh, vv).stride(1)),
-        int(ent0["a"][:m].view(n, D, -1).stride(1)),
-        int(ent0["b"][:m].view(n, D, -1).stride(1)),
+        int(ent0["a"][:m].view(n, D, int(ent0["a"].shape[-1])).stride(1)),
+        int(ent0["b"][:m].view(n, D, int(ent0["b"].shape[-1])).stride(1)),
     )
     # The table holds raw data_ptrs, so this key is only valid because mamba
     # pools are allocated once, before graph capture; a replaced layer entry

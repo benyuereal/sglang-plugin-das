@@ -17,6 +17,7 @@ see flash-attention-das ``fix/varlen-layout`` for the pattern.
 
 from __future__ import annotations
 import sglang.srt.layers.attention.linear.gdn_backend as upstream
+from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
 from hcu_sglang.utils.detection import is_hcu
 from sglang.srt.utils import get_bool_env_var
 
@@ -218,7 +219,7 @@ def forward_decode(
         assert isinstance(mixed_qkv, torch.Tensor)
 
     if not conv_already_applied:
-        mixed_qkv = causal_conv1d_update(
+        mixed_qkv = conv_update(
             mixed_qkv,
             conv_states,
             layer.conv_weights,
@@ -319,25 +320,11 @@ _HIP_LOG = {"done": False}
 
 
 def _gdn_hip_kernel_enabled() -> bool:
-    if not _is_hcu:
-        return False
-    try:
-        from hcu_sglang.layers.attention.linear import gdn_recurrent
-
-        return gdn_recurrent.enabled_kernel()
-    except Exception:
-        return False
+    return _is_hcu and gdn_recurrent.enabled_kernel()
 
 
 def _gdn_recurrent_enabled() -> bool:
-    if not _is_hcu:
-        return False
-    try:
-        from hcu_sglang.layers.attention.linear import gdn_commit
-
-        return gdn_commit.enabled()
-    except Exception:
-        return False
+    return _is_hcu and gdn_commit.enabled()
 
 
 _CONV_HIP_LOG = {"done": False}

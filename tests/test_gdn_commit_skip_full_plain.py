@@ -46,7 +46,9 @@ def _stash_entry():
     qkv = torch.zeros(N * T)
     return {
         "layer_cache": layer_cache,
-        "q": qkv, "k": qkv, "v": qkv, "a": qkv, "b": qkv,
+        "q": qkv, "k": qkv, "v": qkv,
+        # a/b are per-token 2-D (rows, gate_dim), like the real stash entries.
+        "a": torch.zeros(N * T, 2), "b": torch.zeros(N * T, 2),
         "A_log": torch.zeros(1), "dt_bias": torch.zeros(1), "out": torch.zeros(1),
         "dims": gdn_commit.HeadDims(qh=1, qk=1, kh=1, kk=1, vh=1, vv=1),
     }
