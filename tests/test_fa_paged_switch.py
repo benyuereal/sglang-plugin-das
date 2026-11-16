@@ -13,6 +13,34 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 INTERFACE = ROOT / "hcu_sglang/layers/attention/flashattention_interface.py"
+PATCH = ROOT / "hcu_sglang/patches/flash_attn_layout.py"
+
+
+def _load_layout_patch():
+    """Load the layout patch module without importing the hcu_sglang package."""
+    stubs = {}
+    for name in ("hcu_sglang", "hcu_sglang.patches"):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        stubs[name] = module
+    constants = types.ModuleType("hcu_sglang.constants")
+    constants.PAGED_DECODE_PAGE_SIZE = 64
+    constants.PAGED_VERIFY_MAX_Q = 16
+    constants.PAGED_VERIFY_Q_ROWS_PER_KV_HEAD = 64
+    stubs["hcu_sglang.constants"] = constants
+    saved = {name: sys.modules.get(name) for name in stubs}
+    sys.modules.update(stubs)
+    try:
+        spec = importlib.util.spec_from_file_location("fa_layout_patch_under_test", PATCH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    return module
 
 
 def _env_defaults(path: Path):
@@ -65,7 +93,7 @@ def _load_interface():
 class DirectPagedEligibilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.fi = _load_interface()
+        cls.fi = _load_layout_patch()
 
     def setUp(self):
         self._enabled = self.fi._paged_bshd_enabled
@@ -85,17 +113,25 @@ class DirectPagedEligibilityTests(unittest.TestCase):
     def eligible(self, q_rows, mq, **overrides):
         kwargs = dict(
             q=torch.zeros(q_rows, 24, 256),
-            k_cache=self.k,
-            v_cache=self.v,
+            k=self.k,
+            v=self.v,
             cu_seqlens_q=torch.arange(0, q_rows + 1, mq, dtype=torch.int32),
             max_seqlen_q=mq,
-            page_table=self.pt,
-            cache_seqlens=self.lens,
+            block_table=self.pt,
+            seqused_k=self.lens,
             window_size=(-1, -1),
             softcap=0.0,
         )
+        for old, new in (
+            ("k_cache", "k"),
+            ("v_cache", "v"),
+            ("page_table", "block_table"),
+            ("cache_seqlens", "seqused_k"),
+        ):
+            if old in overrides:
+                overrides[new] = overrides.pop(old)
         kwargs.update(overrides)
-        return self.fi._direct_paged_eligible(**kwargs)
+        return self.fi._choose_layout(**kwargs) == "bshd"
 
     def test_switch_is_off_by_default(self):
         defaults = _env_defaults(ROOT / "hcu_sglang/environ.py")

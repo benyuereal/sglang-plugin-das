@@ -45,6 +45,7 @@ def _direct_paged_layout(
     block_table,
     window_size,
     softcap,
+    seqused_k=None,
 ) -> str:
     """The wheel's direct paged kernel covers decode and MTP-packed verify."""
     if not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
@@ -56,6 +57,8 @@ def _direct_paged_layout(
     if q.ndim != 3 or k.ndim != 4 or v.ndim != 4:
         return _CUSTOM
     if block_table is None or cu_seqlens_q is None:
+        return _CUSTOM
+    if not torch.is_tensor(seqused_k):
         return _CUSTOM
     page_size = k.shape[1]
     nheads_q, head_dim_qk = q.shape[-2], q.shape[-1]
@@ -82,11 +85,30 @@ def _direct_paged_layout(
     return _CUSTOM
 
 
-def _choose_layout(q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap) -> str:
+def _layout_enabled() -> bool:
+    from sglang.srt.utils import get_bool_env_var
+
+    return get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="false")
+
+
+def _paged_bshd_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_HCU_FA_PAGED_BSHD.get()
+
+
+def _choose_layout(
+    q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap, seqused_k=None
+) -> str:
+    if _layout_enabled():
+        return _CUSTOM
     if _is_hnd_page_view(k) and _is_hnd_page_view(v):
         return "bhsd"
+    if not _paged_bshd_enabled():
+        return _CUSTOM
     return _direct_paged_layout(
-        q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap
+        q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap,
+        seqused_k=seqused_k,
     )
 
 
@@ -161,7 +183,8 @@ def vllm_flash_attn_varlen_func(
     if fa_version is not None:
         kwargs["fa_version"] = fa_version
     kwargs["layout"] = _choose_layout(
-        q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap
+        q, k, v, max_seqlen_q, cu_seqlens_q, block_table, window_size, softcap,
+        seqused_k=seqused_k,
     )
     return _varlen(q, k, v, **kwargs)
 
