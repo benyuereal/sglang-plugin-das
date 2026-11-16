@@ -12,10 +12,12 @@ import os
 import torch
 
 # The B+ entries (single-layer and the one-launch multi) live in this build;
-# the per-layer `gdn_bw_ship.so` is kernel-only lineage and has no multi entry,
-# so it is never the default here.
-_DEFAULT_SO = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "lib", "gdn_recurrent_hip.so"
+# GDN_HIP_SO overrides it when a deployment ships the object elsewhere.
+_DEFAULT_SO = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "..", "csrc", "gdn", "build", "gdn_recurrent.so",
+    )
 )
 _BV = 32  # 与 gdn_recurrent.hip 的 BV 一致
 # softplus(beta * x + threshold) literals the recurrent kernel expects; they
