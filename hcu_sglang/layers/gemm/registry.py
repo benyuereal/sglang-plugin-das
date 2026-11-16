@@ -2,6 +2,7 @@
 
 import logging
 import os
+from dataclasses import dataclass, field
 
 import torch
 
@@ -15,6 +16,13 @@ _LOG = logging.getLogger(__name__)
 _EMBEDDINGS = {"VocabParallelEmbedding"}
 #: The head keeps its source weight; ``_compute_lm_head`` reads it for dispatch.
 _LM_HEADS = {"ParallelLMHead"}
+
+#: A successful load is cached: the .so probe behind it is memoised, so its
+#: answer cannot change within the process.
+_backend = None
+
+
+# --- enablement -------------------------------------------------------------
 
 
 def enabled() -> bool:
@@ -43,7 +51,40 @@ def selected(runner) -> bool:
 
 
 def provider():
-    return hbird.load() if enabled() else None
+    """The loaded backend, or None; a failed load is retried on the next call."""
+    global _backend
+    if not enabled():
+        return None
+    if _backend is None:
+        _backend = hbird.load()
+    return _backend
+
+
+# --- conversion -------------------------------------------------------------
+
+
+@dataclass
+class _Stats:
+    """Sinks for one conversion pass; ``as_result`` is the caller-facing view."""
+
+    limit: int
+    converted: int = 0
+    kept: int = 0
+    freed: int = 0
+    skipped: list = field(default_factory=list)
+    shapes: dict = field(default_factory=dict)
+    prepared: int = 0
+    refused: int = 0
+
+    def as_result(self) -> dict:
+        return {
+            "converted": self.converted,
+            "freed": self.freed,
+            "kept": self.kept,
+            "skipped": self.skipped,
+            "shapes": sorted(self.shapes),
+            "prepared": self.prepared,
+        }
 
 
 def convert_model(model, runner=None):
@@ -51,102 +92,142 @@ def convert_model(model, runner=None):
     backend = provider()
     if backend is None:
         return None
+    modules = _walk(model)
+    if modules is None:
+        return None
+    if not selected(runner):
+        _exclude(modules, runner)
+        return None
+
+    stats = _Stats(limit=backend.max_m())
+    for name, module in modules:
+        _convert_one(backend, model, name, module, stats)
+    _warm_workspaces(backend, stats.shapes, stats)
+    _log_summary(stats)
+    return stats.as_result()
+
+
+def _walk(model):
     try:
-        modules = list(model.named_modules())
+        return list(model.named_modules())
     except Exception as exc:  # noqa: BLE001 - optional path
         _LOG.warning("[hbird_bf16] cannot walk model: %s", exc)
         return None
 
-    if not selected(runner):
-        for _, module in modules:
-            try:
-                module._hbird_off = True
-            except Exception:  # noqa: BLE001 - a slotted module: nothing to mark
-                pass
-        _LOG.info(
-            "[hbird_bf16] %s excluded by HBIRD_GEMM_ROLE=%s; kept on SGLang",
-            "draft worker" if runner is not None and runner.is_draft_worker
-            else "target",
-            role(),
-        )
-        return None
 
-    converted, kept, skipped, freed = 0, 0, [], 0
-    shapes = {}
-    limit = backend.max_m()
-    for name, module in modules:
-        weight = getattr(module, "weight", None)
-        if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
-            continue
-        if not weight.is_cuda or weight.dtype != torch.bfloat16:
-            continue
-        if getattr(module, "bias", None) is not None:
-            continue
-        kind = type(module).__name__
-        if kind in _EMBEDDINGS:
-            continue
-        if kind in _LM_HEADS or module is getattr(model, "lm_head", None):
-            try:
-                backend.prepare_lm_head(weight)
-                # Key by the weight's own shape so a padded pad_n cannot leak in.
-                shapes[(int(weight.shape[0]), int(weight.shape[1]))] = weight.device
-                kept += 1
-            except Exception as exc:  # noqa: BLE001
-                skipped.append((name, f"{type(exc).__name__}: {exc}"))
-            continue
-        if not backend.owns(module):
-            continue
+def _exclude(modules, runner):
+    """Mark every module off; hbird-gemm's shim reads this flag on dispatch."""
+    for _, module in modules:
         try:
-            ok, why = backend.can_pack(weight)
-            if not ok:
-                skipped.append((name, why))
-                continue
-            freed += int(weight.numel()) * int(weight.element_size())
-            handle = backend.pack(weight)
-            backend.release(module, handle)
-            shapes[(int(handle.N), int(handle.K))] = weight.device
-            converted += 1
-        except Exception as exc:  # noqa: BLE001
-            skipped.append((name, f"{type(exc).__name__}: {exc}"))
+            module._hbird_off = True
+        except Exception:  # noqa: BLE001 - a slotted module: nothing to mark
+            pass
+    _LOG.info(
+        "[hbird_bf16] %s excluded by HBIRD_GEMM_ROLE=%s; kept on SGLang",
+        "draft worker" if runner is not None and runner.is_draft_worker
+        else "target",
+        role(),
+    )
 
+
+def _convert_one(backend, model, name, module, stats):
+    weight = _eligible_weight(module)
+    if weight is None:
+        return
+    if type(module).__name__ in _LM_HEADS or module is getattr(model, "lm_head", None):
+        _keep_lm_head(backend, name, weight, stats)
+    elif backend.owns(module):
+        _pack_linear(backend, name, module, weight, stats)
+
+
+def _eligible_weight(module):
+    weight = getattr(module, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        return None
+    if not weight.is_cuda or weight.dtype != torch.bfloat16:
+        return None
+    if getattr(module, "bias", None) is not None:
+        return None
+    if type(module).__name__ in _EMBEDDINGS:
+        return None
+    return weight
+
+
+def _keep_lm_head(backend, name, weight, stats):
+    try:
+        backend.prepare_lm_head(weight)
+        # Key by the weight's own shape so a padded pad_n cannot leak in.
+        stats.shapes[(int(weight.shape[0]), int(weight.shape[1]))] = weight.device
+        stats.kept += 1
+    except Exception as exc:  # noqa: BLE001
+        stats.skipped.append((name, f"{type(exc).__name__}: {exc}"))
+
+
+def _pack_linear(backend, name, module, weight, stats):
+    try:
+        ok, why = backend.can_pack(weight)
+        if not ok:
+            stats.skipped.append((name, why))
+            return
+        stats.freed += int(weight.numel()) * int(weight.element_size())
+        handle = backend.pack(weight)
+        backend.release(module, handle)
+        stats.shapes[(int(handle.N), int(handle.K))] = weight.device
+        stats.converted += 1
+    except Exception as exc:  # noqa: BLE001
+        stats.skipped.append((name, f"{type(exc).__name__}: {exc}"))
+
+
+def _warm_workspaces(backend, shapes, stats):
+    """Allocate every (M, N, K) a captured graph may issue, plus the prefill one."""
     # A captured graph may not allocate, so every reachable (M, N, K) must exist
     # now; M past DECODE_MAX_M binds to the shared prefill buffer.
-    prepared, failed = 0, 0
     try:
         for (n, k), device in shapes.items():
             for m in range(1, DECODE_MAX_M + 1):
                 try:
                     backend.prepare(m, n, k, device)
-                    prepared += 1
+                    stats.prepared += 1
                 except Exception:  # noqa: BLE001 - shape refused at this M
-                    failed += 1
+                    stats.refused += 1
         backend.prepare_prefill(next(iter(shapes.values())) if shapes else None)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
     except Exception as exc:  # noqa: BLE001
         _LOG.warning("[hbird_bf16] workspace warm-up failed: %s", exc)
 
+
+def _log_summary(stats):
     _LOG.info(
         "[hbird_bf16] packed %d linear(s), freed %.2f GiB, lm_head kept %d, "
         "skipped %d, %d (M,N,K) ws prepared (%d refused), cap M <= %d",
-        converted, freed / BYTES_PER_GIB, kept, len(skipped), prepared, failed, limit,
+        stats.converted, stats.freed / BYTES_PER_GIB, stats.kept,
+        len(stats.skipped), stats.prepared, stats.refused, stats.limit,
     )
-    if skipped:
-        _LOG.info("[hbird_bf16] skipped: %s", skipped[:SKIPPED_LOG_LIMIT])
-    return {
-        "converted": converted,
-        "freed": freed,
-        "kept": kept,
-        "skipped": skipped,
-        "shapes": sorted(shapes),
-        "prepared": prepared,
-    }
+    if stats.skipped:
+        _LOG.info("[hbird_bf16] skipped: %s", stats.skipped[:SKIPPED_LOG_LIMIT])
+
+
+# --- lm_head fast path ------------------------------------------------------
 
 
 def lm_head_linear(hidden_states, lm_head, embedding_bias, use_fp32_lm_head):
     """Return the provider's lm_head GEMM, or None to keep the original path."""
     backend = provider()
-    if backend is None or use_fp32_lm_head or embedding_bias is not None:
+    if backend is None:
+        return None
+    weight = _lm_head_weight(hidden_states, lm_head, embedding_bias, use_fp32_lm_head)
+    if weight is None:
+        return None
+    try:
+        return backend.linear(hidden_states, weight, backend.packed_handle(lm_head))
+    except Exception:  # noqa: BLE001 - the fallback is always correct
+        return None
+
+
+def _lm_head_weight(hidden_states, lm_head, embedding_bias, use_fp32_lm_head):
+    """The bf16 weight to hand the backend, or None to keep the caller's GEMM."""
+    if use_fp32_lm_head or embedding_bias is not None:
         return None
     method = getattr(lm_head, "quant_method", None)
     if method is not None and type(method).__module__.startswith("hcu_sglang."):
@@ -164,7 +245,4 @@ def lm_head_linear(hidden_states, lm_head, embedding_bias, use_fp32_lm_head):
     # M = 144/160 to hipBLASLt, 1.85x slower (measured, CUDA graph).
     if hidden_states.shape[-1] != k or hidden_states.numel() == 0:
         return None
-    try:
-        return backend.linear(hidden_states, weight, backend.packed_handle(lm_head))
-    except Exception:  # noqa: BLE001 - the fallback is always correct
-        return None
+    return weight
