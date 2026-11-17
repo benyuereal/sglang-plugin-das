@@ -3043,3 +3043,20 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
 - paged bshd vs splitkv 同臂 A/B（fp8 头）：1133.35 / 25.48 vs **1185.45 / 25.03**，
   即 **+4.6%** 吞吐、TPOT **−0.45 ms**；wheel varlen layout 补丁缺失时另多约 1.9 ms/步。
 
+### fp8 草稿头的三个 GEMM 后端
+
+- 选择：`SGLANG_MTP_LMHEAD_QUANT_BACKEND=auto|hbird|lightop|torch`；`auto` 顺序为
+  hbird → lightop → torch。三者都不可用时草稿头保持 bf16，不再依赖 hbird。
+- hbird：packed tiles，支持 `out=`；lightop：`hipblaslt_w8a8_channelwise_gemm`
+  （`transpose_flag="NT"`，权重 `[N,K]` 直接匹配）；torch：`torch._scaled_mm`
+  （`weight_q.t()` 的 `[K,N]` column-major + `scale_b[1,N]`）。
+- lightop/torch 没有 `out=`，适配层把结果 `copy_` 进调用方预分配 buffer；默认后端仍是
+  hbird（唯一支持 `out=`、避免 graph 内分配）。
+- 实测（M=45 / N=4096 / K=5120，fp8 e4m3 W8A8，对 fp32 参考）：lightop 与 torch 的
+  maxerr 均为 3.9e-3（bf16 舍入量级），且 `out` 返回调用方 buffer；
+  `tests/test_mtp_quant_backend_select.py` 5/5 通过（选择顺序与回退）。
+
+### 依赖、回退及证据
+
+- 依赖 GEMM PR；GPU 安装与量化数值同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
+- 回退：`SGLANG_MTP_LMHEAD_FP8=0`，安装函数直接返回 False，草稿头保持 bf16。
