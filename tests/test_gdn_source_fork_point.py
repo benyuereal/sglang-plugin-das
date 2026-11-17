@@ -26,9 +26,9 @@ SOURCE = (Path(__file__).resolve().parents[1]
 
 PINNED = {
     "_convolve_prefill": "fe7aaa59df57eea618e8bfd20420ba4a8146360690e4e55f094e91ff7c5ebf00",
-    "_verify_kernel_forward": "c7997a17aa8fffd06767a0c8a67a57f093cf0c265689a8957b7c26c11dab1c70",
+    "_verify_kernel_forward": "5cc232b129e2cad03f9c120ec44524f00bf2bf447f319635e6ef113ec28f59fd",
     "forward_decode": "e991f711b27f57102cd81e32a9a6fa945243e73937c5387f1541ff48996d0121",
-    "forward_extend": "f8bd5d5f08ff7756534eec613ed8b5b6481b7b1a53f4094bf63574e77ce8bcbd",
+    "forward_extend": "44c614ee53f8c6d6d289669437b525395eff765513f273e84bbcd85aebdb8cb6",
 }
 
 # The deltas that make the copy ours; losing one of these is the regression.

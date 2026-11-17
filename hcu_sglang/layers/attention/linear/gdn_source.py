@@ -366,6 +366,7 @@ def forward_extend(
             self.forward_metadata.mamba_cache_indices,
             mamba_cache,
             int(inter.shape[1]),
+            forward_batch.req_pool_indices,
         )
     return core_attn_out
 
@@ -465,6 +466,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         cache_indices=cache_indices,
         mamba_cache=mamba_cache,
         query_start_loc=query_start_loc,
+        req_rows=gdn_commit.batch_rows(self, forward_batch),
     )
     if hip_out is not None:
         return hip_out
