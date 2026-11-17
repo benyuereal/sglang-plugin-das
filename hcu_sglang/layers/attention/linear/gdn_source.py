@@ -7,6 +7,9 @@ kernel entries; prefill stays upstream), ``_convolve_prefill`` and
 """
 
 from __future__ import annotations
+
+import logging
+
 import sglang.srt.layers.attention.linear.gdn_backend as upstream
 from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
 from hcu_sglang.utils.detection import is_hcu
@@ -15,6 +18,7 @@ from sglang.srt.utils import get_bool_env_var
 globals().update({name: value for name, value in vars(upstream).items()
                   if not name.startswith("__")})
 _is_hcu = is_hcu()
+logger = logging.getLogger(__name__)
 # Keep the original in a tuple: the hook registry propagates its patch to every
 # module attribute that *is* the original function, and a direct alias would be
 # rewritten to the wrapper -- calling it would recurse into this file.
@@ -384,7 +388,7 @@ def _verify_kernel_path(self, layer, forward_batch, mixed_qkv) -> bool:
 def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
     if not _OVERLAY_LOG["done"]:
         _OVERLAY_LOG["done"] = True
-        rank0_log(
+        logger.info(
             "GDN overlay verify: HIP B+ "
             f"(prenorm={gdn_recurrent.prenorm_enabled()}, "
             f"handoff={gdn_commit.handoff_enabled()}), "
