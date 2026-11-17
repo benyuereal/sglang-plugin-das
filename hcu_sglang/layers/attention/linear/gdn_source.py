@@ -12,7 +12,11 @@ from __future__ import annotations
 import logging
 
 import sglang.srt.layers.attention.linear.gdn_backend as upstream
-from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
+from hcu_sglang.layers.attention.linear import (
+    gdn_commit,
+    gdn_recurrent,
+    gdn_switches as switches,
+)
 from hcu_sglang.utils.detection import is_hcu
 from sglang.srt.utils import get_bool_env_var
 
@@ -322,11 +326,9 @@ def _convolve_prefill(
 _HIP_LOG = {"done": False}
 _OVERLAY_LOG = {"done": False}
 
-def _gdn_hip_kernel_enabled() -> bool:
-    return _is_hcu and gdn_recurrent.enabled_kernel()
-
-def _gdn_recurrent_enabled() -> bool:
-    return _is_hcu and gdn_commit.enabled() and gdn_recurrent.enabled()
+def _overlay_enabled() -> bool:
+    """The binary switch plus the operator library it needs."""
+    return _is_hcu and switches.enabled() and gdn_recurrent.enabled()
 
 def forward_extend(
     self,
@@ -362,9 +364,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
     """The overlaid verify result, or None when this forward is not ours."""
     if not forward_batch.forward_mode.is_target_verify():
         return None
-    recurrent = _gdn_recurrent_enabled()
-    kernel = _gdn_hip_kernel_enabled()
-    if not (recurrent or kernel):
+    if not _overlay_enabled():
         return None
     if self.mis_metadata is not None or not isinstance(mixed_qkv, torch.Tensor):
         return None
@@ -376,11 +376,8 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
     if not _OVERLAY_LOG["done"]:
         _OVERLAY_LOG["done"] = True
         logger.info(
-            "GDN overlay verify: HIP B+ "
-            f"(prenorm={gdn_recurrent.prenorm_enabled()}, "
-            f"handoff={gdn_commit.handoff_enabled()}), "
-            f"conv=HIP={int(gdn_recurrent.conv_enabled())}; "
-            "decode/prefill stay on the dispatcher"
+            "GDN overlay verify: SGLANG_GDN_HIP=1 "
+            "(prenorm, handoff, conv=HIP); decode/prefill stay on the dispatcher"
         )
     seq_len = int(mixed_qkv.shape[0])
     draft_token_num = int(forward_batch.spec_info.draft_token_num)
@@ -418,6 +415,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         retrieve_next_token=meta.retrieve_next_token,
         retrieve_next_sibling=meta.retrieve_next_sibling,
         retrieve_parent_token=meta.retrieve_parent_token,
+        required=True,
     ).transpose(1, 2).view(seq_len, -1)
 
     qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
@@ -443,66 +441,45 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         key = key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
 
-    if recurrent:
-        hip_out = gdn_commit.verify_step(
-            backend=self,
-            layer=layer,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            draft_token_num=draft_token_num,
-            n=batch_size,
-            snap_cache=intermediate_state_cache,
-            cache_indices=cache_indices,
-            intermediate_indices=intermediate_indices,
-            mamba_cache=mamba_cache,
-            ss_states=ssm_states,
-            query_start_loc=query_start_loc,
-        )
-        if hip_out is not None:
-            return hip_out
-    if kernel:
-        if not _HIP_LOG["done"]:
-            rank0_log("GDN HIP kernel-only verify path active")
-            _HIP_LOG["done"] = True
-        flat = intermediate_state_cache.reshape(
-            -1, *intermediate_state_cache.shape[2:]
-        )
-        hip_out = query.new_empty((1, query.shape[1], value.shape[2], value.shape[3]))
-        gdn_recurrent.verify_full(
-            query,
-            key,
-            value,
-            a,
-            b,
-            layer.A_log,
-            layer.dt_bias,
-            query_start_loc[: batch_size + 1],
-            ssm_states,
-            cache_indices[:batch_size].to(torch.int32),
-            flat,
-            intermediate_indices[:batch_size].to(torch.int32),
-            int(intermediate_state_cache.shape[1]),
-            draft_token_num,
-            hip_out,
-        )
-        return hip_out
-    return self.kernel_dispatcher.target_verify(
-        A_log=layer.A_log,
-        dt_bias=layer.dt_bias,
+    hip_out = gdn_commit.verify_step(
+        backend=self,
+        layer=layer,
         q=query,
         k=key,
         v=value,
         a=a,
         b=b,
-        ssm_states=ssm_states,
+        draft_token_num=draft_token_num,
+        n=batch_size,
+        snap_cache=intermediate_state_cache,
         cache_indices=cache_indices,
+        mamba_cache=mamba_cache,
         query_start_loc=query_start_loc,
-        intermediate_states_buffer=intermediate_state_cache,
-        intermediate_state_indices=intermediate_indices,
-        cache_steps=forward_batch.spec_info.draft_token_num,
-        retrieve_parent_token=meta.retrieve_parent_token,
-        stable_rows=pp_spec_stable_rows_enabled(),
     )
+    if hip_out is not None:
+        return hip_out
+    if not _HIP_LOG["done"]:
+        rank0_log("GDN HIP verify fallback: full-snapshot kernel")
+        _HIP_LOG["done"] = True
+    flat = intermediate_state_cache.reshape(
+        -1, *intermediate_state_cache.shape[2:]
+    )
+    hip_out = query.new_empty((1, query.shape[1], value.shape[2], value.shape[3]))
+    gdn_recurrent.verify_full(
+        query,
+        key,
+        value,
+        a,
+        b,
+        layer.A_log,
+        layer.dt_bias,
+        query_start_loc[: batch_size + 1],
+        ssm_states,
+        cache_indices[:batch_size].to(torch.int32),
+        flat,
+        intermediate_indices[:batch_size].to(torch.int32),
+        int(intermediate_state_cache.shape[1]),
+        draft_token_num,
+        hip_out,
+    )
+    return hip_out

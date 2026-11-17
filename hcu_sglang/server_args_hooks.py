@@ -250,6 +250,12 @@ def after_from_cli_args(result: Any, cls: Any, args: Any) -> Any:
     if not is_record(result):
         result.minimax_opt = minimax_opt_enabled()
         result.hy3_sp = hy3_sp_enabled()
+        from hcu_sglang.layers.attention.linear.gdn_switches import enabled as gdn_hip_enabled
+        if is_hcu() and gdn_hip_enabled() and not result.disable_radix_cache:
+            raise ValueError(
+                "SGLANG_GDN_HIP=1 requires --disable-radix-cache: the handoff "
+                "commits one row per slot and cannot follow a shared prefix"
+            )
     return result
 
 
