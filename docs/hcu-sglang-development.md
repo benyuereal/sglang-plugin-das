@@ -3012,10 +3012,14 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
   `SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 回上游采样。
 - 设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 
-### 原始精度产物（各分支共用）
+### 精度测试结果
 
-- 原始精度产物（各分支共用同一组）：`/workspace/eval/he_bitwise2/20261115_235141/`
-  （`predictions/`、`reviews/`、`reports/`）、`/workspace/clean-stack/logs/evalscope_bitwise2.log`、
-  `/workspace/eval/he_bitwise2/humaneval_9175.log`；9×4 复跑：
-  `/workspace/llm-adaptation/qwen3.8-27b-bf16/he_wrong/results/rerun_final.log`、
-  `wrong_rerun_20261117_104134.json`、`wrong_rerun_20261117_104134.csv`。
+- HumanEval 精度报告（evalscope，2026-11-16 15:44:08）：
+
+  | Model | Dataset | Metric | Subset | Num | Score |
+  |---|---|---|---|---:|---:|
+  | Qwen3.8-27B | HumanEval | Accuracy ↑ | openai_humaneval | 163 | 99.4% |
+  | Qwen3.8-27B | HumanEval | Pass@k ↑ · k 1 | openai_humaneval | 163 | 99.4% |
+
+  运行记录：`Evaluating[humaneval] 100%| 164/164 [1:00:39]`，
+  `predictions complete, aggregating scores...`，Accuracy 163/164 = 99.4%。
