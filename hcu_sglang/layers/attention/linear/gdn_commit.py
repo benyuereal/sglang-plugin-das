@@ -6,16 +6,17 @@ variant points verify at the committed row and is valid only with
 ``--disable-radix-cache``.
 
 "B+" is the original name of this path and survives in the kernel entry points
-and SGLANG_GDN_HIP_BPLUS; the module is named after what it does.
+and the ``bplus`` capability of SGLANG_GDN_HIP; the module is named after
+what it does.
 """
 
 import logging
-import os
 from typing import NamedTuple
 
 import torch
 
 from hcu_sglang.layers.attention.linear import gdn_recurrent
+from hcu_sglang.layers.attention.linear import gdn_switches as switches
 
 # Row floor for the seed scratch: a one-slot chunk must not reallocate next chunk.
 SEED_SCRATCH_MIN_ROWS = 128
@@ -77,18 +78,11 @@ def state(backend) -> CommitState:
     return st
 
 def enabled() -> bool:
-    return os.environ.get("SGLANG_GDN_HIP_BPLUS") == "1"
-
-_HANDOFF_OK = None
+    return switches.has(switches.BPLUS)
 
 def handoff_enabled() -> bool:
     """Zero-copy state handoff: verify reads h0 from the committed row."""
-    global _HANDOFF_OK
-    if _HANDOFF_OK is None:
-        _HANDOFF_OK = (enabled()
-                       and os.environ.get("SGLANG_GDN_HIP_HANDOFF") == "1"
-                       and os.environ.get("SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK") == "1")
-    return _HANDOFF_OK
+    return switches.has(switches.HANDOFF)
 
 def _slot_ids(slots) -> torch.Tensor:
     return slots.to(torch.int64).clamp_min(0)
@@ -382,7 +376,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         prev_now = None
         if handoff and st.prev is None:
             return False
-        skip_full = os.environ.get("SGLANG_GDN_HIP_BPLUS_SKIP_FULL", "1") != "0"
+        skip_full = not switches.has(switches.REPLAY_ALL)
         # A full accept already committed verify's row, so replay only the
         # truncated slots. ``neg`` is built unconditionally: ``torch.where``
         # rejects None, and the per-layer except would drop every layer.
@@ -429,8 +423,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 st.commit_failed = True
         if not rows:
             return False
-        if (os.environ.get("SGLANG_GDN_HIP_BPLUS_MULTI", "1") != "0"
-                and gdn_recurrent.has_multi()):
+        if gdn_recurrent.has_multi():
             try:
                 if _compensate_multi(st, rows, n, D, m, store_step, snap32):
                     return True

@@ -7,9 +7,10 @@ dispatcher path (every ``*_enabled`` predicate below returns False).
 """
 
 import logging
-import os
 
 import torch
+
+from hcu_sglang.layers.attention.linear import gdn_switches as switches
 
 try:
     from lightop import gdn as _gdn
@@ -30,21 +31,22 @@ def enabled() -> bool:
     return _gdn is not None
 
 
-def _flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default) == "1" and enabled()
+def _capability(name: str) -> bool:
+    return enabled() and switches.has(name)
 
 
 def enabled_kernel() -> bool:
-    return _flag("SGLANG_GDN_HIP_KERNEL")
+    return _capability(switches.KERNEL)
 
 
 def prenorm_enabled() -> bool:
     """Hoist q/k l2norm + gating out of the 12x-redundant verify CTAs."""
-    return _flag("SGLANG_GDN_HIP_PRENORM")
+    return _capability(switches.PRENORM)
 
 
 def prenorm_gate_enabled() -> bool:
-    return _flag("SGLANG_GDN_HIP_PRENORM_GATE", "1")
+    # The gate ships inside the prenorm kernel; it is not a separate choice.
+    return prenorm_enabled()
 
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
@@ -112,7 +114,7 @@ _CONV_LAST_REASON = None
 
 
 def conv_enabled() -> bool:
-    return _flag("SGLANG_GDN_HIP_CONV")
+    return _capability(switches.CONV)
 
 
 def conv_last_reason():
