@@ -4059,10 +4059,17 @@ TEMP=0，无 rejection sampling，40×2048 in / 40×2048 out）：
 - 本轮 A/B 在 GPU5/9162 顺序完成，但机器上仍有其他 GPU（0/4）的服务常驻；绝对数受
   共享主机资源影响，两臂相对差在同一次会话内可比。
 
-## 2026-11-17（五）handoff 全栈 40 请求单波
+## 2026-11-18（三）handoff radix-on 合入集成复测
 
-int-handoff（main + misc/FA + GDN handoff + gemm/draft），radix ON、mamba 160、
-mem 0.89、`SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`：40/40，**1273.35 tok/s /
-Mean TPOT 22.91 ms / Mean TTFT 12.51 s**，服务端 `#running-req: 40 /
-#queue-req: 0`。对比同配置 plain 集成 1231.48 / 25.05：**+3.4% / −2.14 ms**。
-证据：`logs/bench_handoff_int_r1.log`、`logs/serve_handoff_int_r1.log`。
+修正版 handoff（track 判据改用 `cache_steps` 环形列）合入集成分支，GDN 单测全过，l0 gate 通过。
+40 请求单波、radix ON、mamba 160、mem 0.89、`SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`：
+40/40，**1314.08 tok/s / Mean TPOT 22.92 ms / Mean TTFT 12.60 s**，`#queue-req: 0`；
+同条件 plain 集成 1234.96 / 24.99：**+6.4% / −2.07 ms**。固定 8 prompt、greedy c=1
+的 token-id 对拍 **8/8 逐字节一致**。
+
+HumanEval（164 题，T=0.2/top_p=0.95/rep=1.1/thinking/batch 64，无 seed）：handoff
+（radix ON，40 请求/0.87）161/164、159/164；plain 同配置 160/164，0.89/48 配置
+162/164；历史 163/164 基线（radix OFF）唯一失败 #145。失败均为长思考空输出
+（#99/#108/#146 撞 max_tokens）、代码逻辑（#47/#93/#116/#148）、缺 join/括号
+（#86/#38）与 #145 题面陷阱；同配置 handoff 均值 160 vs plain 160，未见 handoff
+相关数值回退。
