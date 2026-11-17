@@ -2876,7 +2876,7 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
 ## 2026-11-17 GDN B+ commit 链与 lightop.gdn 适配：SGLang 0.5.22
 
-用途：verify 只写被接受那一步的 SSM 快照，commit 只移动行指针或重放 stash，
+用途：verify 只写被接受那一步的 SSM 快照，commit 只重放被截断的 slot，
 避免每步 6 GiB 的整状态拷贝。内核与绑定归 lightop，plugin 只保留框架适配；
 判定依据：内核属算子库（规范 §9）。
 
@@ -2885,7 +2885,7 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；内核真源为
   lightop 分支 `qwen3.8-27b-perf-gdn` @ `35c7e60dd4074be8f87c919efff645700425ca8a`
   （repo `benyuereal/lightop`），本仓不再携带 `.hip`。
-- `gdn_commit.py`：单行快照、stash 重放、handoff 指针移动与 multi-layer 一次 launch；
+- `gdn_commit.py`：单行快照、stash 重放（只重放被截断的 slot）与 multi-layer 一次 launch；
   `gdn_source.py`：prefill 交还上游、target verify 走 B+/HIP、HCU conv；
   `gdn_recurrent.py`：152 行薄适配层，`from lightop import gdn`。
 - 适配层与交付内核不是同一个加载路径：交付候选使用旧 cffi loader 与预编译 `.so`，
@@ -2929,5 +2929,6 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 依赖 lightop wheel 携带 `lib/_gdn*.so`（`scripts/build_gdn.sh`，aicc 构建并断言 8 个导出
   符号）；设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 - 回退：`SGLANG_GDN_HIP=0` 回到上游 Triton；lightop 缺失时同一开关不生效。旧的
-  分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 要求 `--disable-radix-cache`，
-  启动时断言；开启 radix 的前缀复用与 handoff 的单行提交互斥。
+  分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 只有一种模式：plain B+
+  （verify 写完整快照、commit 只重放被截断的 slot）+ HIP conv + prenorm；
+  radix cache 开或关都可直接使用，不再要求 `--disable-radix-cache`。

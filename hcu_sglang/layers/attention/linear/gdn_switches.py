@@ -3,10 +3,14 @@
 
 """The GDN HIP switch: one env var, resolved once per process.
 
-``SGLANG_GDN_HIP=1`` turns on the delivered stack: the B+ handoff verify,
-the HIP conv update and the prenorm kernel. ``0`` / unset keeps the upstream
+``SGLANG_GDN_HIP=1`` turns on the delivered stack: the plain B+ verify/commit
+(full snapshot per verify, replay only the slots the accept truncated), the
+HIP conv update and the prenorm kernel. ``0`` / unset keeps the upstream
 Triton dispatcher. There are no per-capability switches; a capability that
 cannot run declines at runtime and the caller falls back.
+
+This works with or without the radix cache: a shared prefix never moves the
+slot-indexed state pointers, so no server-arg mode is derived here.
 
 The parsed mode is cached by raw value, so the steady-state hot path reads a
 bool instead of re-parsing the environment.

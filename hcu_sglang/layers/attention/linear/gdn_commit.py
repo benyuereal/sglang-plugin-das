@@ -1,13 +1,12 @@
 """Commit only the accepted step's GDN state.
 
-Verify keeps a single snapshot row; the commit replays the stash for the slots
-the accept truncated, so the 6 GiB state copy is not needed. The handoff
-variant points verify at the committed row and is valid only with
-``--disable-radix-cache``.
+Verify writes the full-run snapshot row; the commit replays the stash for the
+slots the accept truncated, so the 6 GiB state copy is not needed. The path
+works with the radix cache on: a shared prefix changes which slots the accepted
+step lands on, never the slot-indexed state layout.
 
-"B+" is the original name of this path and survives in the kernel entry points
-and the ``bplus`` capability of SGLANG_GDN_HIP; the module is named after
-what it does.
+"B+" is the original name of this path and survives in the kernel entry points;
+the module is named after what it does.
 """
 
 import logging
@@ -17,13 +16,6 @@ import torch
 
 from hcu_sglang.layers.attention.linear import gdn_recurrent
 from hcu_sglang.layers.attention.linear import gdn_switches as switches
-
-# Row floor for the seed scratch: a one-slot chunk must not reallocate next chunk.
-SEED_SCRATCH_MIN_ROWS = 128
-
-# Spare rows on slot-indexed buffers: an out-of-range slot parks without a
-# bounds check on the hot path.
-SLOT_BUFFER_SLACK = 3
 
 logger = logging.getLogger(__name__)
 
@@ -49,23 +41,13 @@ class HeadDims(NamedTuple):
 class CommitState:
     """Per-backend scratch, kept off the nn.Module so plain attributes work."""
 
-    __slots__ = (
-        "prev", "stash", "snap_idx", "capture_T", "live_T", "seed_scratch",
-        "ml_table", "ml_key", "max_slots", "logged", "commit_failed",
-        "step_gen", "step_lid", "step_cache", "s64_buf", "prev32_buf",
-        "prev64_buf", "store_buf", "row_bufs", "h0_bufs", "tmp32_buf",
-        "tmp64_buf",
-    )
+    __slots__ = ("stash", "snap_idx", "capture_T", "live_T", "max_slots",
+                 "ml_table", "ml_key", "commit_failed")
 
     def __init__(self):
-        self.prev = self.stash = self.snap_idx = None
-        self.seed_scratch = self.ml_table = self.ml_key = self.step_cache = None
-        self.capture_T = self.live_T = self.max_slots = self.step_gen = 0
-        self.step_lid = -1
-        self.logged = self.commit_failed = False
-        for name in ("s64_buf", "prev32_buf", "prev64_buf", "store_buf",
-                     "row_bufs", "h0_bufs", "tmp32_buf", "tmp64_buf"):
-            setattr(self, name, {})
+        self.stash = self.snap_idx = self.ml_table = self.ml_key = None
+        self.capture_T = self.live_T = self.max_slots = 0
+        self.commit_failed = False
 
 def state(backend) -> CommitState:
     # The adaptive controller swaps a second backend in between batches, so
@@ -80,149 +62,8 @@ def state(backend) -> CommitState:
 def enabled() -> bool:
     return switches.enabled()
 
-def _slot_ids(slots) -> torch.Tensor:
-    return slots.to(torch.int64).clamp_min(0)
-
 def _head_dims(*tensors) -> list[int]:
     return [int(t.shape[2]) * int(t.shape[3]) for t in tensors]
-
-def _prev_buf(backend, slots, size: int) -> torch.Tensor:
-    st = state(backend)
-    if st.prev is None or int(st.prev.numel()) < size:
-        st.prev = torch.full((size,), -1, dtype=torch.int32, device=slots.device)
-    return st.prev
-
-def _buf(st, name: str, key, rows: int, dtype, device) -> torch.Tensor:
-    """Persistent scratch keyed per size: captures bake buffer addresses."""
-    bufs = getattr(st, name)
-    buf = bufs.get(key)
-    if buf is None or buf.dtype != dtype or buf.device != device:
-        bufs[key] = buf = torch.empty(rows, dtype=dtype, device=device)
-    return buf
-
-def seed_prev(backend, slots, mamba_cache_params, cache_steps: int) -> None:
-    """Publish a freshly written temporal state to the handoff scratch rows."""
-    if not enabled():
-        return
-    temporal = mamba_cache_params.temporal
-    inter = getattr(mamba_cache_params, "intermediate_ssm", None)
-    if inter is None or temporal is None:
-        return
-    st = state(backend)
-    prev_buf = _prev_buf(backend, slots, int(temporal.shape[0]) + SLOT_BUFFER_SLACK)
-    s64, n = _slot_ids(slots), int(slots.numel())
-    flat = inter.reshape(-1, *inter.shape[2:])
-    # One persistent scratch: a per-chunk temporary fragments the allocator.
-    sc = st.seed_scratch
-    if (sc is None or int(sc.shape[0]) < n
-            or tuple(sc.shape[1:]) != tuple(temporal.shape[1:])
-            or sc.dtype != temporal.dtype):
-        st.seed_scratch = sc = torch.empty(
-            (max(n, SEED_SCRATCH_MIN_ROWS), *temporal.shape[1:]),
-            dtype=temporal.dtype, device=temporal.device)
-    torch.index_select(temporal, 0, s64, out=sc[:n])
-    flat.index_copy_(0, s64 * int(cache_steps), sc[:n])
-    prev_buf.index_fill_(0, s64, 0)
-
-def begin_verify_step(backend, layer_id: int) -> None:
-    """Rotate the per-step cache at the start of a verify forward."""
-    st, lid = state(backend), int(layer_id)
-    if lid <= st.step_lid:
-        st.step_gen += 1
-        st.step_cache = None
-    st.step_lid = lid
-
-def shared_step_values(backend, slots, mamba_cache_params, cache_steps: int,
-                       T: int) -> dict:
-    """Per-batch tensors every layer of this verify forward uses unchanged."""
-    st = state(backend)
-    n = int(slots.numel())
-    buf = _prev_buf(backend, slots,
-                    int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK)
-    rows = int(buf.numel())
-    sh = st.step_cache
-    if (sh is None or sh["gen"] != st.step_gen
-            or sh["ptr"] != int(slots.data_ptr()) or sh["n"] != n):
-        dev = slots.device
-        s64 = _buf(st, "s64_buf", rows, rows, torch.int64, dev)[:n]
-        s64.copy_(slots)
-        torch.clamp_min(s64, 0, out=s64)
-        prev32 = _buf(st, "prev32_buf", rows, rows, torch.int32, dev)[:n]
-        torch.index_select(buf, 0, s64, out=prev32)
-        store = _buf(st, "store_buf", rows, rows, torch.int32, dev)[:n]
-        store.fill_(int(T) - 1)
-        sh = {"gen": st.step_gen, "ptr": int(slots.data_ptr()), "n": n,
-              "s64": s64, "prev": prev32, "store": store, "rows": {}}
-        st.step_cache = sh
-    ent = sh["rows"].get(int(cache_steps))
-    if ent is None:
-        ent = {"store_row": _step_store_row(st, sh, cache_steps)}
-        ent["h0"] = _step_h0(st, sh["s64"], sh["prev"], cache_steps)
-        sh["rows"][int(cache_steps)] = ent
-    return sh
-
-def _step_store_row(st, sh, cache_steps: int) -> torch.Tensor:
-    n, rows = sh["n"], int(sh["prev"].numel())
-    dev = sh["prev"].device
-    tmp = _buf(st, "tmp32_buf", rows, rows, torch.int32, dev)[:n]
-    row = _buf(st, "row_bufs", (int(cache_steps), rows), rows,
-               torch.int32, dev)[:n]
-    torch.add(sh["prev"], 1, out=tmp)
-    torch.remainder(tmp, int(cache_steps), out=row)
-    return row
-
-def _step_h0(st, s64, prev32, cache_steps: int) -> torch.Tensor:
-    n, dev = int(s64.numel()), s64.device
-    prev64 = _buf(st, "prev64_buf", n, n, torch.int64, dev)[:n]
-    prev64.copy_(prev32)
-    torch.clamp_min(prev64, 0, out=prev64)
-    tmp = _buf(st, "tmp64_buf", n, n, torch.int64, dev)[:n]
-    torch.mul(s64, int(cache_steps), out=tmp)
-    torch.add(tmp, prev64, out=tmp)
-    h0 = _buf(st, "h0_bufs", (int(cache_steps), n), n, torch.int32, dev)[:n]
-    h0.copy_(tmp)
-    return h0
-
-def step_h0(backend, slots, cache_steps: int):
-    """The cached h0 rows for this batch, or None when this forward did not"""
-    st = state(backend)
-    sh = st.step_cache
-    if (sh is None or sh["gen"] != st.step_gen
-            or sh["ptr"] != int(slots.data_ptr()) or sh["n"] != int(slots.numel())):
-        return None
-    ent = sh["rows"].get(int(cache_steps))
-    return None if ent is None else ent["h0"]
-
-def h0_rows(slots: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.Tensor:
-    rows = _slot_ids(slots) * row_stride + prev.to(torch.int64).clamp_min(0)
-    return rows.to(torch.int32)
-
-def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) -> bool:
-    """Advance the committed row; no state copy."""
-    if not enabled():
-        return False
-    st = state(backend)
-    if st.prev is None or st.commit_failed:
-        return False
-    try:
-        idx, last = state_indices.to(torch.int64), last_correct.to(torch.int64)
-        # Rotate here: the forward keeps the capture batch's length, this sees live.
-        prev = st.prev.index_select(0, idx.clamp_min(0)).to(torch.int64)
-        keep = torch.where(last < T - 1, last,
-                           torch.remainder(prev + 1, cache_steps)).to(torch.int32)
-        # idx[valid] sizes its output on the device and stalls the host; route
-        # invalid slots to the buffer's discard row instead.
-        put = torch.where(idx >= 0, idx, torch.full_like(idx, st.prev.numel() - 1))
-        st.prev.index_copy_(0, put, keep)
-    except Exception:  # noqa: BLE001 - the upstream scatter is always correct
-        st.commit_failed = True
-        logger.warning("[gdn-bplus] commit_prev failed; falling back to scatter",
-                       exc_info=True)
-        return False
-    if not st.logged:
-        st.logged = True
-        logger.info("[gdn-bplus] handoff commit active (scatter skipped)")
-    return True
 
 def _fused_qkv_view(q, k, v, n: int, T: int):
     """[n, T, W] view over one fused q|k|v buffer, or None when they are apart."""
@@ -302,8 +143,9 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         return False
 
 def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache,
-                cache_indices, mamba_cache, query_start_loc):
-    """Write this step's snapshot row and hand the truncated rows to ``stash``.
+                cache_indices, intermediate_indices, mamba_cache, ss_states,
+                query_start_loc):
+    """Write this step's full snapshot row and hand the truncated rows to ``stash``.
 
     Returns the kernel output, or None when the chain declined.
     """
@@ -311,22 +153,16 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
         return None
     flat = snap_cache.reshape(-1, *snap_cache.shape[2:])
     st = state(backend)
-    # Slot-indexed scratch rows give the committed row a stable address, so
-    # commit only moves an int32 pointer; stride is the allocated cache_steps,
-    # not the runtime draft-token count.
-    cache_steps = int(snap_cache.shape[1])
-    snap_idx = cache_indices[:n].to(torch.int32)
-    begin_verify_step(backend, layer.layer_id)
-    sh = shared_step_values(backend, snap_idx, mamba_cache, cache_steps,
-                            int(draft_token_num))
-    row = sh["rows"][cache_steps]
+    # Default verify rows are batch positions: the snapshot lands in the
+    # intermediate buffer, and the commit replays truncated slots into the
+    # slot-indexed temporal state.
+    snap_idx = intermediate_indices[:n].to(torch.int32)
     st.snap_idx = snap_idx
     out = q.new_empty((1, q.shape[1], v.shape[2], v.shape[3]))
     gdn_recurrent.verify(
         q, k, v, a, b, layer.A_log, layer.dt_bias, query_start_loc[: n + 1],
-        flat, row["h0"], flat, snap_idx, cache_steps,
-        int(draft_token_num), out,
-        prev_step=st.prev, store=sh["store"], store_row=row["store_row"])
+        ss_states, cache_indices[:n].to(torch.int32), flat, snap_idx,
+        int(snap_cache.shape[1]), int(draft_token_num), out)
     return out
 
 def compensate_from_stash(backend, state_indices, last_correct) -> bool:
@@ -334,7 +170,7 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
     if not enabled():
         return False
     st = state(backend)
-    if not st.stash or st.snap_idx is None or st.prev is None:
+    if not st.stash or st.snap_idx is None:
         return False
     try:
         # Graph replay skips verify's Python: prefer the live value.
@@ -342,17 +178,27 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         if T <= 1:
             return False
         n, idx32 = int(state_indices.shape[0]), state_indices.to(torch.int32)
-        # Handoff rows are slot-indexed, so the live batch indices address them.
-        snap32 = idx32
+        from sglang.srt.layers.attention.linear.utils import (
+            pp_spec_stable_rows_enabled,
+        )
+        if pp_spec_stable_rows_enabled():
+            if int(st.snap_idx.numel()) != n:
+                return False
+            snap32 = st.snap_idx.to(torch.int32)
+        else:
+            # Default verify rows are batch positions; rebuild for the live batch.
+            snap32 = torch.arange(n, dtype=torch.int32,
+                                  device=state_indices.device)
         last32 = last_correct.to(torch.int32)
         trunc = (idx32 > 0) & (last32 >= 0) & (last32 < T - 1)
         store_step = torch.where(trunc, last32, torch.full_like(last32, -1))
         D, m = T, n * T
-        # A full accept already committed verify's row, so replay only the
+        # A full accept already wrote the snapshot row, so replay only the
         # truncated slots. ``neg`` is built unconditionally: ``torch.where``
-        # rejects None.
+        # rejects None, and the per-layer except would drop every layer.
         neg = torch.full_like(idx32, -1)
-        h0_by_stride, prev_now, rows = {}, None, []
+        h0_plain = torch.where(trunc, idx32, neg)
+        rows = []
         for lid, ent in st.stash.items():
             try:
                 layer_cache = ent.get("layer_cache")
@@ -367,18 +213,10 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 if flat is None:
                     flat = ent["flat"] = inter.reshape(-1, *inter.shape[2:])
                 stride = int(inter.shape[1])
-                h0_idx = h0_by_stride.get(stride)
-                if h0_idx is None:
-                    h0_idx = step_h0(backend, idx32, stride)
-                    if h0_idx is None:
-                        if prev_now is None:
-                            prev_now = st.prev.index_select(
-                                0, idx32.to(torch.int64).clamp_min(0)
-                            ).to(torch.int32)
-                        h0_idx = h0_rows(idx32, prev_now, stride)
-                    h0_idx = torch.where(trunc, h0_idx, neg)
-                    h0_by_stride[stride] = h0_idx
-                rows.append((ent, flat, flat, h0_idx, stride, lid))
+                # Plain rows are slot-indexed temporal state; the snapshot
+                # rows are the verify's batch positions.
+                rows.append((ent, layer_cache.temporal, flat, h0_plain,
+                             stride, lid))
             except Exception:  # noqa: BLE001 - optional path
                 logger.warning("[gdn-bplus] compensate failed for layer %s",
                                lid, exc_info=True)

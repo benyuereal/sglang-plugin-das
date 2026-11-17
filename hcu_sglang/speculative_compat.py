@@ -118,7 +118,7 @@ def commit_mamba_states_after_verify(
     **kwargs,
 ) -> None:
     # Graph replay never reruns the verify forward, so its recorded draft width
-    # is stale. Publish the live one for the GDN handoff commit.
+    # is stale. Publish the live one for the GDN plain commit's replay.
     linear = getattr(
         target_worker.model_runner.attn_backend, "linear_attn_backend", None
     )
