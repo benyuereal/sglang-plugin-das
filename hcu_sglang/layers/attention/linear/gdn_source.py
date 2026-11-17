@@ -23,10 +23,21 @@ globals().update({name: value for name, value in vars(upstream).items()
                   if not name.startswith("__")})
 _is_hcu = is_hcu()
 logger = logging.getLogger(__name__)
-# Keep the original in a tuple: the hook registry propagates its patch to every
-# module attribute that *is* the original function, and a direct alias would be
-# rewritten to the wrapper -- calling it would recurse into this file.
-_UPSTREAM_FORWARD_EXTEND = (upstream.GDNAttnBackend.forward_extend,)
+_GDN_BACKEND_MODULE = "sglang.srt.layers.attention.linear.gdn_backend"
+# Resolve lazily through the hook registry: gdn_source may be imported after the
+# REPLACE hooks are installed, when GDNAttnBackend.forward_extend is already the
+# wrapper. A module-level alias would capture that wrapper and recurse.
+_UPSTREAM_FORWARD_EXTEND = []
+
+
+def _upstream_forward_extend(self, *args, **kwargs):
+    if not _UPSTREAM_FORWARD_EXTEND:
+        from hcu_sglang.utils.module_patch import get_original_attr
+
+        _UPSTREAM_FORWARD_EXTEND.append(
+            get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
+        )
+    return _UPSTREAM_FORWARD_EXTEND[0](self, *args, **kwargs)
 _use_hcu_causal_conv1d = False
 if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
     try:
@@ -342,7 +353,7 @@ def forward_extend(
     hip_out = _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b)
     if hip_out is not None:
         return hip_out
-    core_attn_out = _UPSTREAM_FORWARD_EXTEND[0](
+    core_attn_out = _upstream_forward_extend(
         self, layer, forward_batch, mixed_qkv, a, b, **kwargs
     )
     # Real prefill only: seeding on the MTP draft extend would copy the whole
