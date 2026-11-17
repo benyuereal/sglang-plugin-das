@@ -21,7 +21,13 @@ from typing import Optional
 
 import torch
 
-from hcu_sglang.constants import AMAX_EPS, BYTES_PER_GIB, MTP_LMHEAD_QUANT_BLOCK
+from hcu_sglang.constants import BYTES_PER_GIB
+
+# Row block the MTP draft head is quantized in.
+MTP_LMHEAD_QUANT_BLOCK = 4096
+
+# amax floor used when scaling fp8 activations and weights.
+AMAX_EPS = 1e-8
 
 logger = logging.getLogger(__name__)
 

@@ -15,8 +15,14 @@ from typing import NamedTuple
 
 import torch
 
-from hcu_sglang.constants import SEED_SCRATCH_MIN_ROWS, SLOT_BUFFER_SLACK
 from hcu_sglang.layers.attention.linear import gdn_recurrent
+
+# Row floor for the seed scratch: a one-slot chunk must not reallocate next chunk.
+SEED_SCRATCH_MIN_ROWS = 128
+
+# Spare rows on slot-indexed buffers: an out-of-range slot parks without a
+# bounds check on the hot path.
+SLOT_BUFFER_SLACK = 3
 
 logger = logging.getLogger(__name__)
 

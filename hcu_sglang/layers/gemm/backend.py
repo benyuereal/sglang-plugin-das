@@ -15,7 +15,13 @@ from typing import Protocol
 
 import torch
 
-from hcu_sglang.constants import BYTES_PER_GIB, DECODE_MAX_M, SKIPPED_LOG_LIMIT
+from hcu_sglang.constants import BYTES_PER_GIB
+
+# Cap on how many skipped layers one log line lists.
+SKIPPED_LOG_LIMIT = 8
+
+# M values a decode CUDA graph can issue (verify runs bs * draft tokens).
+DECODE_MAX_M = 128
 
 _LOG = logging.getLogger(__name__)
 

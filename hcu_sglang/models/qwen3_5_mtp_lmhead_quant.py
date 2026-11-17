@@ -13,9 +13,12 @@ import time
 import torch
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-from hcu_sglang.constants import BYTES_PER_GIB, QWEN3_5_MTP_HOOK_BASE
+from hcu_sglang.constants import BYTES_PER_GIB
 from hcu_sglang.layers.gemm import quant_lm_head
 from hcu_sglang.models import mtp_lmhead_quant as mtp_head
+
+# Prefix of the Qwen3.5 MTP setters the draft-head hooks patch.
+QWEN3_5_MTP_HOOK_BASE = "sglang.srt.models.qwen3_5_mtp.Qwen3_5ForCausalLMMTP."
 
 logger = logging.getLogger(__name__)
 

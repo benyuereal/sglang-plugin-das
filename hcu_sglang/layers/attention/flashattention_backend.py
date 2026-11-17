@@ -8,11 +8,13 @@ import types
 
 import torch
 
-from hcu_sglang.constants import FA3_MAX_DESCALE_HEAD_DIM
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 from hcu_sglang.models.fused_rotary import has_fused_kv_store
 from hcu_sglang.utils.detection import is_hcu
+
+# Largest head dim the fa3 fp8 path builds a descale tile for.
+FA3_MAX_DESCALE_HEAD_DIM = 256
 
 logger = logging.getLogger(__name__)
 
