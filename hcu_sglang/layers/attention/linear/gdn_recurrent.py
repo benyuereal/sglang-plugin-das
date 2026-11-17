@@ -7,6 +7,7 @@ norm reciprocal reproduce the production Triton kernel
 (sglang.kernels.ops.attention.fla), not aiter's tl.rsqrt variant.
 """
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -34,8 +35,15 @@ _LIB = None
 _ERR = None
 _FFI = None
 _HEADER_TEXT = None
+_ARGS = None
+_PARAMS = None
 _PRENORM_BUF = {}
 _CONV_LAST_REASON = None
+# Pointer cdata cached on the tensor itself, keyed by the address it was built
+# from: a tensor whose storage moves is re-cast, transient views are not.
+_PTR_ATTR = "_gdn_cptr"
+_STREAM_PTRS = {}
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 def _header_text() -> str:
     """The cdef source, read once; the FFI object parses it at load time."""
@@ -43,6 +51,87 @@ def _header_text() -> str:
     if _HEADER_TEXT is None:
         _HEADER_TEXT = _HEADER.read_text(encoding="utf-8")
     return _HEADER_TEXT
+
+def _params():
+    """(argument name, is pointer) per entry, parsed from the ABI header."""
+    global _PARAMS
+    if _PARAMS is None:
+        _PARAMS = {}
+        for match in re.finditer(r"void (\w+)\((.*?)\);", _header_text(), re.S):
+            params = []
+            for part in match.group(2).split(","):
+                part = part.strip()
+                if part:
+                    name = part.rsplit(None, 1)[-1].lstrip("*")
+                    params.append((name, "*" in part))
+            _PARAMS[match.group(1)] = tuple(params)
+    return _PARAMS
+
+def _args():
+    """Argument names per entry, read from the ABI header (single source)."""
+    global _ARGS
+    if _ARGS is None:
+        _ARGS = {entry: tuple(n for n, _ in params if n != "stream")
+                 for entry, params in _params().items()}
+    return _ARGS
+
+def _cptr(value):
+    """Pointer argument as the void* cffi wants; None stays the null pointer."""
+    if value is None:
+        return _ffi().NULL
+    if not isinstance(value, torch.Tensor):
+        return value
+    address = value.data_ptr()
+    hit = getattr(value, _PTR_ATTR, None)
+    if hit is None or hit[0] != address:
+        hit = (address, _ffi().cast("void *", address))
+        try:
+            setattr(value, _PTR_ATTR, hit)
+        except Exception:  # noqa: BLE001 - 不允许挂属性就每次现算
+            pass
+    return hit[1]
+
+def _generate(entry, fn, params):
+    """Build this entry's wrapper from the prototypes in the ABI header.
+
+    The header is the single source of truth: the wrapper takes exactly the
+    parameter names it declares, so call sites stay named and a missing or
+    unknown argument is a plain Python TypeError.  Marshalling is compiled in,
+    which keeps the hot path free of dict and name lookups.
+    """
+    signature, arguments = [], []
+    for name, is_pointer in params:
+        if name == "stream":
+            arguments.append("_stream()")
+        else:
+            signature.append(name)
+            arguments.append(f"_cptr({name})" if is_pointer else name)
+    source = (f"def {entry}({', '.join(signature)}):\n"
+              f"    return _fn({', '.join(arguments)})\n")
+    namespace = {"__name__": __name__, "_fn": fn,
+                 "_cptr": _cptr, "_stream": _stream}
+    exec(compile(source, f"<gdn-abi:{entry}>", "exec"), namespace)
+    return namespace[entry]
+
+class _Library:
+    """The loaded object; each entry is called by the header's names."""
+
+    __slots__ = ("_raw", "_entries")
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._entries = {}
+
+    def __getattr__(self, name):
+        entries = self._entries
+        entry = entries.get(name)
+        if entry is None:
+            params = _params().get(name)
+            if params is None:
+                raise AttributeError(f"{name}: not declared in {_HEADER}")
+            entry = _generate(name, getattr(self._raw, name), params)
+            entries[name] = entry
+        return entry
 
 def lib():
     global _LIB, _ERR, _FFI
@@ -54,15 +143,15 @@ def lib():
     try:
         ffi = FFI()
         ffi.cdef(_header_text())
-        h = ffi.dlopen(path)
+        raw = ffi.dlopen(path)
         # Required entries: resolve them now so a stale .so fails here, not on
-        # the first verify launch.  Optional entries stay behind getattr().
+        # the first verify launch. Optional entries stay behind getattr().
         for name in ("gdn_recurrent_update_bplus",
                      "gdn_recurrent_update_bplus_state",
                      "gdn_recurrent_update_nofma"):
-            getattr(h, name)
+            getattr(raw, name)
         _FFI = ffi
-        _LIB = h
+        _LIB = _Library(raw)
     except Exception as e:  # noqa: BLE001 - 报清楚为什么没起来
         _ERR = f"[gdn-hip-bplus] 加载 {path} 失败: {e}"
         raise RuntimeError(_ERR) from e
@@ -106,13 +195,14 @@ def _norm_pass(q, k, a, b, A_log, dt_bias, qn, kn, eg, beta, hv):
     h = int(q.shape[-2])
     kdim = int(q.shape[-1])
     lib().gdn_verify_norm_pass(
-        _ptr(q), _ptr(k), _ptr(a), _ptr(b),
-        _ptr(_f32(A_log)), _ptr(_f32(dt_bias)),
-        _ptr(qn), _ptr(kn), _ptr(eg), _ptr(beta),
-        int(q.shape[1]) * h, h, int(hv), kdim, int(hv) // h,
-        _tok_stride(q), _tok_stride(k), _tok_stride(a), _tok_stride(b),
-        _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD, 1.0 / (kdim ** 0.5),
-        _stream(),
+        q=q, k=k, a=a, b=b, A_log=_f32(A_log), dt_bias=_f32(dt_bias),
+        qn=qn, kn=kn, eg_out=eg, beta_out=beta,
+        n_units=int(q.shape[1]) * h, H=h, HV=int(hv), K=kdim,
+        hratio=int(hv) // h,
+        stride_q=_tok_stride(q), stride_k=_tok_stride(k),
+        stride_a=_tok_stride(a), stride_b=_tok_stride(b),
+        softplus_beta=_SOFTPLUS_BETA, softplus_threshold=_SOFTPLUS_THRESHOLD,
+        scale=1.0 / (kdim ** 0.5),
     )
 
 def _tok_stride(x: torch.Tensor) -> int:
@@ -141,38 +231,13 @@ def _ptr(tensor):
 
 def _stream():
     """The current torch stream as the kernels' opaque void* handle."""
-    return _ffi().cast("void *", int(torch.cuda.current_stream().cuda_stream))
-
-def _call(fn, q, k, v, a, b, A_log, dt_bias, cu_seqlens, h0_source, h0_indices,
-          o, snap_buf, snap_idx, cache_steps, store_step, store_row, n_seq,
-          tok_per_seq, hv, h, kdim, vdim, use_h0=None):
-    """Launch a B+ entry by its typed cffi function object (never a name)."""
-    # use_initial_state and varlen are independent (compensate: no cu_seqlens).
-    if use_h0 is None:
-        use_h0 = True
-    fn(
-        _ptr(q), _ptr(k), _ptr(v), _ptr(a), _ptr(b),
-        _ptr(_f32(A_log)), _ptr(_f32(dt_bias)),
-        _ptr(cu_seqlens),
-        _ptr(h0_source), _ptr(h0_indices), _ptr(o),
-        _ptr(snap_buf),
-        _ptr(snap_idx),
-        int(cache_steps),
-        _ptr(store_step),
-        _ptr(store_row),
-        int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
-        int(hv // h),
-        # a and b carry separate strides: b is often a slice of a wider buffer.
-        _tok_stride(q), _tok_stride(k), _tok_stride(v),
-        _tok_stride(a), _tok_stride(b),
-        1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
-        # (use_initial_state, varlen, disable_state_update)
-        1 if use_h0 else 0,
-        # varlen must be off without cu_seqlens: the kernel would read null.
-        0 if cu_seqlens is None else 1,
-        1,
-        _stream(),
-    )
+    if _RAW_STREAM is None:
+        return _ffi().cast("void *", int(torch.cuda.current_stream().cuda_stream))
+    raw = _RAW_STREAM(torch.cuda.current_device())
+    pointer = _STREAM_PTRS.get(raw)
+    if pointer is None:
+        pointer = _STREAM_PTRS[raw] = _ffi().cast("void *", raw)
+    return pointer
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
            snap_flat, snap_idx, cache_steps, draft_token_num, o, prev_step=None,
@@ -202,61 +267,86 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
         qn, kn, eg, beta = prenorm_buffers(rows, h, kdim, hv, q.device)
         _norm_pass(q, k, a, b, A_log, dt_bias, qn, kn, eg, beta, hv)
         lib().gdn_recurrent_update_bplus_prenorm(
-            _ptr(q), _ptr(k), _ptr(v), _ptr(a), _ptr(b),
-            _ptr(_f32(A_log)), _ptr(_f32(dt_bias)),
-            _ptr(cu_seqlens),
-            _ptr(ssm_states), _ptr(cache_indices), _ptr(o),
-            _ptr(snap_flat),
-            _ptr(snap_idx),
-            int(cache_steps),
-            _ptr(store),
-            _ptr(store_row),
-            n, int(draft_token_num), hv, kdim, int(v.shape[-1]),
-            int(hv // h),
-            _tok_stride(q), _tok_stride(k), _tok_stride(v),
-            _tok_stride(a), _tok_stride(b),
-            1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
-            1, 0 if cu_seqlens is None else 1, 1,
-            _ptr(qn), _ptr(kn), _ptr(eg), _ptr(beta),
-            h * kdim, hv, 1 if prenorm_gate_enabled() else 0,
-            _stream(),
+            q=q, k=k, v=v, a=a, b=b, A_log=_f32(A_log),
+            dt_bias=_f32(dt_bias), cu_seqlens=cu_seqlens,
+            h0_source=ssm_states, h0_indices=cache_indices, o=o,
+            snap_buf=snap_flat, snap_idx=snap_idx, cache_steps=int(cache_steps),
+            store_step=store, store_row=store_row,
+            N=n, T=int(draft_token_num), HV=hv, K=kdim,
+            V=int(v.shape[-1]), hratio=int(hv // h),
+            stride_q=_tok_stride(q), stride_k=_tok_stride(k),
+            stride_v=_tok_stride(v), stride_a=_tok_stride(a),
+            stride_b=_tok_stride(b), scale=1.0 / (kdim ** 0.5),
+            softplus_beta=_SOFTPLUS_BETA,
+            softplus_threshold=_SOFTPLUS_THRESHOLD,
+            use_initial_state=1, varlen=0 if cu_seqlens is None else 1,
+            disable_state_update=1, qn=qn, kn=kn, eg_buf=eg,
+            beta_buf=beta, stride_qn=h * kdim, stride_ab=hv,
+            gate=1 if prenorm_gate_enabled() else 0,
         )
         return
-    _call(lib().gdn_recurrent_update_bplus,
-          q, k, v, a, b, A_log, dt_bias,
-          cu_seqlens, ssm_states, cache_indices, o, snap_flat, snap_idx,
-          cache_steps, store, store_row, n, draft_token_num, v.shape[-2],
-          q.shape[-2], k.shape[-1], v.shape[-1])
+    hv = int(v.shape[-2])
+    h = int(q.shape[-2])
+    kdim = int(k.shape[-1])
+    lib().gdn_recurrent_update_bplus(
+        q=q, k=k, v=v, a=a, b=b, A_log=_f32(A_log), dt_bias=_f32(dt_bias),
+        cu_seqlens=cu_seqlens, h0_source=ssm_states, h0_indices=cache_indices,
+        o=o, snap_buf=snap_flat, snap_idx=snap_idx,
+        cache_steps=int(cache_steps), store_step=store, store_row=store_row,
+        N=n, T=int(draft_token_num), HV=hv, K=kdim, V=int(v.shape[-1]),
+        hratio=int(hv // h),
+        stride_q=_tok_stride(q), stride_k=_tok_stride(k),
+        stride_v=_tok_stride(v), stride_a=_tok_stride(a),
+        stride_b=_tok_stride(b), scale=1.0 / (kdim ** 0.5),
+        softplus_beta=_SOFTPLUS_BETA,
+        softplus_threshold=_SOFTPLUS_THRESHOLD,
+        use_initial_state=1, varlen=0 if cu_seqlens is None else 1,
+        disable_state_update=1,
+    )
 
 def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
                 cache_indices, snap_flat, snap_idx, cache_steps,
                 draft_token_num, o):
     """Full-snapshot entry, for the A/B only: same kernel and inputs, every step"""
     n = int(snap_idx.shape[0])
+    kdim = int(k.shape[-1])
     lib().gdn_recurrent_update_nofma(
-        _ptr(q), _ptr(k), _ptr(v), _ptr(a), _ptr(b),
-        _ptr(_f32(A_log)), _ptr(_f32(dt_bias)),
-        _ptr(cu_seqlens),
-        _ptr(ssm_states), _ptr(cache_indices), _ptr(o),
-        _ptr(snap_flat), _ptr(snap_idx),
-        int(cache_steps), int(n), int(draft_token_num), int(v.shape[-2]),
-        int(k.shape[-1]), int(v.shape[-1]), int(v.shape[-2] // q.shape[-2]),
-        _tok_stride(q), _tok_stride(k), _tok_stride(v),
-        _tok_stride(a), _tok_stride(b),
-        1.0 / (k.shape[-1] ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
-        1, 0 if cu_seqlens is None else 1, 1,
-        _stream(),
+        q=q, k=k, v=v, a=a, b=b, A_log=_f32(A_log), dt_bias=_f32(dt_bias),
+        cu_seqlens=cu_seqlens, h0_source=ssm_states, h0_indices=cache_indices,
+        o=o, snap_buf=snap_flat, snap_idx=snap_idx,
+        cache_steps=int(cache_steps), N=int(n), T=int(draft_token_num),
+        HV=int(v.shape[-2]), K=kdim, V=int(v.shape[-1]),
+        hratio=int(v.shape[-2] // q.shape[-2]),
+        stride_q=_tok_stride(q), stride_k=_tok_stride(k),
+        stride_v=_tok_stride(v), stride_a=_tok_stride(a),
+        stride_b=_tok_stride(b), scale=1.0 / (kdim ** 0.5),
+        softplus_beta=_SOFTPLUS_BETA,
+        softplus_threshold=_SOFTPLUS_THRESHOLD,
+        use_initial_state=1, varlen=0 if cu_seqlens is None else 1,
+        disable_state_update=1,
     )
 
 def compensate(q, k, v, a, b, A_log, dt_bias, ssm_states, h0_rows,
                snap_flat, snap_idx, cache_steps, store_step, n_seq,
                tok_per_seq, o):
     """Replay state only (no o); slots with h0_rows < 0 exit immediately."""
-    _call(lib().gdn_recurrent_update_bplus_state,
-          q, k, v, a, b, A_log, dt_bias,
-          None, ssm_states, h0_rows, o, snap_flat, snap_idx, cache_steps,
-          store_step, None, n_seq, tok_per_seq, v.shape[-2], q.shape[-2],
-          k.shape[-1], v.shape[-1], use_h0=True)
+    hv = int(v.shape[-2])
+    h = int(q.shape[-2])
+    kdim = int(k.shape[-1])
+    lib().gdn_recurrent_update_bplus_state(
+        q=q, k=k, v=v, a=a, b=b, A_log=_f32(A_log), dt_bias=_f32(dt_bias),
+        cu_seqlens=None, h0_source=ssm_states, h0_indices=h0_rows, o=o,
+        snap_buf=snap_flat, snap_idx=snap_idx, cache_steps=int(cache_steps),
+        store_step=store_step, store_row=None,
+        N=int(n_seq), T=int(tok_per_seq), HV=hv, K=kdim, V=int(v.shape[-1]),
+        hratio=int(hv // h),
+        stride_q=_tok_stride(q), stride_k=_tok_stride(k),
+        stride_v=_tok_stride(v), stride_a=_tok_stride(a),
+        stride_b=_tok_stride(b), scale=1.0 / (kdim ** 0.5),
+        softplus_beta=_SOFTPLUS_BETA,
+        softplus_threshold=_SOFTPLUS_THRESHOLD,
+        use_initial_state=1, varlen=0, disable_state_update=1,
+    )
 
 def f32(x: torch.Tensor) -> torch.Tensor:
     """Cached fp32 view of A_log/dt_bias for the pointer table."""
@@ -269,17 +359,13 @@ def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
                      n_seq, tok_per_seq, hv, h, kdim, vdim):
     """One-launch state replay for every layer in ``layer_ptrs``."""
     lib().gdn_recurrent_update_bplus_state_multi(
-        _ptr(layer_ptrs),
-        _ptr(h0_indices),
-        _ptr(snap_idx),
-        int(cache_steps),
-        _ptr(store_step),
-        int(layer_ptrs.shape[0]),
-        int(n_seq), int(tok_per_seq), int(hv), int(kdim), int(vdim),
-        int(hv // h),
-        1.0 / (kdim ** 0.5), _SOFTPLUS_BETA, _SOFTPLUS_THRESHOLD,
-        1, 0, 1,
-        _stream(),
+        layer_ptrs=layer_ptrs, h0_indices=h0_indices, snap_idx=snap_idx,
+        cache_steps=int(cache_steps), store_step=store_step,
+        L=int(layer_ptrs.shape[0]), N=int(n_seq), T=int(tok_per_seq),
+        HV=int(hv), K=int(kdim), V=int(vdim), hratio=int(hv // h),
+        scale=1.0 / (kdim ** 0.5), softplus_beta=_SOFTPLUS_BETA,
+        softplus_threshold=_SOFTPLUS_THRESHOLD,
+        use_initial_state=1, varlen=0, disable_state_update=1,
     )
 
 # ---------------------------------------------------------------------------
@@ -405,18 +491,14 @@ def conv_update(x, conv_state, weight, bias=None, activation=None,
     if not conv_enabled():
         _CONV_LAST_REASON = "SGLANG_GDN_HIP_CONV=1 and the .so exports no conv entry"
         return None
-    if conv_unsupported_reason(
+    reason = conv_unsupported_reason(
         x, conv_state, weight, bias, activation, cache_seqlens,
         conv_state_indices, num_accept_tokens, intermediate_conv_window,
         intermediate_state_indices, retrieve_next_token,
         retrieve_next_sibling, retrieve_parent_token, pad_slot_id,
-    ) is not None:
-        _CONV_LAST_REASON = conv_unsupported_reason(
-            x, conv_state, weight, bias, activation, cache_seqlens,
-            conv_state_indices, num_accept_tokens, intermediate_conv_window,
-            intermediate_state_indices, retrieve_next_token,
-            retrieve_next_sibling, retrieve_parent_token, pad_slot_id,
-        )
+    )
+    if reason is not None:
+        _CONV_LAST_REASON = reason
         return None
 
     unsq = x.dim() == 2
@@ -441,26 +523,29 @@ def conv_update(x, conv_state, weight, bias=None, activation=None,
     )
 
     lib().gdn_causal_conv1d_update(
-        _ptr(x3), _ptr(weight), _ptr(bias), _ptr(conv_state),
-        _ptr(conv_state_indices), _ptr(win), _ptr(intermediate_state_indices),
-        _ptr(retrieve_next_token), _ptr(retrieve_next_sibling),
-        _ptr(retrieve_parent_token), _ptr(out),
-        batch, dim, seqlen, int(conv_state.size(2)), int(conv_state.size(0)),
-        *[int(s) for s in x3.stride()],
-        *[int(s) for s in weight.stride()],
-        *[int(s) for s in conv_state.stride()],
-        0 if conv_state_indices is None else int(conv_state_indices.stride(0)),
-        *win_strides, s_ii,
-        *nxt_strides, *sib_strides, *par_strides,
-        *[int(s) for s in out.stride()],
-        pad,
-        1 if bias is not None else 0,
-        1 if activation in (True, "silu", "swish") else 0,
-        1 if conv_state_indices is not None else 0,
-        1 if save_inter else 0,
-        1 if tree else 0,
-        1 if pad_slot_id is not None else 0,
-        idx64,
-        _stream(),
+        x=x3, w=weight, bias=bias, conv_state=conv_state,
+        conv_idx=conv_state_indices, window=win,
+        inter_idx=intermediate_state_indices, nxt=retrieve_next_token,
+        sib=retrieve_next_sibling, par_out=retrieve_parent_token, o=out,
+        batch=batch, dim=dim, seqlen=seqlen,
+        state_len=int(conv_state.size(2)), num_cache_lines=int(conv_state.size(0)),
+        s_x_seq=int(x3.stride(0)), s_x_dim=int(x3.stride(1)),
+        s_x_tok=int(x3.stride(2)),
+        s_w_dim=int(weight.stride(0)), s_w_width=int(weight.stride(1)),
+        s_cs_seq=int(conv_state.stride(0)), s_cs_dim=int(conv_state.stride(1)),
+        s_cs_tok=int(conv_state.stride(2)),
+        s_ci=0 if conv_state_indices is None else int(conv_state_indices.stride(0)),
+        s_wseq=win_strides[0], s_wstep=win_strides[1],
+        s_wdim=win_strides[2], s_win=win_strides[3], s_ii=s_ii,
+        s_nseq=nxt_strides[0], s_ntok=nxt_strides[1],
+        s_sseq=sib_strides[0], s_stok=sib_strides[1],
+        s_pseq=par_strides[0], s_ptok=par_strides[1],
+        s_o_seq=int(out.stride(0)), s_o_dim=int(out.stride(1)),
+        s_o_tok=int(out.stride(2)),
+        pad_slot_id=pad, has_bias=1 if bias is not None else 0,
+        silu=1 if activation in (True, "silu", "swish") else 0,
+        cont=1 if conv_state_indices is not None else 0,
+        save_inter=1 if save_inter else 0, tree=1 if tree else 0,
+        use_pad=1 if pad_slot_id is not None else 0, idx64=idx64,
     )
     return out.squeeze(-1) if unsq else out

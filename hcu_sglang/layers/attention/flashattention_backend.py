@@ -190,7 +190,7 @@ def _descale_tile(scale, shape, device):
 
 
 def around_prepare_paged_mha_query(
-    original,
+    wrapped,
     self,
     q,
     q_rope,
@@ -207,7 +207,7 @@ def around_prepare_paged_mha_query(
     ``layer.k_scale``. The fa3 varlen entry requires q/k/v descales for an
     fp8 prefix decode, so fill the missing ones (1.0 when no scale is set).
     """
-    out = original(
+    out = wrapped(
         self,
         q,
         q_rope,

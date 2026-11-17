@@ -1,15 +1,38 @@
 """hbird-gemm as a bf16 GEMM backend."""
 
-from ..provider import Bf16GemmProvider
+import logging
+import os
+import sys
+
+import torch
+
+from hcu_sglang.constants import BYTES_PER_GIB
+
+from ..backend import GemmProvider
+
+_LOG = logging.getLogger(__name__)
+
+_MAX_M_DEFAULT = 192
 
 
 def _ops():
-    import hbird_ops
+    try:
+        import hbird_ops
 
-    return hbird_ops
+        return hbird_ops
+    except ImportError:
+        root = os.environ.get("HBIRD_GEMM_HOME") or ""
+        path = os.path.join(root, "plugins")
+        if not root or not os.path.isdir(path):
+            raise
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import hbird_ops
+
+        return hbird_ops
 
 
-class HbirdProvider(Bf16GemmProvider):
+class HbirdProvider(GemmProvider):
     name = "hbird"
 
     def __init__(self):
@@ -62,6 +85,43 @@ class HbirdProvider(Bf16GemmProvider):
 
     def packed_handle(self, module):
         return self._ops.bf16_packed_handle(module)
+
+    def exclude(self, modules) -> None:
+        """Mark modules this worker keeps on the upstream GEMM."""
+        for _, module in modules:
+            try:
+                module._hbird_off = True
+            except AttributeError:
+                pass
+
+    def prepare_quant_head(self, weight_q):
+        ops = self._ops
+        vocab, hidden = weight_q.shape
+        ms = [
+            m
+            for m in range(1, _MAX_M_DEFAULT + 1)
+            if ops.guard(m, vocab, hidden) == 0
+        ]
+        if not ms:
+            raise RuntimeError("guard refuses every M")
+        ops.prepare_weight(weight_q)
+        for m in ms:
+            ops.prepare(m, vocab, hidden, weight_q.device)
+        torch.cuda.synchronize()
+        _LOG.info(
+            "[gemm] quant head on packed tiles: %.2f GiB B, "
+            "%d M workspaces (%d..%d)",
+            weight_q.numel() / BYTES_PER_GIB,
+            len(ms),
+            ms[0],
+            ms[-1],
+        )
+        return ops.hbird_fp8_gemm, ms[-1]
+
+    def install_shim(self) -> bool:
+        import hbird_sglang
+
+        return bool(hbird_sglang.install())
 
 
 def load() -> HbirdProvider | None:

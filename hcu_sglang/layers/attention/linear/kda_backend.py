@@ -1854,7 +1854,7 @@ class _HybridMethods:
         gdn_commit.compensate_from_stash(
             linear, state_indices_tensor, last_correct_step_indices
         )
-        if self._handoff_moved_the_pointer(
+        if self._handoff_committed(
             linear, mamba_caches, state_indices_tensor, last_correct_step_indices,
             src_indices_raw,
         ):
@@ -1881,7 +1881,7 @@ class _HybridMethods:
             src_indices_raw,
         )
 
-    def _handoff_moved_the_pointer(
+    def _handoff_committed(
         self, linear, mamba_caches, state_indices, last_correct, src_indices_raw
     ) -> bool:
         """B+ handoff: the commit only moves the row pointer, not the state."""
@@ -2095,7 +2095,7 @@ def register_hooks():
         setattr(K.KDAAttnBackend, name, _bind(vars(_KdaMethods)[name], K, K.KDAAttnBackend, name, decorators))
     for name, decorators in [('__init__', []), ('_forward_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('_replay_metadata', [])]:
         setattr(H.MambaAttnBackendBase, name, _bind(vars(_BaseMethods)[name], H, H.MambaAttnBackendBase, name, decorators))
-    for name, decorators in [('get_indexer_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('forward', []), ('update_mamba_state_after_mtp_verify', []), ('_handoff_moved_the_pointer', [])]:
+    for name, decorators in [('get_indexer_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('forward', []), ('update_mamba_state_after_mtp_verify', []), ('_handoff_committed', [])]:
         setattr(H.HybridLinearAttnBackend, name, _bind(vars(_HybridMethods)[name], H, H.HybridLinearAttnBackend, name, decorators))
     for name, decorators in [('prepare_mixed', ['classmethod'])]:
         setattr(MD.Mamba2Metadata, name, _bind(vars(_MetadataMethods)[name], MD, MD.Mamba2Metadata, name, decorators))

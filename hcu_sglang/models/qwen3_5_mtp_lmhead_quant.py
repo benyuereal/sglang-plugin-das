@@ -24,26 +24,28 @@ def _mtp_lmhead_fp8_enabled() -> bool:
     return value.strip().lower() not in ("", "0", "false", "off")
 
 def _should_use_fp8_draft_head(model) -> bool:
-    """Cheap gates first: a captured stream cannot allocate, and the proxy must"""
+    """Cheap gates first: a captured stream cannot allocate, and the proxy must
+    not be wrapped twice."""
+    if getattr(model, "_mtp_fp8_installed", False):
+        return False
+    if not _mtp_lmhead_fp8_enabled():
+        return False
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return False
     head = getattr(model, "lm_head", None)
+    if isinstance(head, mtp_head.DraftHeadQuantProxy):
+        return False
     weight = getattr(head, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        return False
+    if not weight.is_cuda or weight.dtype not in (torch.bfloat16, torch.float16):
+        return False
     logits_processor = getattr(model, "logits_processor", None)
-    return (
-        not getattr(model, "_mtp_fp8_installed", False)
-        and _mtp_lmhead_fp8_enabled()
-        and not (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
-        and isinstance(weight, torch.Tensor)
-        and weight.dim() == 2
-        and weight.is_cuda
-        and weight.dtype in (torch.bfloat16, torch.float16)
-        and not isinstance(head, mtp_head.DraftHeadQuantProxy)
-        and not (
-            logits_processor is not None
-            and getattr(logits_processor, "use_fp32_lm_head", False)
-        )
-    )
+    if logits_processor is not None and getattr(
+        logits_processor, "use_fp32_lm_head", False
+    ):
+        return False
+    return True
 
 def _install_draft_head(*, model, head, weight_q, weight_scale, gemm, max_m, scheme):
     method = mtp_head.DraftHeadQuantMethod(

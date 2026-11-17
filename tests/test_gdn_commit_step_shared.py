@@ -152,15 +152,19 @@ class SharedStepTest(unittest.TestCase):
         captured = {}
 
         def fake_call(*args, **kwargs):
-            captured["store"] = args[15]
-            captured["store_row"] = args[16]
+            captured["store"] = kwargs["store_step"]
+            captured["store_row"] = kwargs["store_row"]
+
+        class FakeLib:
+            def __getattr__(self, name):
+                return fake_call
 
         q = torch.zeros(1, BATCH * DRAFT, 2, 8)
         v = torch.zeros(1, BATCH * DRAFT, 4, 6)
         snap_idx = torch.zeros(BATCH, dtype=torch.int32)
         store = torch.full((BATCH,), DRAFT - 1, dtype=torch.int32)
         store_row = torch.zeros(BATCH, dtype=torch.int32)
-        with patch.object(gdn_recurrent, "_call", fake_call):
+        with patch.object(gdn_recurrent, "lib", FakeLib):
             gdn_recurrent.verify(
                 q, q, v, q, q, q, q, None, v, snap_idx, v, snap_idx,
                 CACHE_STEPS, DRAFT, v, prev_step=self.prev_buf,
@@ -173,13 +177,17 @@ class SharedStepTest(unittest.TestCase):
         captured = {}
 
         def fake_call(*args, **kwargs):
-            captured["store"] = args[15]
-            captured["store_row"] = args[16]
+            captured["store"] = kwargs["store_step"]
+            captured["store_row"] = kwargs["store_row"]
+
+        class FakeLib:
+            def __getattr__(self, name):
+                return fake_call
 
         q = torch.zeros(1, BATCH * DRAFT, 2, 8)
         v = torch.zeros(1, BATCH * DRAFT, 4, 6)
         snap_idx = self.slots.to(torch.int32)
-        with patch.object(gdn_recurrent, "_call", fake_call):
+        with patch.object(gdn_recurrent, "lib", FakeLib):
             gdn_recurrent.verify(
                 q, q, v, q, q, q, q, None, v, snap_idx, v, snap_idx,
                 CACHE_STEPS, DRAFT, v, prev_step=self.prev_buf,

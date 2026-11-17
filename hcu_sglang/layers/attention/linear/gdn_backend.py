@@ -1,9 +1,13 @@
 """REPLACE hook implementations for HCU GDN backend paths."""
 
 import logging
+import os
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
+import torch
+
+from sglang.srt.utils import is_cpu, is_npu
 from hcu_sglang.layers.attention.linear import gdn_source
 from hcu_sglang.utils.module_patch import get_original_attr
 
@@ -31,28 +35,74 @@ def register() -> None:
     for target, hook in hooks:
         logger.info("[hcu_sglang] register REPLACE hook: %s", target)
         HookRegistry.register(target, hook, HookType.REPLACE)
+    _log_overlay()
+
+
+def _log_overlay() -> None:
+    """State the paths this overlay owns; the dispatcher log covers the rest."""
+    from hcu_sglang.layers.attention.linear import gdn_commit
+
+    if not gdn_commit.enabled():
+        return
+    logger.info(
+        "[gdn-overlay] verify=HIP B+ (prenorm=%s, handoff=%s), conv=HIP=%s; "
+        "decode/prefill stay on sglang's kernel dispatcher",
+        os.environ.get("SGLANG_GDN_HIP_PRENORM", "1") == "1",
+        gdn_commit.handoff_enabled(),
+        os.environ.get("SGLANG_GDN_HIP_CONV", "1") == "1",
+    )
+
+
+def _load_causal_conv1d_hcu():
+    from causal_conv1d import causal_conv1d_fn_hcu
+    from causal_conv1d.causal_conv1d_interface import (
+        causal_conv1d_update as causal_conv1d_update_hcu,
+    )
+
+    return causal_conv1d_update_hcu, causal_conv1d_fn_hcu
+
+
+def _load_sglang_gdn_symbols():
+    try:
+        from sglang.kernels.ops.attention.fla.fused_gdn_gating import (
+            fused_gdn_gating,
+        )
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+            causal_conv1d_update,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+    except ImportError:
+        from sglang.srt.layers.attention.linear.gdn_backend import (
+            MambaPool,
+            fused_gdn_gating,
+        )
+        from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+            causal_conv1d_update,
+        )
+
+    return MambaPool, fused_gdn_gating, causal_conv1d_update
 
 
 def replacement_forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
     if not gdn_source._is_hcu:
-        original = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_decode")
-        return original(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+        upstream = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_decode")
+        return upstream(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
     return gdn_source.forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
 
 
 def replacement_forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
     if not gdn_source._is_hcu:
-        original = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
-        return original(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+        upstream = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
+        return upstream(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
     return gdn_source.forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
 
 
 def around_convolve_prefill(
-    original, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
+    wrapped, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
 ):
     if not gdn_source._is_hcu:
-        return original(self, layer, forward_batch, mixed_qkv, conv_states,
-                        cache_indices)
+        return wrapped(self, layer, forward_batch, mixed_qkv, conv_states,
+                       cache_indices)
     return gdn_source._convolve_prefill(
-        original, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
+        wrapped, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
     )

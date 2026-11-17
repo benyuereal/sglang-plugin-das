@@ -277,7 +277,7 @@ def forward_decode(
     return (core_attn_out, z) if return_z else core_attn_out
 
 def _convolve_prefill(
-    original,
+    wrapped,
     self,
     layer: RadixLinearAttention,
     forward_batch: ForwardBatch,
@@ -287,11 +287,11 @@ def _convolve_prefill(
 ) -> torch.Tensor:
     """HCU conv1d for prefill; the upstream implementation otherwise."""
     if not _use_hcu_causal_conv1d:
-        return original(self, layer, forward_batch, mixed_qkv, conv_states,
-                        cache_indices)
+        return wrapped(self, layer, forward_batch, mixed_qkv, conv_states,
+                       cache_indices)
     if self.forward_metadata.conv_block_table is not None:
-        return original(self, layer, forward_batch, mixed_qkv, conv_states,
-                        cache_indices)
+        return wrapped(self, layer, forward_batch, mixed_qkv, conv_states,
+                       cache_indices)
     return causal_conv1d_fn_hcu(
         mixed_qkv.transpose(0, 1),
         layer.conv_weights,
