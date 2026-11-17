@@ -2917,6 +2917,18 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   运行记录：`Evaluating[humaneval] 100%| 164/164 [1:00:39]`，
   `predictions complete, aggregating scores...`，Accuracy 163/164 = 99.4%。
 
+### 测试方法与本 PR 的贡献
+
+- 40/40 复现命令：`PORT=9160 TAG=<tag> bash /workspace/clean-stack/bench_verified.sh`
+  （内部调用 `vllm_bench_driver.py --backend openai --base-url http://localhost:9160
+  --endpoint /v1/completions --model /data/Qwen3.8-27B --dataset-name random
+  --random-input-len 2048 --random-output-len 2048 --num-prompts 40
+  --max-concurrency 40 --ignore-eos --seed 42 --temperature 0`；
+  脚本在 40/40 全部成功前拒绝出数）。
+- 对产线 0.5.18：1300.07 / 23.34 vs 1236.93 / 24.20，即 **+5.1%** 吞吐、TPOT **−0.86 ms**。
+- 分项（不同阶段/配置，**不可相加**）：GDN B+/HIP 移除损失 18.3%；aicc vs hipcc +8.2%；
+  fp8 草稿头 +3.8%；FA bshd +4.6%；hbird GEMM 早期累计 +24.6%。
+
 ### 依赖、回退及证据
 
 - 依赖：flash_attn wheel 的 varlen layout 补丁（`DELIVERY.md` §5、
