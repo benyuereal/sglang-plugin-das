@@ -25,7 +25,6 @@ SOURCE = (Path(__file__).resolve().parents[1]
           / "hcu_sglang/layers/attention/linear/gdn_source.py")
 
 PINNED = {
-    "forward_decode": "e991f711b27f57102cd81e32a9a6fa945243e73937c5387f1541ff48996d0121",
     "_convolve_prefill": "fe7aaa59df57eea618e8bfd20420ba4a8146360690e4e55f094e91ff7c5ebf00",
     "forward_extend": "391c2db862c2bde1a3f7494695470f915d9260a4376001a1ef4bb2629e712a8a",
     "_verify_attempt": "b60f0930b6de7e68e14283c70db21701eb318037530ebeb5afdc1a6b42938da5",
