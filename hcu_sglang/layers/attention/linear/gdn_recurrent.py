@@ -30,17 +30,21 @@ def enabled() -> bool:
     return _gdn is not None
 
 
+def _flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default) == "1" and enabled()
+
+
 def enabled_kernel() -> bool:
-    return os.environ.get("SGLANG_GDN_HIP_KERNEL") == "1" and enabled()
+    return _flag("SGLANG_GDN_HIP_KERNEL")
 
 
 def prenorm_enabled() -> bool:
     """Hoist q/k l2norm + gating out of the 12x-redundant verify CTAs."""
-    return os.environ.get("SGLANG_GDN_HIP_PRENORM") == "1" and enabled()
+    return _flag("SGLANG_GDN_HIP_PRENORM")
 
 
 def prenorm_gate_enabled() -> bool:
-    return os.environ.get("SGLANG_GDN_HIP_PRENORM_GATE", "1") == "1"
+    return _flag("SGLANG_GDN_HIP_PRENORM_GATE", "1")
 
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
@@ -108,7 +112,7 @@ _CONV_LAST_REASON = None
 
 
 def conv_enabled() -> bool:
-    return os.environ.get("SGLANG_GDN_HIP_CONV") == "1" and enabled()
+    return _flag("SGLANG_GDN_HIP_CONV")
 
 
 def conv_last_reason():
