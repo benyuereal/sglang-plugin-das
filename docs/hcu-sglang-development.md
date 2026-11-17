@@ -2874,3 +2874,47 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+
+## 2026-11-17 Qwen3.8-27B clean 0.5.22 交付：GEMM/GDN/MTP/FA 优化栈
+
+用途：在官方 SGLang 0.5.22 上交付 Qwen3.8-27B 的优化栈（hbird GEMM 打包、GDN B+
+提交链、MTP fp8 草稿头、FA 分页布局与 norm/spec 适配）。上游零改动，全部经
+HookRegistry / 模块 overlay 接入；内核与绑定归 lightop。
+
+### 代码与组合边界
+
+- plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；交付分支
+  `qwen3.8-27b-perf`（本记录所在分支），设备实测候选 `e7a0da6`。
+- GDN 内核真源在 lightop 分支 `qwen3.8-27b-perf-gdn` @
+  `35c7e60dd4074be8f87c919efff645700425ca8a`；本分支已移除 `csrc/gdn`，交付配置
+  通过 `GDN_HIP_SO` 加载预编译对象（旧 cffi loader 形态）。
+- 四个可独立评审的 PR 分支：`-gemm`（backend seam）、`-draft`（MTP fp8 头）、
+  `-gdn`（lightop 适配）、`-misc`（FA/norm/spec）；集成验证分支
+  `qwen3.8-27b-perf-integration`。
+
+### 已有设备与模型证据（2026-11-17）
+
+单卡 gfx938，模型 `/data/Qwen3.8-27B`，TP1/PP1，`fa3`、page 64、fp8 e4m3 KV、
+NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
+
+- 40/40（c40/2k2k，`TEMP=0`）：**1300.07 tok/s / Mean TPOT 23.34 ms**
+  （`logs/bench_final_e7a0da6.log`）。
+- HumanEval 完整 164 题：**163/164**（基线 161–163）；已知错题 9×4 复跑 29/36
+  （上一臂 30/36），差异在长思考噪声内。
+- 无 HIP 内核对照臂：**1061.67 tok/s / TPOT 28.02**（`logs/bench_no_hip.log`），
+  相对交付 −18.3%——B+ 是主要性能路径。
+- aicc vs hipcc 同负载 A/B：1300.61 vs 1201.88 tok/s；accept rate 0.946 vs 0.890。
+  hipcc 改变核数值（max diff 3.8e-6）并降低投机接受率，故内核必须 aicc。
+- L0 passed；单测 14 failures / 3 errors / 17 skipped（本分支基线）。
+
+### 依赖、回退及证据
+
+- 依赖：flash_attn wheel 的 varlen layout 补丁（`DELIVERY.md` §5、
+  `patches/0001-flash-attn-varlen-layout.patch`）；hbird-gemm 的 bf16/fp8 GEMM `.so`；
+  GDN 预编译对象（`GDN_HIP_SO`）。lightop wheel 携带 `lib/_gdn*.so` 后，GDN 改走
+  `lightop.gdn`（见 `-gdn` PR）。
+- 回退：`SGLANG_GEMM_BACKEND=none` 回上游 GEMM；`SGLANG_GDN_HIP_*` 置 0 回 Triton
+  （即上述 1061.67/28.02 臂）；`SGLANG_MTP_LMHEAD_FP8=0` 回 bf16 草稿头；
+  `SGLANG_HCU_FA_PAGED_BSHD=0` 回 split-KV。
+- 证据边界：四个 PR 分支是交付候选的代码子集，分支本身未单独重跑完整镜像；
+  合入前需在候选提交上复测 40/40 与精度。
