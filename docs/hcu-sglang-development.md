@@ -3016,3 +3016,11 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
 - 回退：`SGLANG_HCU_FA_PAGED_BSHD=0` 回 split-KV；`SGLANG_KV_LAYOUT_HCU_FA=0` 保持官方布局；
   `SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 回上游采样。
 - 候选提交上的完整镜像与精度复测待合入前完成。
+
+### 原始精度产物（各分支共用）
+
+- 原始精度产物（各分支共用同一组）：`/workspace/eval/he_bitwise2/20261115_235141/`
+  （`predictions/`、`reviews/`、`reports/`）、`/workspace/clean-stack/logs/evalscope_bitwise2.log`、
+  `/workspace/eval/he_bitwise2/humaneval_9175.log`；9×4 复跑：
+  `/workspace/llm-adaptation/qwen3.8-27b-bf16/he_wrong/results/rerun_final.log`、
+  `wrong_rerun_20261117_104134.json`、`wrong_rerun_20261117_104134.csv`。
