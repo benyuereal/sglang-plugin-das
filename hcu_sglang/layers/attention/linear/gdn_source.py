@@ -305,6 +305,7 @@ def _convolve_prefill(
     ).transpose(0, 1)[: mixed_qkv.shape[0]]
 
 _HIP_LOG = {"done": False}
+_OVERLAY_LOG = {"done": False}
 
 def _gdn_hip_kernel_enabled() -> bool:
     return _is_hcu and gdn_recurrent.enabled_kernel()
@@ -381,6 +382,15 @@ def _verify_kernel_path(self, layer, forward_batch, mixed_qkv) -> bool:
 
 
 def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
+    if not _OVERLAY_LOG["done"]:
+        _OVERLAY_LOG["done"] = True
+        rank0_log(
+            "GDN overlay verify: HIP B+ "
+            f"(prenorm={gdn_recurrent.prenorm_enabled()}, "
+            f"handoff={gdn_commit.handoff_enabled()}), "
+            f"conv=HIP={int(gdn_recurrent.conv_enabled())}; "
+            "decode/prefill stay on the dispatcher"
+        )
     seq_len = int(mixed_qkv.shape[0])
     draft_token_num = int(forward_batch.spec_info.draft_token_num)
     batch_size = seq_len // draft_token_num

@@ -1,7 +1,6 @@
 """REPLACE hook implementations for HCU GDN backend paths."""
 
 import logging
-import os
 
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -35,22 +34,6 @@ def register() -> None:
     for target, hook in hooks:
         logger.info("[hcu_sglang] register REPLACE hook: %s", target)
         HookRegistry.register(target, hook, HookType.REPLACE)
-    _log_overlay()
-
-
-def _log_overlay() -> None:
-    """State the paths this overlay owns; the dispatcher log covers the rest."""
-    from hcu_sglang.layers.attention.linear import gdn_commit
-
-    if not gdn_commit.enabled():
-        return
-    logger.info(
-        "[gdn-overlay] verify=HIP B+ (prenorm=%s, handoff=%s), conv=HIP=%s; "
-        "decode/prefill stay on sglang's kernel dispatcher",
-        os.environ.get("SGLANG_GDN_HIP_PRENORM", "1") == "1",
-        gdn_commit.handoff_enabled(),
-        os.environ.get("SGLANG_GDN_HIP_CONV", "1") == "1",
-    )
 
 
 def _load_causal_conv1d_hcu():
