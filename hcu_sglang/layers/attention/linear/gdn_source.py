@@ -340,7 +340,8 @@ def conv_update(x, conv_state, weight, bias=None, activation=None, **kwargs):
             if not _CONV_HIP_LOG["done"]:
                 _CONV_HIP_LOG["done"] = True
                 rank0_log(f"SGLANG_GDN_HIP_CONV path disabled: {exc}")
-    return causal_conv1d_update(x, conv_state, weight, bias, activation, **kwargs)
+    update = causal_conv1d_update_hcu if _use_hcu_causal_conv1d else causal_conv1d_update
+    return update(x, conv_state, weight, bias, activation, **kwargs)
 
 def forward_extend(
     self,
