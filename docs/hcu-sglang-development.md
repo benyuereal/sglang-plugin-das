@@ -2902,3 +2902,33 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 未在真实 HCU 设备上运行模型；HND 布局识别、fp8 descale 填充与 lightop 回退缺少实机/整模型验证。
 - `SGLANG_HCU_FA_PAGED_BSHD` 在本仓仅声明，消费方不在本仓，未验证其路由行为。
 - 未运行 GitHub CI。
+## 2026-11-17 FA paged layout、silu 回退与 speculative compat：SGLang 0.5.22
+
+用途：让 NHD 分页池走到 wheel 的直通 paged 核、补齐 fp8 KV 的 descale，并在 lightop
+缺失时回退上游 silu；同时把自动拒绝采样接入官方入口。归属判据：平台与框架适配属
+plugin；FA wheel 的布局选择属 flash-attention-das。
+
+### 代码与组合边界
+
+- plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；FA 侧对应
+  `flash-attention-das` 分支 `fix/varlen-layout` @ `ca3e6cb39bd790580ddb15d998304e6299b37173`。
+- `flashattention_interface.py`：NHD pool 的 varlen 直通与 HND 视图；
+  `flashattention_backend.py`：fp8 KV descale 补齐 hook；`norm_activation.py`：lightop
+  silu 缺失时回退；`speculative_compat.py`：自动拒绝采样与 torchaudio 探测
+  （B+ commit hook 归 GDN PR）。
+- 部署前置：flash_attn wheel 的 varlen layout 补丁
+  （`patches/0001-flash-attn-varlen-layout.patch`）；缺失时 TPOT 会回到 25 ms 以上。
+
+### 已有设备与模型证据（2026-11-17）
+
+- 交付候选 `e7a0da6`（`SGLANG_HCU_FA_PAGED_BSHD=1`）：40/40 1300.07 tok/s / TPOT 23.34；
+  同臂 A/B（fp8 头）：splitkv 1133.35/25.48 vs bshd 1185.45/25.03。
+- `tests/test_fa_paged_switch.py` 3/3；L0 passed；单测 13F/3E/17。
+
+### 依赖、回退及证据
+
+- HND 支持为休眠路径（交付用 NHD）；`SGLANG_HCU_FA_PAGED_BSHD` 的消费方在 adapter/wheel
+  侧，本仓只做登记；FA 其他模型的影响面未在本 PR 验证。
+- 回退：`SGLANG_HCU_FA_PAGED_BSHD=0` 回 split-KV；`SGLANG_KV_LAYOUT_HCU_FA=0` 保持官方
+  布局；`SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 回上游采样。
+- 本 PR 分支未重跑完整镜像与精度；候选提交上的复测待合入前完成。
