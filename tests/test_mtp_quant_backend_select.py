@@ -16,7 +16,7 @@ class QuantHeadBackendSelectTests(unittest.TestCase):
 
     def _prepare(self, backends, name):
         with mock.patch.dict(os.environ, {
-            "SGLANG_MTP_LMHEAD_QUANT_BACKEND": name,
+            "SGLANG_QUANT_HEAD_BACKEND": name,
         }), mock.patch.object(quant_lm_head, "_BACKENDS", backends):
             return quant_lm_head.prepare(self.weight)
 

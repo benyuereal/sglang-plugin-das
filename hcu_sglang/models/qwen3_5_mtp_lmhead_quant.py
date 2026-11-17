@@ -62,7 +62,7 @@ def install(model) -> bool:
     head = model.lm_head
     weight = head.weight
     started = time.perf_counter()
-    scheme = mtp_head.active_scheme()
+    scheme = mtp_head.SCHEME
     quantized = mtp_head.quantize(weight.detach(), scheme)
     if quantized is None:
         return False

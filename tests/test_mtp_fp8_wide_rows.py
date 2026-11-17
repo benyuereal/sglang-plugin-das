@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from hcu_sglang.models.mtp_lmhead_quant import DraftHeadQuantMethod, active_scheme
+from hcu_sglang.models.mtp_lmhead_quant import DraftHeadQuantMethod, SCHEME
 
 
 class _Head:
@@ -25,7 +25,7 @@ class WideRowsTest(unittest.TestCase):
             torch.ones((vocab, 1)),
             gemm=None,
             max_m=rows - 1,
-            scheme=active_scheme(),
+            scheme=SCHEME,
         )
         x = torch.randn(rows, hidden, dtype=torch.bfloat16)
         out = method.apply(None, x)

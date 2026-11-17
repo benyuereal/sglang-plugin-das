@@ -3046,7 +3046,7 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
 
 ### fp8 草稿头的三个 GEMM 后端
 
-- 选择：`SGLANG_MTP_LMHEAD_QUANT_BACKEND=auto|hbird|lightop|torch`；`auto` 顺序为
+- 选择：`SGLANG_QUANT_HEAD_BACKEND=auto|hbird|lightop|torch`；`auto` 顺序为
   hbird → lightop → torch。三者都不可用时草稿头保持 bf16，不再依赖 hbird。
 - hbird：packed tiles，支持 `out=`；lightop：`hipblaslt_w8a8_channelwise_gemm`
   （`transpose_flag="NT"`，权重 `[N,K]` 直接匹配）；torch：`torch._scaled_mm`

@@ -7,17 +7,14 @@ replaced, so the target head stays bf16.
 
 A scheme owns the dtype and the per-row quantization only; the GEMM backend
 that serves the result lives in :mod:`hcu_sglang.layers.gemm.quant_lm_head`.
-``fp8_e4m3`` is the only scheme wired today, and SGLANG_MTP_LMHEAD_QUANT picks
-one by name when a second exists.
+``fp8_e4m3`` is the only scheme wired today; a second one would replace
+``SCHEME`` here, not add an environment variable.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
-from typing import Optional
-
 import torch
 
 # Row block the MTP draft head is quantized in.
@@ -28,8 +25,6 @@ AMAX_EPS = 1e-8
 
 logger = logging.getLogger(__name__)
 
-_SCHEME_ENV = "SGLANG_MTP_LMHEAD_QUANT"
-_DEFAULT_SCHEME = "fp8_e4m3"
 
 @dataclass(frozen=True)
 class HeadQuantScheme:
@@ -116,27 +111,12 @@ class DraftHeadQuantProxy:
     def weight(self) -> torch.Tensor:
         return self._base.weight
 
-_SCHEMES = {
-    "fp8_e4m3": HeadQuantScheme(
-        name="fp8_e4m3",
-        dtype=torch.float8_e4m3fn,
-        amax=448.0,
-        block=MTP_LMHEAD_QUANT_BLOCK,
-    ),
-}
-
-def active_scheme() -> Optional[HeadQuantScheme]:
-    name = os.environ.get(_SCHEME_ENV, _DEFAULT_SCHEME).strip().lower()
-    scheme = _SCHEMES.get(name)
-    if scheme is None:
-        logger.warning(
-            "[mtp_draft_lmhead_quant] unknown %s=%r; falling back to %s",
-            _SCHEME_ENV,
-            name,
-            _DEFAULT_SCHEME,
-        )
-        scheme = _SCHEMES[_DEFAULT_SCHEME]
-    return scheme
+SCHEME = HeadQuantScheme(
+    name="fp8_e4m3",
+    dtype=torch.float8_e4m3fn,
+    amax=448.0,
+    block=MTP_LMHEAD_QUANT_BLOCK,
+)
 
 def quantize(weight: torch.Tensor, scheme: HeadQuantScheme):
     """The quantized head and its per-row scale, or None to keep bf16."""

@@ -2,13 +2,12 @@
 
 The head can be served by three fp8 W8A8 GEMMs and never depends on one of
 them: hbird's packed tiles, lightop's hipBLASLt channelwise kernel, or
-``torch._scaled_mm``. ``SGLANG_MTP_LMHEAD_QUANT_BACKEND`` picks one by name;
+``torch._scaled_mm``. ``SGLANG_QUANT_HEAD_BACKEND`` picks one by name;
 ``auto`` tries hbird, then lightop, then torch. Every adapter implements the
 same ``gemm(xq, wq, xs, ws, out=..., prepare_shape=...)`` contract.
 """
 
 import logging
-import os
 
 import torch
 
@@ -74,9 +73,7 @@ _AUTO_ORDER = ("hbird", "lightop", "torch")
 
 def prepare(weight_q):
     """The packed GEMM and its largest M, or (None, 0) when none takes it."""
-    name = os.environ.get(
-        "SGLANG_MTP_LMHEAD_QUANT_BACKEND", "auto"
-    ).strip().lower() or "auto"
+    name = backend.quant_head_name()
     order = _AUTO_ORDER if name == "auto" else (name,)
     for candidate in order:
         make = _BACKENDS.get(candidate)
