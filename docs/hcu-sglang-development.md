@@ -2932,3 +2932,72 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
   分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 是 handoff B+（verify 写快照、
   commit 移指针）+ HIP conv + prenorm；radix cache 开启时 commit 之后补写 track 行
   （`mamba_track_indices`），因此不再要求 `--disable-radix-cache`。
+
+## 2026-11-17（二）GDN handoff 在 radix cache 下的行空间修复
+
+### 根因（设备证据）
+
+radix 打开后 mamba 池分成两个索引空间：
+
+- persistent 状态槽 `temporal.shape[0] = 109`（`max_mamba_cache_size=108` 加 padding），
+  请求的 mamba slot 由 allocator/前缀匹配在 `[0, 108]` 内发放（实测第二批 prefill 拿到
+  57/60/63/66）；
+- 请求级 scratch `intermediate_ssm` 每层只有 `spec_state_size + 1 = 22` 行 ×
+  `cache_steps=5` = 110 个摊平行（`intermediate_ssm_state_cache 15.47GB`）。
+
+旧 handoff 把 slot id 当行号：`seed_prev` 写 `flat[slot*cache_steps]`、verify 的
+`snap_idx=cache_indices`（slot）、`commit_prev` 用 slot 索引 `prev`。slot 一旦超过 21
+就越过 110 行。探针（`GDN_HANDOFF_PROBE_LOG`）实测：
+
+```
+seed_prev n=4 temporal=(109,48,128,128) inter=(22,5,48,128,128) flat_rows=110
+  slots=[57,60,63,66] flat_rows=[285,330] oob_rows=4
+```
+
+随后 `HSA_STATUS_ERROR_EXCEPTION / KERNEL VMFault`（`logs/server_radix_handoff47_probe.log`），
+faulting kernel 为 torch `index_copy`（4 字节元素），`origin ptr ... size byte: 16609443840`
+= 15.47 GiB，即 Mamba Cache 日志里的 `intermediate_ssm_state_cache`。radix off 时
+`max_num_reqs = max_mamba_cache_size = 48`，slot 与 scratch 行数一致，旧算术才碰巧成立。
+
+### 改动范围
+
+- `hcu_sglang/layers/attention/linear/gdn_commit.py`：handoff 全部行号改为请求 scratch 行
+  （请求池行，请求生命周期内稳定；`max_num_reqs+1` 与 scratch 行数一致）。`prev` 表按
+  scratch 容量分配；`seed_prev` 写 `flat[row*D]` 并把 `prev[row]` 置 0；`verify_step` 的
+  `snap_idx`/`h0`/`store_row` 用 scratch 行，未 seed 或越界的行在 device 上 mask 成 -1
+  （kernel 跳过，无 host 分支，cuda-graph replay 安全）；`commit_prev` 只推进已 seed 的行；
+  越界/几何不符时整条 handoff 停用并回落 plain 全量 scatter，回落前 `resync_plain` 把已提交
+  行拷回 persistent slot。
+- `hcu_sglang/layers/attention/linear/kda_backend.py`：新增 `handoff_rows_list` 静态 per-bs
+  请求行缓冲，在 `_forward_metadata` / `init_forward_metadata_capture_cpu_graph` /
+  `_replay_metadata` 里原地刷新，使被 cuda graph 捕获的 verify kernel 在 replay 时读到当前
+  batch 的请求行；track scatter 的 SSM 源行改用请求行（conv 窗口保持 positional）；track
+  间隔穿越时用 stash 在 `track_step` 补一份快照（handoff 行只保留一个提交态）。
+- `hcu_sglang/layers/attention/linear/gdn_source.py`：prefill seed 传 `req_pool_indices`，
+  verify 传 `gdn_commit.batch_rows`。
+- 测试：重写 `tests/test_gdn_commit_step_shared.py`（映射/seed/commit/越界/未 seed），
+  更新 `tests/test_gdn_source_fork_point.py` 的 pin。
+
+### 验证结果
+
+- `python3 ci/l0_gate.py`：passed；`unittest discover -s tests` 与 HEAD 基线对比，除
+  fork-point pin 更新外无新增失败（既有 provenance/triage 失败不变）。
+- 设备（GPU4 / 9161，radix on + handoff，`--max-mamba-cache-size 200`，40 并发）：
+  40/40 成功、0 失败、无 VMFault，**860.04 tok/s / Mean TPOT 37.68 ms**
+  （`logs/bench_radix_handoff47_final.log`；`handoff commit active`，commit 失败计数 0）。
+- 同 build 对照（本树 + `--disable-radix-cache`，`max_mamba_cache_size=48`，40 并发）：
+  **850.13 tok/s / Mean TPOT 37.58 ms**（`logs/bench_radixoff48.log`）。radix on handoff
+  860.04 / 37.68 与之相差 1.2%：radix cache 在本分支上几乎没有额外代价，行空间分离
+  也没有引入退化。
+- 任务书里的 1300.07 / 23.34 来自交付树（`/workspace/third_party/sglang-plugin-das`
+  @ e7a0da6；与本树 `git diff e7a0da6..HEAD` 相差 10 个提交，交付树含本树没有的
+  `hcu_sglang/layers/gemm/*`、`models/mtp_lmhead_quant.py` 等文件——两棵树不是同一条
+  代码线，性能数字不能直接对比）。本树自身的 radix off 基线就是 ~850 / 37.6，所以 23.3
+  不能作为本分支的目标；本轮验收口径改为「radix on handoff vs 同分支 radix off」。
+- 另一 agent 的 radix on + plain（spec 关闭，27–31 并发）876.00 / 37.02，仅作量级参考。
+
+### 未验证 / 边界
+
+- radix off 的 40/40 复跑用于隔离 radix 开销（同 build），未再改 handoff 逻辑。
+- PP stable rows 组合：verify 侧直接回落 plain（本机 `pp_size=1`，未在 PP 设备验证）。
+- 运行期 handoff→plain 回落路径只有失败注入才能触发，本轮未做设备注入。

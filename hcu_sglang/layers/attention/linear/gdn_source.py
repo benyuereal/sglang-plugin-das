@@ -361,6 +361,7 @@ def forward_extend(
             self.forward_metadata.mamba_cache_indices,
             mamba_cache,
             int(inter.shape[1]),
+            forward_batch.req_pool_indices,
         )
     return core_attn_out
 
@@ -379,6 +380,7 @@ class _VerifyPlan(NamedTuple):
     ssm_states: torch.Tensor
     intermediate_state_cache: torch.Tensor
     intermediate_indices: torch.Tensor
+    req_rows: object
 
 
 def _verify_plan(self, layer, forward_batch, mixed_qkv):
@@ -427,6 +429,7 @@ def _verify_plan(self, layer, forward_batch, mixed_qkv):
         ssm_states=mamba_cache.temporal,
         intermediate_state_cache=intermediate_state_cache,
         intermediate_indices=intermediate_indices,
+        req_rows=gdn_commit.batch_rows(self, forward_batch),
     )
 
 
@@ -516,6 +519,7 @@ def _verify_from_plan(self, plan, layer, mixed_qkv, a, b):
         cache_indices=plan.cache_indices,
         mamba_cache=plan.mamba_cache,
         query_start_loc=plan.query_start_loc,
+        req_rows=plan.req_rows,
     )
     if out is not None:
         return out

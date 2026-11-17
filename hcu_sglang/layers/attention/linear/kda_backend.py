@@ -1182,6 +1182,19 @@ class _KdaMethods:
 
         return core_attn_out
 
+def _refresh_handoff_rows(owner, bs: int, req_pool_indices) -> None:
+    """Keep the per-bs handoff row buffer in step with the live batch."""
+    bufs = owner.handoff_rows_list
+    while len(bufs) < bs:
+        bufs.append(torch.full((len(bufs) + 1,), -1, dtype=torch.int32,
+                               device=owner.device))
+    buf = bufs[bs - 1]
+    src = req_pool_indices[:bs]
+    if src.dtype != torch.int32 or src.device != buf.device:
+        src = src.to(device=buf.device, dtype=torch.int32)
+    buf.copy_(src)
+
+
 class _BaseMethods:
     def __init__(self, model_runner: ModelRunner):
         self.validate_mis_support(model_runner.server_args)
@@ -1219,6 +1232,10 @@ class _BaseMethods:
             )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
+        # Static per-bs request-pool rows: the GDN handoff scratch row of every
+        # batch member, refreshed in place each replay so a captured verify
+        # kernel reads live rows. See gdn_commit.batch_rows.
+        self.handoff_rows_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
         self.mamba_track_indices_buf = None
@@ -1239,6 +1256,7 @@ class _BaseMethods:
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
+        _refresh_handoff_rows(self, bs, forward_batch.req_pool_indices)
 
         logical_mode = forward_batch.logical_forward_mode
 
@@ -1450,6 +1468,7 @@ class _BaseMethods:
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        _refresh_handoff_rows(self, bs, req_pool_indices)
         self.forward_metadata = self._capture_metadata(
             bs, req_pool_indices, forward_mode, spec_info
         )
@@ -1494,6 +1513,10 @@ class _BaseMethods:
             mamba_indices = self._translate_mamba_indices(mamba_indices)
             mamba_indices[bs - num_padding :] = -1
             self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        # Live request rows for the GDN handoff, after the mapping path zeroed
+        # the padded rows: the captured verify kernel reads this buffer in
+        # place, and row 0 (padding) never holds handoff state.
+        _refresh_handoff_rows(self, bs, req_pool_indices)
         if _validate_mamba_replay_state_indices and not in_capture:
             # This pre-replay diagnostic intentionally syncs to reject malformed
             # live or padded indices before a captured state update uses them.
@@ -1678,7 +1701,7 @@ def _scatter_conv_windows(mamba_caches, state_indices, last_correct):
 
 
 def _scatter_track_rows(mamba_caches, track_indices, track_steps,
-                        src_indices_raw=None):
+                        ssm_src_rows=None, conv_src_rows=None):
     """Radix checkpoints live outside the handoff row; write only their rows."""
     if track_indices is None:
         return
@@ -1691,12 +1714,12 @@ def _scatter_track_rows(mamba_caches, track_indices, track_steps,
     if ssm_states.numel() > 0:
         fused_mamba_state_scatter_with_mask(
             ssm_states, mamba_caches.intermediate_ssm, track_indices,
-            track_steps, src_indices_raw,
+            track_steps, ssm_src_rows,
         )
     for conv_states, window in zip(mamba_caches.conv,
                                    mamba_caches.intermediate_conv_window):
         fused_conv_window_scatter_with_mask(
-            conv_states, window, track_indices, track_steps, src_indices_raw,
+            conv_states, window, track_indices, track_steps, conv_src_rows,
         )
 
 
@@ -1875,17 +1898,24 @@ class _HybridMethods:
 
         linear = self.linear_attn_backend
 
+        # Handoff state is request-private: the request-pool row is its scratch
+        # row in intermediate_ssm. Persistent slots stay the conv/track dst.
+        handoff_rows = None
+        if gdn_commit.enabled() and req_pool_indices is not None:
+            handoff_rows = req_pool_indices[:request_number]
         gdn_commit.compensate_from_stash(
             linear,
-            state_indices_tensor,
+            handoff_rows,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            state_indices=state_indices_tensor,
         )
-        if self._handoff_committed(
-            linear, mamba_caches, state_indices_tensor, last_correct_step_indices,
+        committed = self._handoff_committed(
+            linear, mamba_caches, handoff_rows, last_correct_step_indices,
             src_indices_raw,
-        ):
+        )
+        if committed:
             # Verify already wrote the committed rows, so the 6 GiB ssm copy is
             # skipped and only the conv windows still need the accept rollback.
             _scatter_conv_windows(
@@ -1893,9 +1923,14 @@ class _HybridMethods:
             )
             _scatter_track_rows(
                 mamba_caches, mamba_track_indices, mamba_steps_to_track,
-                src_indices_raw,
+                ssm_src_rows=handoff_rows,
             )
         else:
+            if handoff_rows is not None:
+                gdn_commit.resync_plain(
+                    linear, handoff_rows, state_indices_tensor, mamba_caches,
+                    int(mamba_caches.intermediate_ssm.shape[2]), request_number,
+                )
             scatter_mamba_states_after_mtp_verify(
                 mamba_caches,
                 state_indices_tensor,
@@ -1914,14 +1949,15 @@ class _HybridMethods:
         )
 
     def _handoff_committed(
-        self, linear, mamba_caches, state_indices, last_correct, src_indices_raw
+        self, linear, mamba_caches, handoff_rows, last_correct, src_indices_raw
     ) -> bool:
         """B+ handoff: the commit only moves the row pointer, not the state."""
         from hcu_sglang.layers.attention.linear import gdn_commit
 
         # Pipeline-parallel rows are request-pool indices; the pointer
         # arithmetic below assumes the forward's own row layout.
-        if not gdn_commit.enabled() or src_indices_raw is not None:
+        if (not gdn_commit.enabled() or src_indices_raw is not None
+                or handoff_rows is None):
             return False
         # Host int on purpose: .item() would serialize the CPU behind the
         # verify every decode step; the captured width is the fallback.
@@ -1931,7 +1967,7 @@ class _HybridMethods:
             return False
         return gdn_commit.commit_prev(
             linear,
-            state_indices,
+            handoff_rows,
             last_correct,
             steps,
             int(mamba_caches.intermediate_ssm.shape[2]),
