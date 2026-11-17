@@ -15,13 +15,10 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
-from hcu_sglang.constants import BYTES_PER_GIB
 
 # Row block the MTP draft head is quantized in.
 MTP_LMHEAD_QUANT_BLOCK = 4096
