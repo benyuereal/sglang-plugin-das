@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import types
 import dis
 import builtins
@@ -7,12 +8,14 @@ from typing import Optional, Tuple, Union
 import sglang.srt.layers.attention.linear.kda_backend as K
 import sglang.srt.layers.attention.hybrid_linear_attn_backend as H
 import sglang.srt.layers.attention.mamba.mamba2_metadata as MD
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 globals().update({name: value for name, value in vars(K).items() if not name.startswith("__")})
 globals().update({name: value for name, value in vars(H).items() if not name.startswith("__")})
 from hcu_sglang.utils.detection import is_hcu
 from sglang.srt.utils import get_bool_env_var
 from hcu_sglang.layers.attention.linear.kda_state_indices import prepare_fused_replay_state_indices
+from hcu_sglang.layers.attention.linear import gdn_commit
 
 _hcu_causal_conv1d_fn = None
 _hcu_causal_conv1d_update = None
@@ -1649,6 +1652,7 @@ class _BaseMethods:
                 replayssm_force_flush=replayssm_force_flush,
             )
 
+
 class _HybridMethods:
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
@@ -1822,6 +1826,17 @@ class _HybridMethods:
             )
             return
 
+        linear = self.linear_attn_backend
+
+        gdn_commit.compensate_from_stash(
+            linear,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+        # The stash replay only rewrites the truncated slots; the upstream
+        # scatter still publishes the accepted state for every slot.
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1995,6 +2010,9 @@ def register_hooks():
     K._hcu_causal_conv1d_update = _hcu_causal_conv1d_update
     K._run_causal_conv1d_fn = _run_causal_conv1d_fn
     K._run_causal_conv1d_update = _run_causal_conv1d_update
+    # The upstream module resolves this global at call time and expects the
+    # platform to override it; our wrapper falls back to the original.
+    K.causal_conv1d_update = _run_causal_conv1d_update
     for name, decorators in [('__init__', [])]:
         setattr(K.KDAKernelDispatcher, name, _bind(vars(_DispatcherMethods)[name], K, K.KDAKernelDispatcher, name, decorators))
     for name, decorators in [('__init__', []), ('init_forward_metadata', []), ('forward_decode', []), ('forward_extend', []), ('_hcu_forward_decode', []), ('_hcu_forward_extend', [])]:

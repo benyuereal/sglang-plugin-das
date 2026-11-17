@@ -164,6 +164,8 @@ _HCU_DEFAULT_OVERRIDES: dict[str, tuple[type, Any]] = {
     "SGLANG_HACK_FLASHMLA_BACKEND": (EnvStr, "kernel"),
     "SGLANG_OPT_FP8_WO_A_GEMM": (EnvBool, False),
     "SGLANG_OPT_FUSE_MHC_POST_PRE": (EnvBool, False),
+    "SGLANG_HCU_FUSE_QKVZBA_VERIFY": (EnvBool, True),
+    "SGLANG_GDN_ZBA_STRIDED": (EnvBool, True),
 }
 
 

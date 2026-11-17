@@ -79,7 +79,7 @@ def register() -> None:
     from hcu_sglang.multimodal_gen import qknorm_rope
     from hcu_sglang.multimodal_gen import wan_sla
     from hcu_sglang.models.deepseek import register_hooks as register_deepseek
-    from hcu_sglang.models.qwen import qwen2, qwen3, qwen3_moe
+    from hcu_sglang.models.qwen import qwen2, qwen3, qwen3_moe, qwen3_5
 
     jit_overlay_loader.register_hooks()
     configs.register_hooks()

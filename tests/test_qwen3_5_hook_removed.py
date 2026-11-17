@@ -14,7 +14,9 @@ TARGET = "sglang.srt.models.qwen3_5.Qwen3_5AttentionDecoderLayer.self_attention"
 class Qwen35HookRemovedTests(unittest.TestCase):
     def test_plugin_entry_does_not_register_the_passthrough_hook(self):
         text = (ROOT / "hcu_sglang/__init__.py").read_text()
-        self.assertNotIn("qwen3_5", text)
+        # The MTP quant head shares the qwen3_5 module prefix; the passthrough
+        # hook is identified by its target, not by the prefix.
+        self.assertNotIn(TARGET, text)
 
     def test_no_module_registers_the_passthrough_self_attention_target(self):
         offenders = []

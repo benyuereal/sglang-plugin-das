@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import torch
 
+from hcu_sglang.layers.attention.linear import gdn_commit
 from hcu_sglang.utils.detection import is_hcu
 
 
@@ -106,6 +107,29 @@ def patch_broken_torchaudio_availability() -> None:
         transformers_utils.is_torchaudio_available = lambda: False
 
 
+def commit_mamba_states_after_verify(
+    wrapped: Callable[..., None],
+    target_worker: Any,
+    batch: Any,
+    accept_lens: Any,
+    accept_index: Any,
+    draft_token_num: int,
+    *args,
+    **kwargs,
+) -> None:
+    # Graph replay never reruns the verify forward, so its recorded draft width
+    # is stale. Publish the live one for the GDN plain commit's replay.
+    linear = getattr(
+        target_worker.model_runner.attn_backend, "linear_attn_backend", None
+    )
+    if linear is not None:
+        gdn_commit.state(linear).live_T = int(draft_token_num)
+    return wrapped(
+        target_worker, batch, accept_lens, accept_index, draft_token_num,
+        *args, **kwargs
+    )
+
+
 def register_hooks() -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -166,5 +190,10 @@ def register_hooks() -> None:
         "sglang.srt.batch_overlap.two_batch_overlap."
         "TboForwardBatchPreparer.filter_batch",
         around_tbo_filter_batch,
+        HookType.AROUND,
+    )
+    HookRegistry.register(
+        "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify",
+        commit_mamba_states_after_verify,
         HookType.AROUND,
     )
