@@ -2910,3 +2910,31 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   草稿头保持 bf16。
 - 本 PR 分支未重跑完整镜像与精度；上述设备证据属于交付候选 `e7a0da6`，
   合入前需在候选提交上复测。
+## 2026-11-17 MTP fp8 草稿 lm_head：SGLang 0.5.22 适配
+
+用途：把 MTP 草稿模型的 lm_head 换成 fp8 打包权重，降低 decode 最宽 GEMM 的带宽；
+只替换草稿头的 quant_method，target 头保持 bf16。归属判据：新增算法与 provider 消费者
+属于 plugin。
+
+### 代码与组合边界
+
+- plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；本 PR 基于
+  GEMM 分支 `qwen3.8-27b-perf-gemm`，须在其后合入。
+- `models/mtp_lmhead_quant.py` 负责量化方案、`DraftHeadQuantMethod` 与只替换
+  `quant_method` 的 proxy；`models/qwen3_5_mtp_lmhead_quant.py` 负责模型侧安装/还原 hook。
+- GEMM 侧通过 `backend.prepare_quant_head()` 取打包 GEMM；本 PR 不含 backends 实现。
+
+### 已有设备与模型证据（2026-11-17）
+
+同 §GEMM 的环境与协议；交付配置含 fp8 草稿头。
+
+- HumanEval 完整 164 题 163/164；已知错题 9×4 复跑 29/36。
+- 40/40：1300.07 tok/s / Mean TPOT 23.34 ms。隔离 A/B（`PERF_RECORD.md`）：
+  bf16 头 1091.55/26.26 vs fp8 头 1133.35/25.48。
+- `tests/test_mtp_fp8_wide_rows.py` 通过；L0 passed；单测 13F/3E/17。
+
+### 依赖、回退及证据
+
+- 依赖 GEMM PR；GPU 安装与量化数值目前只在交付候选 `e7a0da6` 上端到端验证，
+  本分支与候选提交的复测未做。
+- 回退：`SGLANG_MTP_LMHEAD_FP8=0`，安装函数直接返回 False，草稿头保持 bf16。
