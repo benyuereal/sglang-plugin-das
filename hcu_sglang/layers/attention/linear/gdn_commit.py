@@ -1,9 +1,9 @@
 """Commit only the accepted step's GDN state.
 
-Verify writes the full-run snapshot row; the commit replays the stash for the
-slots the accept truncated, so the 6 GiB state copy is not needed. The path
-works with the radix cache on: a shared prefix changes which slots the accepted
-step lands on, never the slot-indexed state layout.
+Verify keeps a single snapshot row; the commit points the next verify at it and
+replays the stash for the slots the accept truncated, so the 6 GiB state copy
+is not needed. With the radix cache on, the commit also scatters the radix
+track rows: they live outside the committed row and would otherwise go stale.
 
 With the mamba radix extra_buffer, the upstream commit also scatters the
 interval-crossing state (``mamba_track_indices`` / ``mamba_steps_to_track``)
@@ -21,6 +21,13 @@ from typing import NamedTuple
 import torch
 
 from hcu_sglang.layers.attention.linear import gdn_recurrent
+
+# Row floor for the seed scratch: a one-slot chunk must not reallocate next chunk.
+SEED_SCRATCH_MIN_ROWS = 128
+
+# Spare rows on slot-indexed buffers: an out-of-range slot parks without a
+# bounds check on the hot path.
+SLOT_BUFFER_SLACK = 3
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +69,25 @@ class StashEntry:
 class CommitState:
     """Per-backend scratch, kept off the nn.Module so plain attributes work."""
 
-    __slots__ = ("stash", "snap_idx", "capture_T", "live_T", "max_slots",
-                 "ml_table", "ml_key", "commit_failed", "track_batches",
-                 "track_rows", "track_bytes")
+    __slots__ = (
+        "prev", "stash", "snap_idx", "capture_T", "live_T", "seed_scratch",
+        "ml_table", "ml_key", "max_slots", "logged", "commit_failed",
+        "step_gen", "step_lid", "step_cache", "s64_buf", "prev32_buf",
+        "prev64_buf", "store_buf", "row_bufs", "h0_bufs", "tmp32_buf",
+        "tmp64_buf", "track_batches", "track_rows", "track_bytes",
+    )
 
     def __init__(self):
-        self.stash = self.snap_idx = self.ml_table = self.ml_key = None
-        self.capture_T = self.live_T = self.max_slots = 0
-        self.commit_failed = False
+        self.prev = self.stash = self.snap_idx = None
+        self.seed_scratch = self.ml_table = self.ml_key = self.step_cache = None
+        self.capture_T = self.live_T = self.max_slots = self.step_gen = 0
+        self.step_lid = -1
+        self.logged = self.commit_failed = False
         # Host-side counters, updated only while DEBUG logging is enabled.
         self.track_batches = self.track_rows = self.track_bytes = 0
+        for name in ("s64_buf", "prev32_buf", "prev64_buf", "store_buf",
+                     "row_bufs", "h0_bufs", "tmp32_buf", "tmp64_buf"):
+            setattr(self, name, {})
 
 def state(backend) -> CommitState:
     # The adaptive controller swaps a second backend in between batches, so
@@ -86,8 +102,149 @@ def state(backend) -> CommitState:
 def enabled() -> bool:
     return gdn_recurrent.overlay_enabled()
 
+def _slot_ids(slots) -> torch.Tensor:
+    return slots.to(torch.int64).clamp_min(0)
+
 def _head_dims(*tensors) -> list[int]:
     return [int(t.shape[2]) * int(t.shape[3]) for t in tensors]
+
+def _prev_buf(backend, slots, size: int) -> torch.Tensor:
+    st = state(backend)
+    if st.prev is None or int(st.prev.numel()) < size:
+        st.prev = torch.full((size,), -1, dtype=torch.int32, device=slots.device)
+    return st.prev
+
+def _buf(st, name: str, key, rows: int, dtype, device) -> torch.Tensor:
+    """Persistent scratch keyed per size: captures bake buffer addresses."""
+    bufs = getattr(st, name)
+    buf = bufs.get(key)
+    if buf is None or buf.dtype != dtype or buf.device != device:
+        bufs[key] = buf = torch.empty(rows, dtype=dtype, device=device)
+    return buf
+
+def seed_prev(backend, slots, mamba_cache_params, cache_steps: int) -> None:
+    """Publish a freshly written temporal state to the handoff scratch rows."""
+    if not enabled():
+        return
+    temporal = mamba_cache_params.temporal
+    inter = getattr(mamba_cache_params, "intermediate_ssm", None)
+    if inter is None or temporal is None:
+        return
+    st = state(backend)
+    prev_buf = _prev_buf(backend, slots, int(temporal.shape[0]) + SLOT_BUFFER_SLACK)
+    s64, n = _slot_ids(slots), int(slots.numel())
+    flat = inter.reshape(-1, *inter.shape[2:])
+    # One persistent scratch: a per-chunk temporary fragments the allocator.
+    sc = st.seed_scratch
+    if (sc is None or int(sc.shape[0]) < n
+            or tuple(sc.shape[1:]) != tuple(temporal.shape[1:])
+            or sc.dtype != temporal.dtype):
+        st.seed_scratch = sc = torch.empty(
+            (max(n, SEED_SCRATCH_MIN_ROWS), *temporal.shape[1:]),
+            dtype=temporal.dtype, device=temporal.device)
+    torch.index_select(temporal, 0, s64, out=sc[:n])
+    flat.index_copy_(0, s64 * int(cache_steps), sc[:n])
+    prev_buf.index_fill_(0, s64, 0)
+
+def begin_verify_step(backend, layer_id: int) -> None:
+    """Rotate the per-step cache at the start of a verify forward."""
+    st, lid = state(backend), int(layer_id)
+    if lid <= st.step_lid:
+        st.step_gen += 1
+        st.step_cache = None
+    st.step_lid = lid
+
+def shared_step_values(backend, slots, mamba_cache_params, cache_steps: int,
+                       T: int) -> dict:
+    """Per-batch tensors every layer of this verify forward uses unchanged."""
+    st = state(backend)
+    n = int(slots.numel())
+    buf = _prev_buf(backend, slots,
+                    int(mamba_cache_params.temporal.shape[0]) + SLOT_BUFFER_SLACK)
+    rows = int(buf.numel())
+    sh = st.step_cache
+    if (sh is None or sh["gen"] != st.step_gen
+            or sh["ptr"] != int(slots.data_ptr()) or sh["n"] != n):
+        dev = slots.device
+        s64 = _buf(st, "s64_buf", rows, rows, torch.int64, dev)[:n]
+        s64.copy_(slots)
+        torch.clamp_min(s64, 0, out=s64)
+        prev32 = _buf(st, "prev32_buf", rows, rows, torch.int32, dev)[:n]
+        torch.index_select(buf, 0, s64, out=prev32)
+        store = _buf(st, "store_buf", rows, rows, torch.int32, dev)[:n]
+        store.fill_(int(T) - 1)
+        sh = {"gen": st.step_gen, "ptr": int(slots.data_ptr()), "n": n,
+              "s64": s64, "prev": prev32, "store": store, "rows": {}}
+        st.step_cache = sh
+    ent = sh["rows"].get(int(cache_steps))
+    if ent is None:
+        ent = {"store_row": _step_store_row(st, sh, cache_steps)}
+        ent["h0"] = _step_h0(st, sh["s64"], sh["prev"], cache_steps)
+        sh["rows"][int(cache_steps)] = ent
+    return sh
+
+def _step_store_row(st, sh, cache_steps: int) -> torch.Tensor:
+    n, rows = sh["n"], int(sh["prev"].numel())
+    dev = sh["prev"].device
+    tmp = _buf(st, "tmp32_buf", rows, rows, torch.int32, dev)[:n]
+    row = _buf(st, "row_bufs", (int(cache_steps), rows), rows,
+               torch.int32, dev)[:n]
+    torch.add(sh["prev"], 1, out=tmp)
+    torch.remainder(tmp, int(cache_steps), out=row)
+    return row
+
+def _step_h0(st, s64, prev32, cache_steps: int) -> torch.Tensor:
+    n, dev = int(s64.numel()), s64.device
+    prev64 = _buf(st, "prev64_buf", n, n, torch.int64, dev)[:n]
+    prev64.copy_(prev32)
+    torch.clamp_min(prev64, 0, out=prev64)
+    tmp = _buf(st, "tmp64_buf", n, n, torch.int64, dev)[:n]
+    torch.mul(s64, int(cache_steps), out=tmp)
+    torch.add(tmp, prev64, out=tmp)
+    h0 = _buf(st, "h0_bufs", (int(cache_steps), n), n, torch.int32, dev)[:n]
+    h0.copy_(tmp)
+    return h0
+
+def step_h0(backend, slots, cache_steps: int):
+    """The cached h0 rows for this batch, or None when this forward did not"""
+    st = state(backend)
+    sh = st.step_cache
+    if (sh is None or sh["gen"] != st.step_gen
+            or sh["ptr"] != int(slots.data_ptr()) or sh["n"] != int(slots.numel())):
+        return None
+    ent = sh["rows"].get(int(cache_steps))
+    return None if ent is None else ent["h0"]
+
+def h0_rows(slots: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.Tensor:
+    rows = _slot_ids(slots) * row_stride + prev.to(torch.int64).clamp_min(0)
+    return rows.to(torch.int32)
+
+def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) -> bool:
+    """Advance the committed row; no state copy."""
+    if not enabled():
+        return False
+    st = state(backend)
+    if st.prev is None or st.commit_failed:
+        return False
+    try:
+        idx, last = state_indices.to(torch.int64), last_correct.to(torch.int64)
+        # Rotate here: the forward keeps the capture batch's length, this sees live.
+        prev = st.prev.index_select(0, idx.clamp_min(0)).to(torch.int64)
+        keep = torch.where(last < T - 1, last,
+                           torch.remainder(prev + 1, cache_steps)).to(torch.int32)
+        # idx[valid] sizes its output on the device and stalls the host; route
+        # invalid slots to the buffer's discard row instead.
+        put = torch.where(idx >= 0, idx, torch.full_like(idx, st.prev.numel() - 1))
+        st.prev.index_copy_(0, put, keep)
+    except Exception:  # noqa: BLE001 - the upstream scatter is always correct
+        st.commit_failed = True
+        logger.warning("[gdn-bplus] commit_prev failed; falling back to scatter",
+                       exc_info=True)
+        return False
+    if not st.logged:
+        st.logged = True
+        logger.info("[gdn-bplus] handoff commit active (scatter skipped)")
+    return True
 
 def _fused_qkv_view(q, k, v, n: int, T: int):
     """[n, T, W] view over one fused q|k|v buffer, or None when they are apart."""
@@ -193,9 +350,8 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
             _drop_layer_entry(st, lid)
 
 def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache,
-                cache_indices, intermediate_indices, mamba_cache, ss_states,
-                query_start_loc):
-    """Write this step's full snapshot row and hand the truncated rows to ``stash``.
+                cache_indices, mamba_cache, query_start_loc):
+    """Write this step's snapshot row and hand the truncated rows to ``stash``.
 
     Returns the kernel output, or None when the chain declined.
     """
@@ -203,16 +359,22 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
         return None
     flat = snap_cache.reshape(-1, *snap_cache.shape[2:])
     st = state(backend)
-    # Default verify rows are batch positions: the snapshot lands in the
-    # intermediate buffer, and the commit replays truncated slots into the
-    # slot-indexed temporal state.
-    snap_idx = intermediate_indices[:n].to(torch.int32)
+    # Slot-indexed scratch rows give the committed row a stable address, so
+    # commit only moves an int32 pointer; stride is the allocated cache_steps,
+    # not the runtime draft-token count.
+    cache_steps = int(snap_cache.shape[1])
+    snap_idx = cache_indices[:n].to(torch.int32)
+    begin_verify_step(backend, layer.layer_id)
+    sh = shared_step_values(backend, snap_idx, mamba_cache, cache_steps,
+                            int(draft_token_num))
+    row = sh["rows"][cache_steps]
     st.snap_idx = snap_idx
     out = q.new_empty((1, q.shape[1], v.shape[2], v.shape[3]))
     gdn_recurrent.verify(
         q, k, v, a, b, layer.A_log, layer.dt_bias, query_start_loc[: n + 1],
-        ss_states, cache_indices[:n].to(torch.int32), flat, snap_idx,
-        int(snap_cache.shape[1]), int(draft_token_num), out)
+        flat, row["h0"], flat, snap_idx, cache_steps,
+        int(draft_token_num), out,
+        prev_step=st.prev, store=sh["store"], store_row=row["store_row"])
     return out
 
 def _warn_layer(lid, exc, st) -> None:
@@ -299,7 +461,7 @@ def _replay_rows(st, rows, n, D, m, h0_rows, store_step, snap32) -> bool:
     return True
 
 
-def compensate_from_stash(backend, state_indices, last_correct,
+def compensate_plain_from_stash(backend, state_indices, last_correct,
                           mamba_track_indices=None,
                           mamba_steps_to_track=None) -> bool:
     """Replay the stash for the truncated slots, before the upstream scatter.
@@ -372,6 +534,87 @@ def compensate_from_stash(backend, state_indices, last_correct,
     except Exception:  # noqa: BLE001
         logger.warning("[gdn-bplus] compensate_from_stash failed", exc_info=True)
         return False
+
+def handoff_ready(backend, rows) -> bool:
+    """Whether this commit is the handoff pointer move, not the plain scatter."""
+    st = state(backend)
+    return (enabled() and rows is not None and bool(st.stash)
+            and getattr(st, "step_ok", True) and st.prev is not None)
+
+
+def compensate_from_stash(backend, rows, last_correct,
+                          mamba_track_indices=None,
+                          mamba_steps_to_track=None,
+                          state_indices=None) -> bool:
+    """Replay the handoff stash for the truncated rows.
+
+    Falls back to the plain slot-indexed replay when the handoff is not active
+    (verify declined, PP stable rows, or no request rows). ``state_indices`` is
+    the plain path's slot id tensor when ``rows`` are request scratch rows.
+    """
+    if not handoff_ready(backend, rows):
+        plain_rows = rows if state_indices is None else state_indices
+        return compensate_plain_from_stash(
+            backend, plain_rows, last_correct, mamba_track_indices,
+            mamba_steps_to_track)
+    st = state(backend)
+    try:
+        # Graph replay skips verify's Python: prefer the live value.
+        T = int(st.live_T or st.capture_T)
+        if T <= 1:
+            return False
+        n = int(rows.shape[0])
+        idx32 = rows[:n].to(torch.int32)
+        # Handoff rows are slot-indexed at this stage, so the live batch
+        # indices address them.
+        snap32 = idx32
+        last32 = last_correct.to(torch.int32)
+        trunc = (idx32 > 0) & (last32 >= 0) & (last32 < T - 1)
+        store_step = torch.where(trunc, last32, torch.full_like(last32, -1))
+        D, m = T, n * T
+        neg = torch.full_like(idx32, -1)
+        h0_by_stride, prev_now, layer_rows = {}, None, []
+        for lid, ent in st.stash.items():
+            try:
+                layer_cache = ent.layer_cache
+                if layer_cache is None:
+                    layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
+                    ent.layer_cache = layer_cache
+                inter = layer_cache.intermediate_ssm
+                if inter is None:
+                    st.commit_failed = True
+                    continue
+                flat = ent.flat
+                if flat is None:
+                    flat = ent.flat = inter.reshape(-1, *inter.shape[2:])
+                stride = int(inter.shape[1])
+                h0_idx = h0_by_stride.get(stride)
+                if h0_idx is None:
+                    h0_idx = step_h0(backend, idx32, stride)
+                    if h0_idx is None:
+                        if prev_now is None:
+                            prev_now = st.prev.index_select(
+                                0, idx32.to(torch.int64).clamp_min(0)
+                            ).to(torch.int32)
+                        h0_idx = h0_rows(idx32, prev_now, stride)
+                    h0_idx = torch.where(trunc, h0_idx, neg)
+                    h0_by_stride[stride] = h0_idx
+                # Replay into the scratch row, not the persistent slot.
+                layer_rows.append((ent, flat, flat, stride, lid))
+            except Exception as exc:  # noqa: BLE001 - optional path
+                _warn_layer(lid, exc, st)
+        if not layer_rows:
+            return False
+        for stride, h0_idx in h0_by_stride.items():
+            subset = [row for row in layer_rows if row[3] == stride]
+            if not _replay_rows(st, subset, n, D, m, h0_idx, store_step,
+                                snap32):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning("[gdn-bplus] compensate_from_stash failed", exc_info=True)
+        return False
+
 
 def _compensate_multi(st, rows, n, D, m, h0_rows, store_step, snap32) -> bool:
     """One launch covers every layer when their layout matches the table."""

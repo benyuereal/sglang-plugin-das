@@ -348,9 +348,21 @@ def forward_extend(
     hip_out = _verify_attempt(self, layer, forward_batch, mixed_qkv, a, b)
     if hip_out is not None:
         return hip_out
-    return _upstream_forward_extend(
+    core_attn_out = _upstream_forward_extend(
         self, layer, forward_batch, mixed_qkv, a, b, **kwargs
     )
+    # Real prefill only: seeding on the MTP draft extend would copy the whole
+    # state (6 GiB per step) for slots that already have a live handoff row.
+    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    inter = getattr(mamba_cache, "intermediate_ssm", None)
+    if inter is not None and forward_batch.forward_mode.is_extend_without_speculative():
+        gdn_commit.seed_prev(
+            self,
+            self.forward_metadata.mamba_cache_indices,
+            mamba_cache,
+            int(inter.shape[1]),
+        )
+    return core_attn_out
 
 
 class _VerifyPlan(NamedTuple):
@@ -474,7 +486,7 @@ def _verify_from_plan(self, plan, layer, mixed_qkv, a, b):
         _OVERLAY_LOG["done"] = True
         logger.info(
             "GDN overlay verify: SGLANG_GDN_HIP=1 "
-            "(prenorm, B+ plain, conv=HIP); decode/prefill stay on the dispatcher"
+            "(prenorm, B+ handoff, conv=HIP); decode/prefill stay on the dispatcher"
         )
     mixed_qkv = gdn_conv.update_verify(
         mixed_qkv.view(plan.batch_size, plan.draft_token_num, -1).transpose(1, 2),
@@ -502,9 +514,7 @@ def _verify_from_plan(self, plan, layer, mixed_qkv, a, b):
         n=plan.batch_size,
         snap_cache=plan.intermediate_state_cache,
         cache_indices=plan.cache_indices,
-        intermediate_indices=plan.intermediate_indices,
         mamba_cache=plan.mamba_cache,
-        ss_states=plan.ssm_states,
         query_start_loc=plan.query_start_loc,
     )
     if out is not None:
