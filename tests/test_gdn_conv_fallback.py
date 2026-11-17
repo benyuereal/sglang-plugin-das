@@ -29,7 +29,7 @@ class ConvUpdateFallbackTests(unittest.TestCase):
         self.kwargs = {"conv_state_indices": torch.zeros(1, dtype=torch.int32)}
 
     def _call(self, *, use_hcu=False, enabled=False, hip=None,
-              required=False):
+              verify=False):
         """Run update() with lightop and both upstream updates stubbed."""
 
         def hcu(*args, **kwargs):
@@ -58,7 +58,7 @@ class ConvUpdateFallbackTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        run = gdn_conv.update_required if required else gdn_conv.update
+        run = gdn_conv.update_verify if verify else gdn_conv.update
         return run(self.x, None, None, None, "silu", **self.kwargs)
 
     def test_lightop_off_runs_triton(self):
@@ -94,13 +94,22 @@ class ConvUpdateFallbackTests(unittest.TestCase):
         self.assertEqual(self.calls, ["lightop", "hcu"])
         self.assertIn("kernel load failed", self.logs[0])
 
-    def test_a_decline_in_the_verify_path_raises(self):
-        with self.assertRaisesRegex(RuntimeError, "HIP conv update"):
-            self._call(enabled=True, use_hcu=True, hip=None, required=True)
+    def test_a_decline_in_the_verify_path_uses_triton(self):
+        self.assertEqual(
+            self._call(enabled=True, use_hcu=True, hip=None, verify=True),
+            "triton")
+        self.assertEqual(self.calls, ["lightop", "triton"])
+        self.assertIn("fell back to Triton", self.logs[0])
 
-    def test_required_without_the_switch_raises(self):
-        with self.assertRaisesRegex(RuntimeError, "lightop is off"):
-            self._call(enabled=False, required=True)
+    def test_verify_without_the_overlay_uses_triton(self):
+        self.assertEqual(self._call(enabled=False, verify=True), "triton")
+        self.assertEqual(self.calls, ["triton"])
+
+    def test_verify_without_any_updater_raises(self):
+        gdn_conv.configure(triton=None, hcu=None, log=self.logs.append)
+        with mock.patch.object(gdn_recurrent, "overlay_enabled", lambda: False):
+            with self.assertRaisesRegex(RuntimeError, "no conv updater"):
+                gdn_conv.update_verify(self.x, None, None)
 
     def test_update_before_configure_is_a_programming_error(self):
         gdn_conv.configure(triton=None, hcu=None,

@@ -13,6 +13,10 @@ from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
 
 
 class OverlayGateTest(unittest.TestCase):
+    def setUp(self):
+        gdn_recurrent._legacy_warned = False
+        gdn_recurrent._switch_cache.clear()
+
     def gate(self, value, *, lightop=True, set_var=True):
         env = {gdn_recurrent._SWITCH_ENV: value} if set_var else {}
         with mock.patch.dict(os.environ, env, clear=True), \
@@ -36,6 +40,27 @@ class OverlayGateTest(unittest.TestCase):
 
     def test_without_lightop_the_overlay_stays_off(self):
         self.assertFalse(self.gate("1", lightop=False))
+
+    def test_legacy_names_warn_once(self):
+        with mock.patch.dict(os.environ, {
+            gdn_recurrent._SWITCH_ENV: "1",
+            "SGLANG_GDN_HIP_BPLUS": "1",
+        }, clear=True), mock.patch.object(
+            gdn_recurrent.logger, "warning") as warning, \
+                mock.patch.object(gdn_recurrent, "_gdn", object()):
+            self.assertTrue(gdn_recurrent.overlay_enabled())
+            gdn_recurrent.overlay_enabled()
+        self.assertEqual(warning.call_count, 1)
+        self.assertIn("SGLANG_GDN_HIP_BPLUS", warning.call_args[0][1])
+
+    def test_an_unknown_value_warns_and_stays_on(self):
+        with mock.patch.dict(os.environ, {
+            gdn_recurrent._SWITCH_ENV: "conv",
+        }, clear=True), mock.patch.object(
+            gdn_recurrent.logger, "warning") as warning, \
+                mock.patch.object(gdn_recurrent, "_gdn", object()):
+            self.assertTrue(gdn_recurrent.overlay_enabled())
+        self.assertTrue(any("unknown" in str(call) for call in warning.call_args_list))
 
     def test_the_commit_chain_follows_the_gate(self):
         with mock.patch.dict(os.environ, {gdn_recurrent._SWITCH_ENV: "1"}), \

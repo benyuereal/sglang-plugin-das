@@ -25,15 +25,36 @@ def enabled() -> bool:
 
 
 _SWITCH_ENV = "SGLANG_GDN_HIP"
+_ON = frozenset({"1", "all", "on", "true", "yes"})
 _OFF = frozenset({"", "0", "off", "none", "false", "no"})
+_LEGACY_PREFIX = "SGLANG_GDN_HIP_"
 _switch_cache: dict[str, bool] = {}
+_legacy_warned = False
+
+
+def _warn_legacy() -> None:
+    global _legacy_warned
+    if _legacy_warned:
+        return
+    _legacy_warned = True
+    legacy = sorted(
+        name for name in os.environ
+        if name.startswith(_LEGACY_PREFIX) and name != _SWITCH_ENV
+    )
+    if legacy:
+        logger.warning("[gdn] %s are ignored; set %s=1 instead",
+                       ", ".join(legacy), _SWITCH_ENV)
 
 
 def _switched_on() -> bool:
+    _warn_legacy()
     value = os.environ.get(_SWITCH_ENV, "").strip().lower()
     result = _switch_cache.get(value)
     if result is None:
         result = _switch_cache[value] = value not in _OFF
+        if value not in _ON and value not in _OFF:
+            logger.warning("[gdn] unknown %s=%r; treating it as on",
+                           _SWITCH_ENV, value)
     return result
 
 

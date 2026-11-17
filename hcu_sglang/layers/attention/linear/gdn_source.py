@@ -476,7 +476,7 @@ def _verify_from_plan(self, plan, layer, mixed_qkv, a, b):
             "GDN overlay verify: SGLANG_GDN_HIP=1 "
             "(prenorm, B+ plain, conv=HIP); decode/prefill stay on the dispatcher"
         )
-    mixed_qkv = gdn_conv.update_required(
+    mixed_qkv = gdn_conv.update_verify(
         mixed_qkv.view(plan.batch_size, plan.draft_token_num, -1).transpose(1, 2),
         plan.conv_states,
         layer.conv_weights,

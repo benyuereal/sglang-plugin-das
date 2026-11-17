@@ -1829,7 +1829,11 @@ class _HybridMethods:
         linear = self.linear_attn_backend
 
         gdn_commit.compensate_from_stash(
-            linear, state_indices_tensor, last_correct_step_indices
+            linear,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
         )
         # The stash replay only rewrites the truncated slots; the upstream
         # scatter still publishes the accepted state for every slot.

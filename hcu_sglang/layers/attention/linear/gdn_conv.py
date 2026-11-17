@@ -4,9 +4,9 @@
 """causal-conv1d update dispatch for GDN decode and verify.
 
 ``update`` is the decode path: try lightop's HIP conv, fall back to the
-upstream update on a decline or failure. ``update_required`` is the verify
-path: verify passes intermediate-window arguments the upstream update does not
-accept, so a decline is an error instead of a fallback. This seam imports
+upstream update on a decline or failure. ``update_verify`` is the verify
+path: its intermediate-window arguments rule out the HCU twin, so a decline
+falls back to the Triton update, which accepts them. This seam imports
 neither sglang nor lightop eagerly, so the contract is testable without a
 device.
 """
@@ -20,7 +20,7 @@ from hcu_sglang.layers.attention.linear import gdn_recurrent
 logger = logging.getLogger(__name__)
 
 _state = {"triton": None, "hcu": None, "log": logger.info,
-          "logged": False, "last": ""}
+          "logged": False, "verify_logged": False, "last": ""}
 
 
 def configure(*, triton, hcu=None, log=None):
@@ -65,12 +65,24 @@ def update(x, conv_state, weight, bias=None, activation=None, **kwargs):
     return updater(x, conv_state, weight, bias, activation, **kwargs)
 
 
-def update_required(x, conv_state, weight, bias=None, activation=None,
-                    **kwargs):
-    """The HIP conv update; verify cannot use the upstream signature."""
+def update_verify(x, conv_state, weight, bias=None, activation=None, **kwargs):
+    """The HIP conv update, or the Triton one that accepts the window args.
+
+    The HCU twin's signature has no intermediate-window parameters, so verify
+    cannot use the decode fallback; the Triton update can take them.
+    """
     out = _attempt(x, conv_state, weight, bias, activation, kwargs)
     if out is not None:
         return out
-    raise RuntimeError(
-        f"GDN verify needs the HIP conv update ({_state['last'] or 'declined'})"
-    )
+    updater = _state["triton"]
+    if updater is None:
+        raise RuntimeError(
+            f"GDN verify has no conv updater ({_state['last'] or 'declined'})"
+        )
+    if not _state["verify_logged"]:
+        _state["verify_logged"] = True
+        _state["log"](
+            "SGLANG_GDN_HIP verify conv fell back to Triton "
+            f"({_state['last'] or 'declined'})"
+        )
+    return updater(x, conv_state, weight, bias, activation, **kwargs)
