@@ -14,7 +14,6 @@ import sglang.srt.layers.attention.linear.gdn_backend as upstream
 from hcu_sglang.layers.attention.linear import (
     gdn_commit,
     gdn_recurrent,
-    gdn_switches as switches,
 )
 from hcu_sglang.utils.detection import is_hcu
 from sglang.srt.utils import get_bool_env_var
@@ -23,10 +22,21 @@ globals().update({name: value for name, value in vars(upstream).items()
                   if not name.startswith("__")})
 _is_hcu = is_hcu()
 logger = logging.getLogger(__name__)
-# Keep the original in a tuple: the hook registry propagates its patch to every
-# module attribute that *is* the original function, and a direct alias would be
-# rewritten to the wrapper -- calling it would recurse into this file.
-_UPSTREAM_FORWARD_EXTEND = (upstream.GDNAttnBackend.forward_extend,)
+_GDN_BACKEND_MODULE = "sglang.srt.layers.attention.linear.gdn_backend"
+# Resolve lazily through the hook registry: gdn_source may be imported after the
+# REPLACE hooks are installed, when GDNAttnBackend.forward_extend is already the
+# wrapper. A module-level alias would capture that wrapper and recurse.
+_UPSTREAM_FORWARD_EXTEND = []
+
+
+def _upstream_forward_extend(self, *args, **kwargs):
+    if not _UPSTREAM_FORWARD_EXTEND:
+        from hcu_sglang.utils.module_patch import get_original_attr
+
+        _UPSTREAM_FORWARD_EXTEND.append(
+            get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
+        )
+    return _UPSTREAM_FORWARD_EXTEND[0](self, *args, **kwargs)
 _use_hcu_causal_conv1d = False
 if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
     try:
@@ -46,7 +56,6 @@ if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
 from hcu_sglang.layers.attention.linear import gdn_conv
 
 gdn_conv.configure(
-    is_hcu=_is_hcu,
     triton=causal_conv1d_update,
     hcu=causal_conv1d_update_hcu if _use_hcu_causal_conv1d else None,
     log=rank0_log,
@@ -325,10 +334,6 @@ def _convolve_prefill(
 _HIP_LOG = {"done": False}
 _OVERLAY_LOG = {"done": False}
 
-def _overlay_enabled() -> bool:
-    """The binary switch plus the operator library it needs."""
-    return _is_hcu and switches.enabled() and gdn_recurrent.enabled()
-
 def forward_extend(
     self,
     layer: RadixLinearAttention,
@@ -339,47 +344,52 @@ def forward_extend(
     **kwargs,
 ):
     """Prefill stays upstream; target verify takes the B+/HIP entries."""
-    hip_out = _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b)
+    hip_out = _verify_attempt(self, layer, forward_batch, mixed_qkv, a, b)
     if hip_out is not None:
         return hip_out
-    return _UPSTREAM_FORWARD_EXTEND[0](
+    return _upstream_forward_extend(
         self, layer, forward_batch, mixed_qkv, a, b, **kwargs
     )
 
 
-def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
-    """The overlaid verify result, or None when this forward is not ours."""
+class _VerifyPlan(NamedTuple):
+    """The per-forward shape the overlay needs, resolved once per layer."""
+
+    seq_len: int
+    draft_token_num: int
+    batch_size: int
+    meta: object
+    query_start_loc: torch.Tensor
+    cache_indices: torch.Tensor
+    mamba_cache: object
+    conv_states: torch.Tensor
+    ssm_states: torch.Tensor
+    intermediate_state_cache: torch.Tensor
+    intermediate_indices: torch.Tensor
+
+
+def _verify_plan(self, layer, forward_batch, mixed_qkv):
+    """The runtime shape of our verify, or None when this forward is not ours."""
     if not forward_batch.forward_mode.is_target_verify():
         return None
-    if not _overlay_enabled():
+    if not gdn_recurrent.overlay_enabled():
         return None
     if self.mis_metadata is not None or not isinstance(mixed_qkv, torch.Tensor):
         return None
     if mixed_qkv.shape[0] == 0:
         return None
     mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-    if mamba_cache.replayssm_d is not None or mamba_cache.replayssm_rawv is not None:
+    if (mamba_cache.replayssm_d is not None
+            or mamba_cache.replayssm_rawv is not None):
         return None
-    if not _OVERLAY_LOG["done"]:
-        _OVERLAY_LOG["done"] = True
-        logger.info(
-            "GDN overlay verify: SGLANG_GDN_HIP=1 "
-            "(prenorm, B+ plain, conv=HIP); decode/prefill stay on the dispatcher"
-        )
-    seq_len = int(mixed_qkv.shape[0])
-    draft_token_num = int(forward_batch.spec_info.draft_token_num)
-    batch_size = seq_len // draft_token_num
-    meta = self.forward_metadata
-    query_start_loc = meta.query_start_loc
-    cache_indices = meta.mamba_cache_indices
-    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-    conv_states = mamba_cache.conv[0]
-    ssm_states = mamba_cache.temporal
     intermediate_state_cache = mamba_cache.intermediate_ssm
     assert intermediate_state_cache is not None, (
         "recurrent target_verify requires intermediate_ssm, "
         "which is not allocated under --enable-linear-replayssm-spec"
     )
+    meta = self.forward_metadata
+    cache_indices = meta.mamba_cache_indices
+    query_start_loc = meta.query_start_loc
     # The mask is only read by the PP stable-rows path; computing it per
     # layer otherwise costs one elementwise launch per GDN layer per step.
     intermediate_indices = select_verify_intermediate_state_indices(
@@ -390,28 +400,28 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         else None,
         self.req_to_token_pool.size,
     )
-    mixed_qkv = conv_update(
-        mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2),
-        conv_states,
-        layer.conv_weights,
-        layer.bias,
-        layer.activation,
-        conv_state_indices=cache_indices[:batch_size],
-        intermediate_conv_window=mamba_cache.intermediate_conv_window[0],
-        intermediate_state_indices=intermediate_indices[:batch_size],
-        retrieve_next_token=meta.retrieve_next_token,
-        retrieve_next_sibling=meta.retrieve_next_sibling,
-        retrieve_parent_token=meta.retrieve_parent_token,
-        required=True,
-    ).transpose(1, 2).view(seq_len, -1)
+    seq_len = int(mixed_qkv.shape[0])
+    draft_token_num = int(forward_batch.spec_info.draft_token_num)
+    return _VerifyPlan(
+        seq_len=seq_len,
+        draft_token_num=draft_token_num,
+        batch_size=seq_len // draft_token_num,
+        meta=meta,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        mamba_cache=mamba_cache,
+        conv_states=mamba_cache.conv[0],
+        ssm_states=mamba_cache.temporal,
+        intermediate_state_cache=intermediate_state_cache,
+        intermediate_indices=intermediate_indices,
+    )
 
-    qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-    if (
-        (is_cuda() or is_hip() or is_xpu())
-        and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-        and not self._use_strided_target_verify_qkv
-    ):
-        query, key, value = fused_qkv_split_gdn_prefill(
+
+def _split_verify_qkv(self, mixed_qkv, layer, seq_len):
+    """The fused split when the head layout allows it, torch.split otherwise."""
+    if (layer.q_dim + layer.k_dim + layer.v_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and not self._use_strided_target_verify_qkv):
+        return fused_qkv_split_gdn_prefill(
             mixed_qkv,
             layer.num_q_heads,
             layer.num_k_heads,
@@ -420,40 +430,24 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
             layer.head_k_dim,
             layer.head_v_dim,
         )
-    else:
-        query, key, value = torch.split(
-            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
-        )
-        query = query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim)
-        key = key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
-        value = value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
-
-    hip_out = gdn_commit.verify_step(
-        backend=self,
-        layer=layer,
-        q=query,
-        k=key,
-        v=value,
-        a=a,
-        b=b,
-        draft_token_num=draft_token_num,
-        n=batch_size,
-        snap_cache=intermediate_state_cache,
-        cache_indices=cache_indices,
-        intermediate_indices=intermediate_indices,
-        mamba_cache=mamba_cache,
-        ss_states=ssm_states,
-        query_start_loc=query_start_loc,
+    query, key, value = torch.split(
+        mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
     )
-    if hip_out is not None:
-        return hip_out
+    return (
+        query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim),
+        key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim),
+        value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
+    )
+
+
+def _kernel_verify(plan, layer, query, key, value, a, b):
+    """The full-snapshot kernel, used when the B+ commit declines."""
     if not _HIP_LOG["done"]:
         rank0_log("GDN HIP verify fallback: full-snapshot kernel")
         _HIP_LOG["done"] = True
-    flat = intermediate_state_cache.reshape(
-        -1, *intermediate_state_cache.shape[2:]
-    )
-    hip_out = query.new_empty((1, query.shape[1], value.shape[2], value.shape[3]))
+    cache = plan.intermediate_state_cache
+    flat = cache.reshape(-1, *cache.shape[2:])
+    out = query.new_empty((1, query.shape[1], value.shape[2], value.shape[3]))
     gdn_recurrent.verify_full(
         query,
         key,
@@ -462,13 +456,64 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         b,
         layer.A_log,
         layer.dt_bias,
-        query_start_loc[: batch_size + 1],
-        ssm_states,
-        cache_indices[:batch_size].to(torch.int32),
+        plan.query_start_loc[: plan.batch_size + 1],
+        plan.ssm_states,
+        plan.cache_indices[: plan.batch_size].to(torch.int32),
         flat,
-        intermediate_indices[:batch_size].to(torch.int32),
-        int(intermediate_state_cache.shape[1]),
-        draft_token_num,
-        hip_out,
+        plan.intermediate_indices[: plan.batch_size].to(torch.int32),
+        int(cache.shape[1]),
+        plan.draft_token_num,
+        out,
     )
-    return hip_out
+    return out
+
+
+def _verify_from_plan(self, plan, layer, mixed_qkv, a, b):
+    if not _OVERLAY_LOG["done"]:
+        _OVERLAY_LOG["done"] = True
+        logger.info(
+            "GDN overlay verify: SGLANG_GDN_HIP=1 "
+            "(prenorm, B+ plain, conv=HIP); decode/prefill stay on the dispatcher"
+        )
+    mixed_qkv = gdn_conv.update_required(
+        mixed_qkv.view(plan.batch_size, plan.draft_token_num, -1).transpose(1, 2),
+        plan.conv_states,
+        layer.conv_weights,
+        layer.bias,
+        layer.activation,
+        conv_state_indices=plan.cache_indices[: plan.batch_size],
+        intermediate_conv_window=plan.mamba_cache.intermediate_conv_window[0],
+        intermediate_state_indices=plan.intermediate_indices[: plan.batch_size],
+        retrieve_next_token=plan.meta.retrieve_next_token,
+        retrieve_next_sibling=plan.meta.retrieve_next_sibling,
+        retrieve_parent_token=plan.meta.retrieve_parent_token,
+    ).transpose(1, 2).view(plan.seq_len, -1)
+    query, key, value = _split_verify_qkv(self, mixed_qkv, layer, plan.seq_len)
+    out = gdn_commit.verify_step(
+        backend=self,
+        layer=layer,
+        q=query,
+        k=key,
+        v=value,
+        a=a,
+        b=b,
+        draft_token_num=plan.draft_token_num,
+        n=plan.batch_size,
+        snap_cache=plan.intermediate_state_cache,
+        cache_indices=plan.cache_indices,
+        intermediate_indices=plan.intermediate_indices,
+        mamba_cache=plan.mamba_cache,
+        ss_states=plan.ssm_states,
+        query_start_loc=plan.query_start_loc,
+    )
+    if out is not None:
+        return out
+    return _kernel_verify(plan, layer, query, key, value, a, b)
+
+
+def _verify_attempt(self, layer, forward_batch, mixed_qkv, a, b):
+    """The overlaid verify result, or None when this forward is not ours."""
+    plan = _verify_plan(self, layer, forward_batch, mixed_qkv)
+    if plan is None:
+        return None
+    return _verify_from_plan(self, plan, layer, mixed_qkv, a, b)

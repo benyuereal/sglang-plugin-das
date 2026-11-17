@@ -7,6 +7,7 @@ Triton dispatcher path.
 """
 
 import logging
+import os
 
 import torch
 
@@ -18,15 +19,27 @@ except Exception:  # noqa: BLE001 - the backend is optional
 logger = logging.getLogger(__name__)
 
 
-def _lib():
-    if _gdn is None:
-        raise RuntimeError("lightop.gdn is not installed")
-    return _gdn
-
-
 def enabled() -> bool:
     """Whether the operator library that serves these kernels is importable."""
     return _gdn is not None
+
+
+_SWITCH_ENV = "SGLANG_GDN_HIP"
+_OFF = frozenset({"", "0", "off", "none", "false", "no"})
+_switch_cache: dict[str, bool] = {}
+
+
+def _switched_on() -> bool:
+    value = os.environ.get(_SWITCH_ENV, "").strip().lower()
+    result = _switch_cache.get(value)
+    if result is None:
+        result = _switch_cache[value] = value not in _OFF
+    return result
+
+
+def overlay_enabled() -> bool:
+    """The operator asked for the GDN overlay and lightop can serve it."""
+    return _switched_on() and enabled()
 
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
@@ -44,7 +57,7 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
             safe = snap_idx.to(torch.int64).clamp(0, int(prev_step.numel()) - 1)
             prev = prev_step.index_select(0, safe).to(torch.int32)
             store_row = torch.remainder(prev + 1, int(cache_steps)).to(torch.int32)
-    return _lib().gdn_verify(
+    return _gdn.gdn_verify(
         q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
         snap_flat, snap_idx, cache_steps, draft_token_num, o,
         prev_step=prev_step, store=store, store_row=store_row,
@@ -56,7 +69,7 @@ def verify_full(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states,
                 cache_indices, snap_flat, snap_idx, cache_steps,
                 draft_token_num, o):
     """Full-snapshot entry, for the A/B only: same kernel and inputs, every step."""
-    return _lib().gdn_verify_full(
+    return _gdn.gdn_verify_full(
         q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
         snap_flat, snap_idx, cache_steps, draft_token_num, o,
     )
@@ -66,7 +79,7 @@ def compensate(q, k, v, a, b, A_log, dt_bias, ssm_states, h0_rows,
                snap_flat, snap_idx, cache_steps, store_step, n_seq,
                tok_per_seq, o):
     """Replay state only (no o); slots with h0_rows < 0 exit immediately."""
-    return _lib().gdn_compensate(
+    return _gdn.gdn_compensate(
         q, k, v, a, b, A_log, dt_bias, ssm_states, h0_rows, snap_flat,
         snap_idx, cache_steps, store_step, n_seq, tok_per_seq, o,
     )
@@ -79,7 +92,7 @@ def has_multi() -> bool:
 def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
                      n_seq, tok_per_seq, hv, h, kdim, vdim):
     """One-launch state replay for every layer in ``layer_ptrs``."""
-    return _lib().gdn_compensate_multi(
+    return _gdn.gdn_compensate_multi(
         layer_ptrs, h0_indices, snap_idx, cache_steps, store_step, n_seq,
         tok_per_seq, hv, h, kdim, vdim,
     )
@@ -87,7 +100,7 @@ def compensate_multi(layer_ptrs, h0_indices, snap_idx, cache_steps, store_step,
 
 def f32(x: torch.Tensor) -> torch.Tensor:
     """Cached fp32 view of A_log/dt_bias for the kernel's float pointers."""
-    return _lib().f32(x)
+    return _gdn.f32(x)
 
 
 _CONV_LAST_REASON = None

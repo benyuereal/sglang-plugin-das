@@ -15,7 +15,6 @@ from typing import NamedTuple
 import torch
 
 from hcu_sglang.layers.attention.linear import gdn_recurrent
-from hcu_sglang.layers.attention.linear import gdn_switches as switches
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +32,26 @@ class HeadDims(NamedTuple):
         return cls(q.shape[2], q.shape[3], k.shape[2], k.shape[3],
                    v.shape[2], v.shape[3])
 
-    @classmethod
-    def from_entry(cls, ent):
-        dims = ent["dims"]
-        return dims if isinstance(dims, HeadDims) else cls(*dims)
+class StashEntry:
+    """One layer's verify scratch; the buffers are reused across forwards."""
+
+    __slots__ = ("rows", "dims", "qkv", "q", "k", "v", "a", "b", "out",
+                 "A_log", "dt_bias", "layer_cache", "flat")
+
+    def __init__(self, *, rows, dims, qkv, q, k, v, a, b, out):
+        self.rows = rows
+        self.dims = dims
+        self.qkv = qkv
+        self.q = q
+        self.k = k
+        self.v = v
+        self.a = a
+        self.b = b
+        self.out = out
+        self.A_log = None
+        self.dt_bias = None
+        self.layer_cache = None
+        self.flat = None
 
 class CommitState:
     """Per-backend scratch, kept off the nn.Module so plain attributes work."""
@@ -60,7 +75,7 @@ def state(backend) -> CommitState:
     return st
 
 def enabled() -> bool:
-    return switches.enabled()
+    return gdn_recurrent.overlay_enabled()
 
 def _head_dims(*tensors) -> list[int]:
     return [int(t.shape[2]) * int(t.shape[3]) for t in tensors]
@@ -94,20 +109,21 @@ def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
         return None, 0
     rows, lid = st.max_slots * D, layer.layer_id
     ent = st.stash.get(lid)
-    if ent is None or int(ent["rows"]) < rows:
+    if ent is None or ent.rows < rows:
         st.ml_table = None  # layer pointers move with the reallocation
         dev, dims = q.device, HeadDims.of(q, k, v)
         qd, kd, vd = _head_dims(q, k, v)
         qkv = torch.zeros((rows, qd + kd + vd), dtype=q.dtype, device=dev)
-        ent = {"rows": rows, "dims": dims, "qkv": qkv,
-               "q": qkv[:, :qd], "k": qkv[:, qd:qd + kd], "v": qkv[:, qd + kd:],
-               "a": torch.zeros((rows, a.shape[-1]), dtype=a.dtype, device=dev),
-               "b": torch.zeros((rows, b.shape[-1]), dtype=b.dtype, device=dev),
-               # One output row per layer launch of the compensate kernel.
-               "out": torch.zeros((1, 1, *dims[4:]), dtype=v.dtype, device=dev),
-               "A_log": None, "dt_bias": None}
+        ent = StashEntry(
+            rows=rows, dims=dims, qkv=qkv,
+            q=qkv[:, :qd], k=qkv[:, qd:qd + kd], v=qkv[:, qd + kd:],
+            a=torch.zeros((rows, a.shape[-1]), dtype=a.dtype, device=dev),
+            b=torch.zeros((rows, b.shape[-1]), dtype=b.dtype, device=dev),
+            # One output row per layer launch of the compensate kernel.
+            out=torch.zeros((1, 1, *dims[4:]), dtype=v.dtype, device=dev),
+        )
         st.stash[lid] = ent
-    ent["A_log"], ent["dt_bias"] = layer.A_log, layer.dt_bias
+    ent.A_log, ent.dt_bias = layer.A_log, layer.dt_bias
     return ent, st.max_slots
 
 def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
@@ -124,19 +140,19 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         ent, max_slots = _ensure_layer_entry(backend, layer, q, k, v, a, b, T)
         if ent is None or n > max_slots:
             return False
-        m, a_width, b_width = n * T, ent["a"].shape[-1], ent["b"].shape[-1]
+        m, a_width, b_width = n * T, ent.a.shape[-1], ent.b.shape[-1]
         src = _fused_qkv_view(q, k, v, n, T)
         if src is not None:
-            ent["qkv"][:m].view(n, T, int(ent["qkv"].shape[-1]))[:, :T].copy_(src)
+            ent.qkv[:m].view(n, T, int(ent.qkv.shape[-1]))[:, :T].copy_(src)
         else:
             qd, kd, vd = _head_dims(q, k, v)
             W = qd + kd + vd
-            dest = ent["qkv"][:m].view(n, T, W)
+            dest = ent.qkv[:m].view(n, T, W)
             dest[:, :T, :qd].copy_(q.reshape(n, T, -1))
             dest[:, :T, qd:qd + kd].copy_(k.reshape(n, T, -1))
             dest[:, :T, qd + kd:].copy_(v.reshape(n, T, -1))
-        ent["a"][:m].view(n, T, a_width)[:, :T].copy_(a.reshape(n, T, a_width))
-        ent["b"][:m].view(n, T, b_width)[:, :T].copy_(b.reshape(n, T, b_width))
+        ent.a[:m].view(n, T, a_width)[:, :T].copy_(a.reshape(n, T, a_width))
+        ent.b[:m].view(n, T, b_width)[:, :T].copy_(b.reshape(n, T, b_width))
         return True
     except Exception:  # noqa: BLE001 - never take serving down
         logger.warning("[gdn-bplus] stash failed", exc_info=True)
@@ -164,6 +180,15 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
         ss_states, cache_indices[:n].to(torch.int32), flat, snap_idx,
         int(snap_cache.shape[1]), int(draft_token_num), out)
     return out
+
+def _warn_layer(lid, exc, st) -> None:
+    """One layer's failure is logged and the commit falls back to the scatter."""
+    kind = ("OOM" if isinstance(exc, torch.OutOfMemoryError)
+            else "runtime" if isinstance(exc, RuntimeError) else "error")
+    logger.warning("[gdn-bplus] %s compensate failed for layer %s",
+                   kind, lid, exc_info=True)
+    st.commit_failed = True
+
 
 def compensate_from_stash(backend, state_indices, last_correct) -> bool:
     """Replay the stash for the truncated slots, before the upstream scatter."""
@@ -201,26 +226,24 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
         rows = []
         for lid, ent in st.stash.items():
             try:
-                layer_cache = ent.get("layer_cache")
+                layer_cache = ent.layer_cache
                 if layer_cache is None:
                     layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
-                    ent["layer_cache"] = layer_cache
+                    ent.layer_cache = layer_cache
                 inter = layer_cache.intermediate_ssm
                 if inter is None:
                     st.commit_failed = True
                     continue
-                flat = ent.get("flat")
+                flat = ent.flat
                 if flat is None:
-                    flat = ent["flat"] = inter.reshape(-1, *inter.shape[2:])
+                    flat = ent.flat = inter.reshape(-1, *inter.shape[2:])
                 stride = int(inter.shape[1])
                 # Plain rows are slot-indexed temporal state; the snapshot
                 # rows are the verify's batch positions.
                 rows.append((ent, layer_cache.temporal, flat, h0_plain,
                              stride, lid))
-            except Exception:  # noqa: BLE001 - optional path
-                logger.warning("[gdn-bplus] compensate failed for layer %s",
-                               lid, exc_info=True)
-                st.commit_failed = True
+            except Exception as exc:  # noqa: BLE001 - optional path
+                _warn_layer(lid, exc, st)
         if not rows:
             return False
         if gdn_recurrent.has_multi():
@@ -231,19 +254,17 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 logger.warning("[gdn-bplus] multi compensate failed", exc_info=True)
         for ent, ssm, flat, h0_idx, cache_steps, lid in rows:
             try:
-                dims = HeadDims.from_entry(ent)
+                dims = ent.dims
                 gdn_recurrent.compensate(
-                    ent["q"][:m].view(n, D, *dims[:2]),
-                    ent["k"][:m].view(n, D, *dims[2:4]),
-                    ent["v"][:m].view(n, D, *dims[4:]),
-                    ent["a"][:m].view(n, D, ent["a"].shape[-1]),
-                    ent["b"][:m].view(n, D, ent["b"].shape[-1]),
-                    ent["A_log"], ent["dt_bias"], ssm, h0_idx, flat, snap32,
-                    cache_steps, store_step, n, D, ent["out"])
-            except Exception:  # noqa: BLE001 - optional path
-                logger.warning("[gdn-bplus] compensate failed for layer %s",
-                               lid, exc_info=True)
-                st.commit_failed = True
+                    ent.q[:m].view(n, D, *dims[:2]),
+                    ent.k[:m].view(n, D, *dims[2:4]),
+                    ent.v[:m].view(n, D, *dims[4:]),
+                    ent.a[:m].view(n, D, ent.a.shape[-1]),
+                    ent.b[:m].view(n, D, ent.b.shape[-1]),
+                    ent.A_log, ent.dt_bias, ssm, h0_idx, flat, snap32,
+                    cache_steps, store_step, n, D, ent.out)
+            except Exception as exc:  # noqa: BLE001 - optional path
+                _warn_layer(lid, exc, st)
         return True
     except Exception:  # noqa: BLE001
         logger.warning("[gdn-bplus] compensate_from_stash failed", exc_info=True)
@@ -254,13 +275,13 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     if len(rows) < 2:
         return False
     ent0 = rows[0][0]
-    dims, cache_steps = HeadDims.from_entry(ent0), rows[0][4]
+    dims, cache_steps = ent0.dims, rows[0][4]
     qh, qk, kh, kk, vh, vv = dims
-    views = (ent0["q"][:m].view(n, D, qh, qk),
-             ent0["k"][:m].view(n, D, kh, kk),
-             ent0["v"][:m].view(n, D, vh, vv),
-             ent0["a"][:m].view(n, D, ent0["a"].shape[-1]),
-             ent0["b"][:m].view(n, D, ent0["b"].shape[-1]))
+    views = (ent0.q[:m].view(n, D, qh, qk),
+             ent0.k[:m].view(n, D, kh, kk),
+             ent0.v[:m].view(n, D, vh, vv),
+             ent0.a[:m].view(n, D, ent0.a.shape[-1]),
+             ent0.b[:m].view(n, D, ent0.b.shape[-1]))
     strides = tuple(int(t.stride(1)) for t in views)
     # The table holds raw data_ptrs, so this key is only valid because mamba
     # pools are allocated once, before graph capture; a replaced layer entry
@@ -270,19 +291,19 @@ def _compensate_multi(st, rows, n, D, m, store_step, snap32) -> bool:
     if table is None or st.ml_key != key:
         cells = []
         for ent, ssm, flat, h0_idx, cs, _ in rows:
-            if (HeadDims.from_entry(ent) != dims or cs != cache_steps
-                    or int(ent["q"].stride(0)) != strides[0]
-                    or int(ent["a"].stride(0)) != strides[3]
-                    or int(ent["b"].stride(0)) != strides[4]):
+            if (ent.dims != dims or cs != cache_steps
+                    or int(ent.q.stride(0)) != strides[0]
+                    or int(ent.a.stride(0)) != strides[3]
+                    or int(ent.b.stride(0)) != strides[4]):
                 return False
-            cells.append([ent["q"].data_ptr(), ent["k"].data_ptr(),
-                          ent["v"].data_ptr(), ent["a"].data_ptr(),
-                          ent["b"].data_ptr(),
-                          gdn_recurrent.f32(ent["A_log"]).data_ptr(),
-                          gdn_recurrent.f32(ent["dt_bias"]).data_ptr(),
-                          ssm.data_ptr(), ent["out"].data_ptr(), flat.data_ptr(),
+            cells.append([ent.q.data_ptr(), ent.k.data_ptr(),
+                          ent.v.data_ptr(), ent.a.data_ptr(),
+                          ent.b.data_ptr(),
+                          gdn_recurrent.f32(ent.A_log).data_ptr(),
+                          gdn_recurrent.f32(ent.dt_bias).data_ptr(),
+                          ssm.data_ptr(), ent.out.data_ptr(), flat.data_ptr(),
                           *strides])
-        table = torch.tensor(cells, dtype=torch.int64, device=ent0["q"].device)
+        table = torch.tensor(cells, dtype=torch.int64, device=ent0.q.device)
         st.ml_table, st.ml_key = table, key
     gdn_recurrent.compensate_multi(table, rows[0][3], snap32, cache_steps,
                                    store_step, n, D, vh, qh, kk, vv)

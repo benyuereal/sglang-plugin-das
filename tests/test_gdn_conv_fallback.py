@@ -17,18 +17,18 @@ from unittest import mock
 import torch
 
 from hcu_sglang.layers.attention.linear import gdn_conv, gdn_recurrent
-from hcu_sglang.layers.attention.linear import gdn_switches
 
 
 class ConvUpdateFallbackTests(unittest.TestCase):
     def setUp(self):
-        gdn_conv._logged["done"] = False
+        gdn_conv._state["logged"] = False
+        gdn_conv._state["last"] = ""
         self.calls = []
         self.logs = []
         self.x = torch.zeros(1, 8)
         self.kwargs = {"conv_state_indices": torch.zeros(1, dtype=torch.int32)}
 
-    def _call(self, *, is_hcu=True, use_hcu=False, enabled=False, hip=None,
+    def _call(self, *, use_hcu=False, enabled=False, hip=None,
               required=False):
         """Run update() with lightop and both upstream updates stubbed."""
 
@@ -45,14 +45,12 @@ class ConvUpdateFallbackTests(unittest.TestCase):
             return hip() if callable(hip) else hip
 
         gdn_conv.configure(
-            is_hcu=is_hcu,
             triton=triton,
             hcu=hcu if use_hcu else None,
             log=self.logs.append,
         )
         patches = [
-            mock.patch.object(gdn_switches, "enabled", lambda: enabled),
-            mock.patch.object(gdn_recurrent, "enabled", lambda: True),
+            mock.patch.object(gdn_recurrent, "overlay_enabled", lambda: enabled),
             mock.patch.object(gdn_recurrent, "conv_update", lightop),
             mock.patch.object(gdn_recurrent, "conv_last_reason",
                               lambda: "outside the kernel"),
@@ -60,9 +58,8 @@ class ConvUpdateFallbackTests(unittest.TestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        return gdn_conv.update(
-            self.x, None, None, None, "silu", required=required, **self.kwargs
-        )
+        run = gdn_conv.update_required if required else gdn_conv.update
+        return run(self.x, None, None, None, "silu", **self.kwargs)
 
     def test_lightop_off_runs_triton(self):
         self.assertEqual(self._call(), "triton")
@@ -95,23 +92,18 @@ class ConvUpdateFallbackTests(unittest.TestCase):
 
         self.assertEqual(self._call(enabled=True, use_hcu=True, hip=boom), "hcu")
         self.assertEqual(self.calls, ["lightop", "hcu"])
-        self.assertIn("disabled", self.logs[0])
-
-    def test_non_hcu_host_goes_straight_to_triton(self):
-        self.assertEqual(self._call(is_hcu=False, enabled=True, hip="hip"),
-                         "triton")
-        self.assertEqual(self.calls, ["triton"])
+        self.assertIn("kernel load failed", self.logs[0])
 
     def test_a_decline_in_the_verify_path_raises(self):
         with self.assertRaisesRegex(RuntimeError, "HIP conv update"):
             self._call(enabled=True, use_hcu=True, hip=None, required=True)
 
     def test_required_without_the_switch_raises(self):
-        with self.assertRaisesRegex(RuntimeError, "but it is off"):
+        with self.assertRaisesRegex(RuntimeError, "lightop is off"):
             self._call(enabled=False, required=True)
 
     def test_update_before_configure_is_a_programming_error(self):
-        gdn_conv.configure(is_hcu=False, triton=None, hcu=None,
+        gdn_conv.configure(triton=None, hcu=None,
                            log=self.logs.append)
         with self.assertRaises(RuntimeError):
             gdn_conv.update(self.x, None, None)

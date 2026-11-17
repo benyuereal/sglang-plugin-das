@@ -4,7 +4,7 @@
 """Pin the fork point of the vendored GDN backend.
 
 ``gdn_source.forward_decode`` is sglang's target-decode loop plus the HCU
-deltas; ``forward_extend``/``_verify_kernel_forward``/``_convolve_prefill``
+deltas; ``forward_extend``/``_verify_attempt``/``_convolve_prefill``
 are the plugin's overlay. An upstream sync changes the copied body, and these
 hashes make that change show up as a failing test instead of silent drift.
 
@@ -27,16 +27,16 @@ SOURCE = (Path(__file__).resolve().parents[1]
 PINNED = {
     "forward_decode": "e991f711b27f57102cd81e32a9a6fa945243e73937c5387f1541ff48996d0121",
     "_convolve_prefill": "fe7aaa59df57eea618e8bfd20420ba4a8146360690e4e55f094e91ff7c5ebf00",
-    "forward_extend": "27347cadec00829a9c62dabf1ae20d00350d52dcf29671d0fa4662f8e65fed21",
-    "_verify_kernel_forward": "2c0d7fbb429fb32f1b6431fa9621c9b5ba34361759457d9eda6a1b2bafb59745",
+    "forward_extend": "391c2db862c2bde1a3f7494695470f915d9260a4376001a1ef4bb2629e712a8a",
+    "_verify_attempt": "b60f0930b6de7e68e14283c70db21701eb318037530ebeb5afdc1a6b42938da5",
 }
 
 # The deltas that make the copy ours; losing one of these is the regression.
 MARKERS = {
     "forward_decode": "conv_update(",
     "_convolve_prefill": "initial_states=conv_states",
-    "forward_extend": "_UPSTREAM_FORWARD_EXTEND[0](",
-    "_verify_kernel_forward": "gdn_commit.verify_step(",
+    "forward_extend": "_upstream_forward_extend(",
+    "_verify_attempt": "_verify_plan(",
 }
 
 

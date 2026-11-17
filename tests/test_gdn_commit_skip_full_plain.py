@@ -46,14 +46,18 @@ def _stash_entry():
         temporal=torch.zeros(4),
     )
     qkv = torch.zeros(N * T)
-    return {
-        "layer_cache": layer_cache,
-        "q": qkv, "k": qkv, "v": qkv,
+    entry = gdn_commit.StashEntry(
+        rows=N * T,
+        dims=gdn_commit.HeadDims(qh=1, qk=1, kh=1, kk=1, vh=1, vv=1),
+        qkv=qkv, q=qkv, k=qkv, v=qkv,
         # a/b are per-token 2-D (rows, gate_dim), like the real stash entries.
-        "a": torch.zeros(N * T, 2), "b": torch.zeros(N * T, 2),
-        "A_log": torch.zeros(1), "dt_bias": torch.zeros(1), "out": torch.zeros(1),
-        "dims": gdn_commit.HeadDims(qh=1, qk=1, kh=1, kk=1, vh=1, vv=1),
-    }
+        a=torch.zeros(N * T, 2), b=torch.zeros(N * T, 2),
+        out=torch.zeros(1),
+    )
+    entry.layer_cache = layer_cache
+    entry.A_log = torch.zeros(1)
+    entry.dt_bias = torch.zeros(1)
+    return entry
 
 
 def _backend():
@@ -91,6 +95,7 @@ class PlainCompensateTest(unittest.TestCase):
             recorded["called"] = True
 
         with mock.patch.dict(os.environ, {"SGLANG_GDN_HIP": "1"}), \
+                mock.patch.object(gdn_recurrent, "_gdn", object()), \
                 mock.patch.object(gdn_recurrent, "has_multi", lambda: False), \
                 mock.patch.object(gdn_recurrent, "compensate", fake_compensate):
             ok = gdn_commit.compensate_from_stash(
@@ -132,7 +137,7 @@ class PlainCompensateTest(unittest.TestCase):
             torch.tensor([1, -1], dtype=torch.int64),
         )
         self.assertTrue(ok)
-        temporal = gdn_commit.state(backend).stash[0]["layer_cache"].temporal
+        temporal = gdn_commit.state(backend).stash[0].layer_cache.temporal
         self.assertIs(recorded["ssm"], temporal)
 
     def test_plain_path_rebuilds_the_batch_position_rows(self):

@@ -15,6 +15,7 @@ globals().update({name: value for name, value in vars(H).items() if not name.sta
 from hcu_sglang.utils.detection import is_hcu
 from sglang.srt.utils import get_bool_env_var
 from hcu_sglang.layers.attention.linear.kda_state_indices import prepare_fused_replay_state_indices
+from hcu_sglang.layers.attention.linear import gdn_commit
 
 _hcu_causal_conv1d_fn = None
 _hcu_causal_conv1d_update = None
@@ -1825,7 +1826,6 @@ class _HybridMethods:
             return
 
         linear = self.linear_attn_backend
-        from hcu_sglang.layers.attention.linear import gdn_commit
 
         gdn_commit.compensate_from_stash(
             linear, state_indices_tensor, last_correct_step_indices
@@ -1993,31 +1993,6 @@ def _bind(raw, module, owner, name, decorators):
     return fn
 
 
-def _track_skip_enabled() -> bool:
-    """Radix-off serving never consumes the per-step mamba track checkpoints."""
-    return os.environ.get("SGLANG_GDN_TRACK_SKIP") == "1"
-
-
-def _set_mamba_track_indices(wrapped, batch, track_positions=None):
-    if not _track_skip_enabled():
-        return wrapped(batch, track_positions)
-    if track_positions is None:
-        track_positions = [
-            (
-                req.kv.mamba_next_track_idx
-                if req.kv.mamba_next_track_idx is not None
-                else 0
-            )
-            for req in batch.reqs
-        ]
-    # Keep the host-side list (finished-request bookkeeping reads it) but skip
-    # the pinned tensor + device gather: with --disable-radix-cache nothing
-    # consumes the track checkpoints every step.
-    batch.mamba_track_buffer_indices = list(track_positions)
-    batch.mamba_track_indices = None
-    return None
-
-
 def register_hooks():
     global _REGISTERED
     if not is_hcu():
@@ -2045,10 +2020,4 @@ def register_hooks():
         setattr(MD.Mamba2Metadata, name, _bind(vars(_MetadataMethods)[name], MD, MD.Mamba2Metadata, name, decorators))
     from hcu_sglang import speculative_kda
     speculative_kda.register_hooks()
-    if _track_skip_enabled():
-        HookRegistry.register(
-            "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
-            _set_mamba_track_indices,
-            HookType.AROUND,
-        )
     _REGISTERED = True
