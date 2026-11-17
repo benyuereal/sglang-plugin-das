@@ -9,6 +9,7 @@ update itself is ``gdn_conv.update``. General fixes belong upstream.
 from __future__ import annotations
 
 import logging
+from typing import NamedTuple
 
 import sglang.srt.layers.attention.linear.gdn_backend as upstream
 from hcu_sglang.layers.attention.linear import (

@@ -64,6 +64,13 @@ class ForkPointTest(unittest.TestCase):
                 self.assertIn(name, self.functions)
                 self.assertEqual(_digest(self.functions[name]), expected)
 
+    def test_the_module_imports(self):
+        try:
+            from hcu_sglang.layers.attention.linear import gdn_source
+        except ImportError as exc:  # the pinned sglang tree is not installed
+            self.skipTest(str(exc))
+        self.assertTrue(hasattr(gdn_source, "_VerifyPlan"))
+
     def test_each_definition_keeps_its_hcu_delta(self):
         for name, marker in MARKERS.items():
             with self.subTest(definition=name):
