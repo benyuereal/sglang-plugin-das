@@ -1,0 +1,39 @@
+{
+  "recorded_on": "main @ 534f9bea10c34e04e9fcc4a1d27e4601d71cfce5",
+  "recorded_at": "2026-11-17",
+  "policy": "ci/test_gate.py fails on any failure not listed here. A listed test that starts passing is reported for pruning, not failed. Do not add an entry to silence a failure introduced by this branch.",
+  "failures": [
+    {
+      "id": "test_hybrid_pool_closure.HybridPoolClosureTests.test_every_helper_of_the_extracted_definitions_is_ast_equal",
+      "reason": "needs the vendored source checkout at /workspace/work/input-code/sglang; FileNotFoundError in this workspace"
+    },
+    {
+      "id": "test_hybrid_pool_closure.HybridPoolClosureTests.test_negative_case_detects_a_missing_helper",
+      "reason": "needs the vendored source checkout at /workspace/work/input-code/sglang; FileNotFoundError in this workspace"
+    },
+    {
+      "id": "test_hybrid_pool_closure.HybridPoolClosureTests.test_negative_case_detects_a_mutated_helper",
+      "reason": "needs the vendored source checkout at /workspace/work/input-code/sglang; FileNotFoundError in this workspace"
+    },
+    {
+      "id": "test_hcu_runtime.HcuRuntimeTests.test_cli_choices_include_all_plugin_quantization_methods_without_loading_configs",
+      "reason": "installed sglang lacks srt.arg_groups.arg_utils.field_names; the plugin targets the pinned 0.5.22 tree"
+    },
+    {
+      "id": "test_runtime_owned_sources.RuntimeOwnedSourceTests.test_extracted_and_adapter_provenance_is_pinned",
+      "reason": "recorded target_sha256 in tests/contracts/runtime_owned_sources.json no longer matches the owned file (stale pin on main)"
+    },
+    {
+      "id": "test_runtime_owned_sources.RuntimeOwnedSourceTests.test_only_declared_deltas_change_fixed_source_bytes",
+      "reason": "same stale provenance pin, target hcu_sglang/layers/quantization/quant_ops.py"
+    },
+    {
+      "id": "test_runtime_triage.RuntimeTriageTests.test_every_changed_definition_has_the_recorded_owned_ast",
+      "reason": "recorded ast_sha256 for dsa_indexer.py definitions is stale relative to the owned copy (vendor import commit 534f9be)"
+    },
+    {
+      "id": "test_runtime_triage.RuntimeTriageTests.test_validation_only_sources_preserve_full_ast_and_callers",
+      "reason": "same stale provenance pin, dsa_indexer_metadata.py and slimquant_w4a8_marlin.py"
+    }
+  ]
+}
