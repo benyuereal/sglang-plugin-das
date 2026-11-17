@@ -81,7 +81,8 @@ class CommitState:
         "step_gen", "step_lid", "step_cache", "s64_buf", "prev32_buf",
         "prev64_buf", "store_buf", "row_bufs", "h0_bufs", "tmp32_buf",
         "tmp64_buf", "gather_buf", "step_ok", "disabled", "geometry",
-        "rejected", "track_batches", "track_rows", "track_bytes",
+        "rejected", "step_rows", "step_rows_gen", "track_batches",
+        "track_rows", "track_bytes",
     )
 
     def __init__(self):
@@ -93,6 +94,8 @@ class CommitState:
         self.disabled = False
         self.geometry = None
         self.rejected = False
+        self.step_rows = None
+        self.step_rows_gen = None
         # Host-side counters, updated only while DEBUG logging is enabled.
         self.track_batches = self.track_rows = self.track_bytes = 0
         for name in ("s64_buf", "prev32_buf", "prev64_buf", "store_buf",
@@ -499,7 +502,16 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
     capacity = int(snap_cache.shape[0])
     if not _geometry_ok(backend, capacity):
         return None
-    snap_idx = request_rows(req_rows, capacity, n)
+    # One batch-row map per verify forward, not one per GDN layer: a fresh
+    # tensor per layer misses ``shared_step_values``' pointer cache and bakes
+    # the whole per-step setup into the captured graph 48 times.
+    rows_ptr = int(req_rows.data_ptr()) if req_rows is not None else 0
+    key = (st.step_gen, n, capacity, rows_ptr)
+    if st.step_rows is None or st.step_rows_gen != key:
+        snap_idx = request_rows(req_rows, capacity, n)
+        st.step_rows, st.step_rows_gen = snap_idx, key
+    else:
+        snap_idx = st.step_rows
     if snap_idx is None:
         _disable(st, "verify", "no request rows")
         return None
@@ -728,8 +740,9 @@ def compensate_from_stash(backend, rows, last_correct,
         # truncated rows. ``neg`` is built unconditionally: ``torch.where``
         # rejects None.
         neg = torch.full_like(row32, -1)
-        h0_by_stride, prev_now, layer_rows = {}, None, []
-        track_h0_by_stride, track_rows = {}, []
+        h0_by_stride, h0_trunc_by_stride, prev_now = {}, {}, None
+        layer_rows, track_rows = [], []
+        track_h0_by_stride = {}
         for lid, ent in st.stash.items():
             try:
                 layer_cache = ent.layer_cache
@@ -755,6 +768,11 @@ def compensate_from_stash(backend, rows, last_correct,
                         h0_idx = h0_rows(row32, prev_now, stride)
                         h0_idx = torch.where(live, h0_idx, neg)
                     h0_by_stride[stride] = h0_idx
+                # Only truncated rows need a replay: a full accept's snapshot
+                # already sits on the committed column, and a live-but-
+                # unreplayed row would run the whole recurrence for a write it
+                # never makes (store_step < 0).
+                h0_trunc_by_stride[stride] = torch.where(trunc, h0_idx, neg)
                 # Replay into the scratch row, not the persistent slot.
                 layer_rows.append((ent, flat, flat, stride, lid))
                 if track_step is not None:
@@ -767,7 +785,7 @@ def compensate_from_stash(backend, rows, last_correct,
                 _warn_layer(lid, exc, st)
         if not layer_rows:
             return False
-        for stride, h0_idx in h0_by_stride.items():
+        for stride, h0_idx in h0_trunc_by_stride.items():
             subset = [row for row in layer_rows if row[3] == stride]
             if not _replay_rows(st, subset, n, D, m, h0_idx, store_step,
                                 row32):
