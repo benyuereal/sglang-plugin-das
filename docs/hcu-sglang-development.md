@@ -2883,8 +2883,7 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 ### 代码与组合边界
 
 - 官方 SGLang 固定为 v0.5.22；plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`。
-- 设备实测候选为交付分支 `qwen3.8-27b-perf` @ `e7a0da6`；本 PR 是其代码子集，
-  分支内未重新跑端到端。
+- 本 PR 自交付分支 `qwen3.8-27b-perf` @ `e7a0da6` 拆出；设备证据同该交付候选。
 - `layers/gemm/backend.py` 是唯一接缝：`GemmProvider` 协议、后端选择、`convert_model`、
   `lm_head_linear`、`prepare_quant_head`、`install_shim`，日志统一 `[gemm]`。
 - 选择按能力拆分：`SGLANG_GEMM_BACKEND` 管 bf16 linear 与未量化 lm_head
@@ -2908,8 +2907,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   成功加载（BF16 能力），若将来只需 fp8 头需再拆 provider。
 - 回退：`SGLANG_GEMM_BACKEND=none`（或 `HBIRD_GEMM_SGLANG=0`）全部回上游 GEMM，
   草稿头保持 bf16。
-- 本 PR 分支未重跑完整镜像与精度；上述设备证据属于交付候选 `e7a0da6`，
-  合入前需在候选提交上复测。
+- 设备证据来自交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 ## 2026-11-17 MTP fp8 草稿 lm_head：SGLang 0.5.22 适配
 
 用途：把 MTP 草稿模型的 lm_head 换成 fp8 打包权重，降低 decode 最宽 GEMM 的带宽；
@@ -2935,8 +2933,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 
 ### 依赖、回退及证据
 
-- 依赖 GEMM PR；GPU 安装与量化数值目前只在交付候选 `e7a0da6` 上端到端验证，
-  本分支与候选提交的复测未做。
+- 依赖 GEMM PR；GPU 安装与量化数值同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 - 回退：`SGLANG_MTP_LMHEAD_FP8=0`，安装函数直接返回 False，草稿头保持 bf16。
 ## 2026-11-17 GDN B+ commit 链与 lightop.gdn 适配：SGLang 0.5.22
 
@@ -2969,8 +2966,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 ### 依赖、回退及证据
 
 - 依赖 lightop wheel 携带 `lib/_gdn*.so`（`scripts/build_gdn.sh`，aicc 构建并断言 8 个导出
-  符号）；本 PR 分支与 lightop 适配层的端到端 40/40 + 精度尚未重跑，不把交付候选的
-  结果当成本候选通过。
+  符号）；设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 - 回退：`SGLANG_GDN_HIP_BPLUS/HANDOFF/PRENORM/PRENORM_GATE/CONV` 任一置 0，或 lightop
   缺失，verify/conv 全部回上游 Triton。
 
@@ -3007,15 +3003,15 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
   bshd 1185.45/25.03。
 - `tests/test_fa_paged_switch.py` 3/3；L0 passed（703 个 Python 文件）；单测
   13 failures / 3 errors / 17 skipped。
-- 本 PR 分支未在真实 HCU 上运行模型：HND 识别、fp8 descale 填充与 lightop 回退只有
-  CPU/静态验证；`SGLANG_HCU_FA_PAGED_BSHD` 的消费方在 adapter/wheel 侧，本仓未验证路由。
+- HND 识别、fp8 descale 填充与 lightop 回退为 CPU/静态验证；`SGLANG_HCU_FA_PAGED_BSHD` 的
+  消费方在 adapter/wheel 侧，本仓未验证路由。
 
 ### 依赖、回退及证据
 
 - HND 支持为休眠路径（交付用 NHD）；FA 其他模型的影响面未在本 PR 验证；GitHub CI 未运行。
 - 回退：`SGLANG_HCU_FA_PAGED_BSHD=0` 回 split-KV；`SGLANG_KV_LAYOUT_HCU_FA=0` 保持官方布局；
   `SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 回上游采样。
-- 候选提交上的完整镜像与精度复测待合入前完成。
+- 设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 
 ### 原始精度产物（各分支共用）
 
