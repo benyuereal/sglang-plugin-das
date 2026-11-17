@@ -342,9 +342,21 @@ def forward_extend(
     hip_out = _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b)
     if hip_out is not None:
         return hip_out
-    return _UPSTREAM_FORWARD_EXTEND[0](
+    core_attn_out = _UPSTREAM_FORWARD_EXTEND[0](
         self, layer, forward_batch, mixed_qkv, a, b, **kwargs
     )
+    # Real prefill only: seeding on the MTP draft extend would copy the whole
+    # state (6 GiB per step) for slots that already have a live handoff row.
+    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    inter = getattr(mamba_cache, "intermediate_ssm", None)
+    if inter is not None and forward_batch.forward_mode.is_extend_without_speculative():
+        gdn_commit.seed_prev(
+            self,
+            self.forward_metadata.mamba_cache_indices,
+            mamba_cache,
+            int(inter.shape[1]),
+        )
+    return core_attn_out
 
 
 def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
@@ -364,7 +376,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         _OVERLAY_LOG["done"] = True
         logger.info(
             "GDN overlay verify: SGLANG_GDN_HIP=1 "
-            "(prenorm, B+ plain, conv=HIP); decode/prefill stay on the dispatcher"
+            "(prenorm, B+ handoff, conv=HIP); decode/prefill stay on the dispatcher"
         )
     seq_len = int(mixed_qkv.shape[0])
     draft_token_num = int(forward_batch.spec_info.draft_token_num)
@@ -440,9 +452,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         n=batch_size,
         snap_cache=intermediate_state_cache,
         cache_indices=cache_indices,
-        intermediate_indices=intermediate_indices,
         mamba_cache=mamba_cache,
-        ss_states=ssm_states,
         query_start_loc=query_start_loc,
     )
     if hip_out is not None:

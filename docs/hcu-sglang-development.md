@@ -2929,6 +2929,6 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - 依赖 lightop wheel 携带 `lib/_gdn*.so`（`scripts/build_gdn.sh`，aicc 构建并断言 8 个导出
   符号）；设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
 - 回退：`SGLANG_GDN_HIP=0` 回到上游 Triton；lightop 缺失时同一开关不生效。旧的
-  分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 只有一种模式：plain B+
-  （verify 写完整快照、commit 只重放被截断的 slot）+ HIP conv + prenorm；
-  radix cache 开或关都可直接使用，不再要求 `--disable-radix-cache`。
+  分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 是 handoff B+（verify 写快照、
+  commit 移指针）+ HIP conv + prenorm；radix cache 开启时 commit 之后补写 track 行
+  （`mamba_track_indices`），因此不再要求 `--disable-radix-cache`。
