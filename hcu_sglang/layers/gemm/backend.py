@@ -234,17 +234,22 @@ def _convert_one(backend, model, name, module, stats):
     if weight is None:
         return
     if type(module).__name__ in _LM_HEADS or module is getattr(model, "lm_head", None):
-        _keep_lm_head(backend, name, weight, stats)
+        _attempt(stats, name, _keep_lm_head, backend, weight)
     elif backend.owns(module):
-        _pack_linear(backend, name, module, weight, stats)
+        _attempt(stats, name, _pack_linear, backend, name, module, weight)
+
+def _attempt(stats, name, fn, *args):
+    """One layer's failure becomes a skip line, never a failed model load."""
+    try:
+        fn(*args, stats)
+    except Exception as exc:  # noqa: BLE001 - optional path
+        stats.skipped.append((name, f"{type(exc).__name__}: {exc}"))
 
 def _eligible_weight(module):
     """The weight to pack, or None when this module keeps the upstream GEMM."""
     # Not every module in the walk has a weight (activations, norms, pools).
     weight = getattr(module, "weight", None)
-    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
-        return None
-    if not weight.is_cuda or weight.dtype != torch.bfloat16:
+    if not _is_bf16_matrix(weight) or not weight.is_cuda:
         return None
     if module._parameters.get("bias") is not None:
         return None
@@ -252,28 +257,22 @@ def _eligible_weight(module):
         return None
     return weight
 
-def _keep_lm_head(backend, name, weight, stats):
-    try:
-        backend.prepare_lm_head(weight)
-        # Key by the weight's own shape so a padded pad_n cannot leak in.
-        stats.shapes[(int(weight.shape[0]), int(weight.shape[1]))] = weight.device
-        stats.kept += 1
-    except Exception as exc:  # noqa: BLE001
-        stats.skipped.append((name, f"{type(exc).__name__}: {exc}"))
+def _keep_lm_head(backend, weight, stats):
+    backend.prepare_lm_head(weight)
+    # Key by the weight's own shape so a padded pad_n cannot leak in.
+    stats.shapes[(int(weight.shape[0]), int(weight.shape[1]))] = weight.device
+    stats.kept += 1
 
 def _pack_linear(backend, name, module, weight, stats):
-    try:
-        ok, why = backend.can_pack(weight)
-        if not ok:
-            stats.skipped.append((name, why))
-            return
-        stats.freed += int(weight.numel()) * int(weight.element_size())
-        handle = backend.pack(weight)
-        backend.release(module, handle)
-        stats.shapes[(int(handle.N), int(handle.K))] = weight.device
-        stats.converted += 1
-    except Exception as exc:  # noqa: BLE001
-        stats.skipped.append((name, f"{type(exc).__name__}: {exc}"))
+    ok, why = backend.can_pack(weight)
+    if not ok:
+        stats.skipped.append((name, why))
+        return
+    stats.freed += int(weight.numel()) * int(weight.element_size())
+    handle = backend.pack(weight)
+    backend.release(module, handle)
+    stats.shapes[(int(handle.N), int(handle.K))] = weight.device
+    stats.converted += 1
 
 def _warm_workspaces(backend, shapes, stats):
     """Allocate every (M, N, K) a captured graph may issue, plus the prefill one."""

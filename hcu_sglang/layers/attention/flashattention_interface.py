@@ -58,13 +58,7 @@ def _restore_hcu_cache_layout(k_cache: torch.Tensor, v_cache: torch.Tensor):
     )
 
 
-def _paged_bshd_enabled() -> bool:
-    from sglang.srt.environ import envs
-
-    return envs.SGLANG_HCU_FA_PAGED_BSHD.get()
-
-
-def _is_hnd_page_view(t) -> bool:
+def _is_hnd(t) -> bool:
     """True for sglang's [pages, page_size, heads, dim] view of an HND pool.
 
     paged_kv_view() swaps head and page dims of a physical
@@ -146,8 +140,8 @@ def flash_attn_with_kvcache(
     # existing path untouched.
     hnd_layout = (
         not _layout_enabled()
-        and _is_hnd_page_view(k_cache)
-        and _is_hnd_page_view(v_cache)
+        and _is_hnd(k_cache)
+        and _is_hnd(v_cache)
     )
     if hnd_layout:
         k_cache, v_cache = _to_hnd_buffers(k_cache, v_cache)

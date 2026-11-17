@@ -60,7 +60,7 @@ def around_dspark_dequant_supported(original: Callable[..., bool], linear: Any) 
     return original(linear)
 
 
-def around_handle_eagle_family(
+def _handle_eagle_family(
     original: Callable[..., None], server_args: Any, *args, **kwargs
 ) -> None:
     result = original(server_args, *args, **kwargs)
@@ -89,7 +89,7 @@ def around_handle_eagle_family(
     return result
 
 
-def around_commit_mamba_states(
+def commit_mamba_states_after_verify(
     original: Callable[..., None],
     target_worker: Any,
     batch: Any,
@@ -185,12 +185,12 @@ def register_hooks() -> None:
     )
     HookRegistry.register(
         "sglang.srt.arg_groups.speculative_hook._handle_eagle_family",
-        around_handle_eagle_family,
+        _handle_eagle_family,
         HookType.AROUND,
     )
     HookRegistry.register(
         "sglang.srt.speculative.spec_utils.commit_mamba_states_after_verify",
-        around_commit_mamba_states,
+        commit_mamba_states_after_verify,
         HookType.AROUND,
     )
     HookRegistry.register(

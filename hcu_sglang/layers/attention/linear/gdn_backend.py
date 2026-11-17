@@ -29,7 +29,7 @@ def register() -> None:
     )
     HookRegistry.register(
         f"{_GDN_BACKEND_MODULE}.GDNAttnBackend._convolve_prefill",
-        around_convolve_prefill, HookType.AROUND,
+        _convolve_prefill, HookType.AROUND,
     )
     for target, hook in hooks:
         logger.info("[hcu_sglang] register REPLACE hook: %s", target)
@@ -80,7 +80,7 @@ def replacement_forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kw
     return gdn_source.forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
 
 
-def around_convolve_prefill(
+def _convolve_prefill(
     wrapped, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
 ):
     if not gdn_source._is_hcu:

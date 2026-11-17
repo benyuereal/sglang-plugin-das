@@ -40,7 +40,7 @@ def register() -> None:
         ("sglang.srt.layers.attention.flashattention_backend.FlashAttentionBackend.get_paged_mha_kv_cache", around_get_paged_mha_kv_cache),
         (_FORWARD_EXTEND_TARGET, around_forward_extend),
         (_FORWARD_DECODE_TARGET, around_forward_decode),
-        (_PREPARE_TARGET, around_prepare_paged_mha_query),
+        (_PREPARE_TARGET, prepare_paged_mha_query),
     )
     for target, hook in hooks:
         logger.info("[hcu_sglang] register AROUND hook: %s", target)
@@ -189,7 +189,7 @@ def _descale_tile(scale, shape, device):
         return scale.reshape(-1)[:1].expand(shape)
 
 
-def around_prepare_paged_mha_query(
+def prepare_paged_mha_query(
     wrapped,
     self,
     q,

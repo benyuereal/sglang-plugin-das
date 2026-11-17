@@ -2054,9 +2054,9 @@ def _track_skip_enabled() -> bool:
     return os.environ.get("SGLANG_GDN_TRACK_SKIP") == "1"
 
 
-def _around_set_mamba_track_indices(original, batch, track_positions=None):
+def _set_mamba_track_indices(wrapped, batch, track_positions=None):
     if not _track_skip_enabled():
-        return original(batch, track_positions)
+        return wrapped(batch, track_positions)
     if track_positions is None:
         track_positions = [
             (
@@ -2104,7 +2104,7 @@ def register_hooks():
     if _track_skip_enabled():
         HookRegistry.register(
             "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
-            _around_set_mamba_track_indices,
+            _set_mamba_track_indices,
             HookType.AROUND,
         )
     _REGISTERED = True
