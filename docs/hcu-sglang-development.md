@@ -2874,3 +2874,31 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+
+## 2026-11-17 FA 分页布局钩子、silu 回退与投机兼容
+
+**问题来源**：从交付分支 `qwen3.8-27b-perf` 拆出与 GDN 无关的平台适配改动，形成独立 PR（分支 `qwen3.8-27b-perf-misc`，基线 `main` `534f9be`）。
+
+**改动范围**：
+
+- `hcu_sglang/layers/attention/flashattention_interface.py`：识别 `paged_kv_view()` 产生的 HND 物理布局（按 stride 判断），还原为 `[pages, heads, page, dim]` 并走 `layout="bhsd"` 的 varlen 入口；间隙回退 `_restore_hcu_cache_layout`；fp8 查询缺省 descale 补 1.0；decode 传 `s_aux` 与 `layout` 开关。
+- `hcu_sglang/layers/attention/flashattention_backend.py`：新增 `prepare_paged_mha_query` AROUND 钩子，0.5.22 下补 fp8 KV 的 k/v descale tile；`around_init` 同步改写模块级 `flash_attn_varlen_func`/`flash_attn_with_kvcache`。
+- `hcu_sglang/layers/norm_activation.py`：`lightop` 不可导入时回退官方 `SiluAndMul` 实现。
+- `hcu_sglang/server_args_hooks.py`：去掉 `_declare`/`_resolved` 的 `hasattr` 兼容分支，统一走 `declare_resolution`/`resolving_view`/`model_config_of`。
+- `hcu_sglang/speculative_compat.py`：新增 `_handle_eagle_family` 自动开启 rejection sampling（受 `SGLANG_HCU_AUTO_REJECTION_SAMPLING` 控制）与 torchaudio 探测重构；**不包含** GDN 的 `commit_mamba_states_after_verify` 钩子及其 `gdn_commit` 导入。
+- `hcu_sglang/environ.py`：仅新增 `SGLANG_HCU_AUTO_REJECTION_SAMPLING`（默认 True）与 `SGLANG_HCU_FA_PAGED_BSHD`（默认 False）。
+- `tests/test_fa_paged_switch.py`：HND/NHD 判定与还原的 CPU 单测。
+
+**未纳入**：交付分支 `pyproject.toml` 的差异不是版本号，而是 `layers/attention/linear/lib/*` 的 package-data，属于 GDN 分支内容，本 PR 跳过。`SGLANG_HCU_FUSE_QKVZBA_VERIFY` 与 `SGLANG_GDN_ZBA_STRIDED` 同样未纳入。
+
+**实际验证（本机 Linux）**：
+
+- 改动文件 `python3 -m py_compile` 通过；changed files 中无 `hcu_sglang.layers.attention.linear`/`gdn_commit`/`commit_mamba` 引用。
+- `python3 ci/l0_gate.py`：passed（703 个 Python 文件，8 个 skill）。
+- `python3 -m unittest discover -s tests`：246 项，13 failures / 3 errors / 17 skipped。失败集中在既存快照/运行时 triage 类测试，与 main 基线一致；`tests/test_fa_paged_switch.py` 3 项全部通过。
+
+**未验证项**：
+
+- 未在真实 HCU 设备上运行模型；HND 布局识别、fp8 descale 填充与 lightop 回退缺少实机/整模型验证。
+- `SGLANG_HCU_FA_PAGED_BSHD` 在本仓仅声明，消费方不在本仓，未验证其路由行为。
+- 未运行 GitHub CI。

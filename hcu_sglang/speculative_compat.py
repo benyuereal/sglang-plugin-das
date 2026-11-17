@@ -2,18 +2,42 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 import torch
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.environ import envs
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
+)
 
+from hcu_sglang import eagle_sampling
+from hcu_sglang.server_args_hooks import _declare_values
+from hcu_sglang.speculative_dspark import _handle_dspark
 from hcu_sglang.utils.detection import is_hcu
+
+
+def _torchaudio_loads() -> bool:
+    """Import failure is the probe: transformers must not report torchaudio as
+    available on images where loading it raises."""
+    try:
+        import torchaudio  # noqa: F401
+    except (ImportError, OSError):
+        return False
+    return True
+
+
+_TORCHAUDIO_LOADS = _torchaudio_loads()
+
+logger = logging.getLogger(__name__)
 
 
 def around_handle_dspark(original: Callable[..., None], server_args: Any) -> None:
     if not is_hcu():
         return original(server_args)
-    from hcu_sglang.speculative_dspark import _handle_dspark
-
     return _handle_dspark(server_args)
 
 
@@ -35,13 +59,36 @@ def around_dspark_dequant_supported(original: Callable[..., bool], linear: Any) 
     return original(linear)
 
 
-def _get_dspark_ragged_settings():
-    from sglang.srt.environ import envs
-    from sglang.srt.speculative.ragged_verify import (
-        RaggedVerifyMode,
-        read_ragged_verify_mode,
-    )
+def _handle_eagle_family(
+    original: Callable[..., None], server_args: Any, *args, **kwargs
+) -> None:
+    result = original(server_args, *args, **kwargs)
+    if not is_hcu():
+        return result
+    if not envs.SGLANG_HCU_AUTO_REJECTION_SAMPLING.get():
+        return result
+    view = resolving_view(server_args)
+    if (
+        view.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and not view.speculative_use_rejection_sampling
+        and view.speculative_eagle_topk == 1
+        and view.speculative_accept_threshold_single == 1.0
+        and view.speculative_accept_threshold_acc == 1.0
+        and not view.enable_deterministic_inference
+        and view.speculative_token_map is None
+    ):
+        _declare_values(
+            server_args,
+            "hcu_sglang:hcu_rejection_sampling",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info(
+            "HCU has no tree-sampling kernel; using rejection sampling."
+        )
+    return result
 
+
+def _get_dspark_ragged_settings():
     return (
         read_ragged_verify_mode(),
         RaggedVerifyMode.STATIC,
@@ -94,28 +141,28 @@ def around_tbo_filter_batch(
 
 
 def patch_broken_torchaudio_availability() -> None:
+    if _TORCHAUDIO_LOADS:
+        return
     try:
-        import torchaudio  # noqa: F401
-    except (ImportError, OSError):
-        try:
-            import transformers.utils as transformers_utils
-            import transformers.utils.import_utils as import_utils
-        except ImportError:
-            return
-        import_utils.is_torchaudio_available = lambda: False
-        transformers_utils.is_torchaudio_available = lambda: False
+        import transformers.utils as utils
+        import transformers.utils.import_utils as import_utils
+    except ImportError:
+        return
+    utils.is_torchaudio_available = lambda: False
+    import_utils.is_torchaudio_available = lambda: False
 
 
 def register_hooks() -> None:
-    from sglang.srt.plugins.hook_registry import HookRegistry, HookType
-
-    from hcu_sglang import eagle_sampling
-
     eagle_sampling.register_hooks()
     patch_broken_torchaudio_availability()
     HookRegistry.register(
         "sglang.srt.arg_groups.speculative_hook._handle_dspark",
         around_handle_dspark,
+        HookType.AROUND,
+    )
+    HookRegistry.register(
+        "sglang.srt.arg_groups.speculative_hook._handle_eagle_family",
+        _handle_eagle_family,
         HookType.AROUND,
     )
     HookRegistry.register(

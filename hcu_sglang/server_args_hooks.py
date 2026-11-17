@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 from sglang.srt.arg_groups.arg_utils import is_record
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from copy import deepcopy
 from hcu_sglang.config import (configure_minimax_opt, minimax_opt_enabled,
     configure_cp_cache_layer_split, cp_cache_layer_split_enabled,
@@ -28,9 +30,7 @@ _EXTENSION_DEFAULTS = {
 
 
 def _model_arch(server_args: Any) -> str | None:
-    from sglang.srt.arg_groups.model_override_base import model_config_of
-    config = (server_args.get_model_config() if hasattr(server_args, "get_model_config")
-              else model_config_of(server_args))
+    config = model_config_of(server_args)
     architectures = getattr(config.hf_config, "architectures", None)
     return architectures[0] if architectures else None
 
@@ -113,17 +113,10 @@ def around_validate_deepseek_v4_mega_moe_token_budget(
 
 
 def _declare_values(server_args, source, **values):
-    if hasattr(server_args, "_declare"):
-        server_args._declare(source, **values)
-    else:
-        from sglang.srt.arg_groups.overrides import declare_resolution
-        declare_resolution(server_args, source, **values)
+    declare_resolution(server_args, source, **values)
 
 
 def _resolving_view(server_args):
-    if hasattr(server_args, "_resolved"):
-        return server_args._resolved()
-    from sglang.srt.arg_groups.model_override_base import resolving_view
     return resolving_view(server_args)
 
 
@@ -173,11 +166,7 @@ def enforce_hcu_mla_page_size(result: Any, server_args: Any) -> Any:
             "HCU MLA only supports a page_size of 64; changing page_size from %s to 64.",
             view.page_size,
         )
-        if hasattr(server_args, "_declare"):
-            server_args._declare("hcu_sglang:hcu_mla", page_size=64)
-        else:
-            from sglang.srt.arg_groups.overrides import declare_resolution
-            declare_resolution(server_args, "hcu_sglang:hcu_mla", page_size=64)
+        _declare_values(server_args, "hcu_sglang:hcu_mla", page_size=64)
     return result
 
 
@@ -261,7 +250,6 @@ def _hcu_model_defaults(server_args, hf_config):
 
 
 def _hcu_post_process(view):
-    from sglang.srt.arg_groups.model_override_base import model_config_of
     from sglang.srt.configs.model_config import is_deepseek_dsa
     changes = {}
     if not is_hcu():
