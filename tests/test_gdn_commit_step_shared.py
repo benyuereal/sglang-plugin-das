@@ -411,6 +411,8 @@ class CompensateMaskTest(unittest.TestCase):
         self.st.commit_failed = False
         self.st.capture_T = DRAFT
         self.st.live_T = DRAFT
+        self.st.snap_idx = self.rows
+        self.st.cache_steps = DRAFT
 
     def test_only_truncated_rows_carry_an_h0(self):
         captured = {}

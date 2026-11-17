@@ -81,13 +81,16 @@ class CommitState:
         "prev64_buf", "store_buf", "row_bufs", "h0_bufs", "tmp32_buf",
         "tmp64_buf", "gather_buf", "step_ok", "disabled", "geometry",
         "rejected", "step_rows", "step_rows_gen", "track_batches",
-        "track_rows", "track_bytes",
+        "track_rows", "track_bytes", "sealed_gen", "cache_steps",
     )
 
     def __init__(self):
         self.prev = self.stash = self.snap_idx = None
         self.seed_scratch = self.ml_table = self.ml_key = self.step_cache = None
         self.capture_T = self.live_T = self.max_slots = self.step_gen = 0
+        # Allocated ring depth (``snap_cache.shape[1]``), not the draft width:
+        # the handoff snapshot rotates modulo this, not modulo T.
+        self.cache_steps = 0
         self.step_lid = -1
         self.logged = self.commit_failed = self.step_ok = False
         self.disabled = False
@@ -95,6 +98,7 @@ class CommitState:
         self.rejected = False
         self.step_rows = None
         self.step_rows_gen = None
+        self.sealed_gen = -1
         # Host-side counters, updated only while DEBUG logging is enabled.
         self.track_batches = self.track_rows = self.track_bytes = 0
         for name in ("s64_buf", "prev32_buf", "prev64_buf", "store_buf",
@@ -248,20 +252,29 @@ def resync_plain(backend, rows, cache_indices, mamba_cache, cache_steps: int,
     temporal = getattr(mamba_cache, "temporal", None)
     if inter is None or temporal is None or st.prev is None or rows is None:
         return
-    rows32 = request_rows(rows, int(inter.shape[0]), n)
+    # ``inter`` is the full bundle [layers, spec rows, draft tokens, *state];
+    # a persistent slot lives on the same layer, not on layer 0.
+    spec_rows = int(inter.shape[1])
+    rows32 = request_rows(rows, spec_rows, n)
     if rows32 is None:
         return
     idx = rows32.to(torch.int64)
-    safe = idx.clamp(0, int(inter.shape[0]) - 1)
+    safe = idx.clamp(0, spec_rows - 1)
     prev = st.prev.index_select(0, safe).to(torch.int64)
     slots = cache_indices[:n].to(torch.int64)
     live = (idx >= 0) & (prev >= 0) & (slots >= 0) & (
-        slots < int(temporal.shape[0]))
-    src = torch.where(live, safe * int(cache_steps) + prev.clamp_min(0),
-                      torch.zeros_like(safe))
-    flat = inter.reshape(-1, *inter.shape[2:])
-    dst = torch.where(live, slots, torch.zeros_like(slots))
-    temporal.index_copy_(0, dst, flat.index_select(0, src))
+        slots < int(temporal.shape[1]))
+    if not bool(live.any()):
+        return
+    sel = torch.nonzero(live, as_tuple=False).flatten()
+    src = safe.index_select(0, sel) * int(cache_steps) + prev.index_select(
+        0, sel).clamp_min(0)
+    dst = slots.index_select(0, sel)
+    for layer in range(int(inter.shape[0])):
+        layer_inter = inter[layer].reshape(-1, *inter.shape[3:])
+        temporal[layer].index_copy_(
+            0, dst, layer_inter.index_select(0, src)
+        )
     # A synced row is no longer handoff state: the plain path owns it from now
     # on, so a repeated decline does not copy it again.
     st.prev.index_fill_(0, safe[live], -1)
@@ -347,6 +360,43 @@ def h0_rows(rows: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.Te
     return (rows.to(torch.int64) * row_stride
             + prev.to(torch.int64).clamp_min(0)).to(torch.int32)
 
+def _seal(st) -> None:
+    """One-time consistency check for the per-step commit scratch.
+
+    ``prev``, ``stash``, ``step_ok``, ``capture_T`` and ``snap_idx`` belong to
+    the same verify step; a stale mix would silently commit another step's
+    rows. Seal once per step so the check does not run on every commit.
+    """
+    if st.sealed_gen == st.step_gen:
+        return
+    st.sealed_gen = st.step_gen
+    if st.stash:
+        assert st.step_ok, "stash present without a successful verify step"
+        assert st.capture_T > 0, "stash present without the draft width"
+        assert st.snap_idx is not None, "stash present without snapshot rows"
+        assert st.cache_steps > 0, "stash present without the ring depth"
+    if st.prev is not None:
+        assert st.prev.dim() == 1 and st.prev.dtype == torch.int32, (
+            "prev must be an int32 row tensor"
+        )
+
+
+def _handoff_track_mask(prev32, track32, trunc, last32, T, cache_steps):
+    """Rows whose crossing column is neither the ring snapshot nor the replay.
+
+    The handoff verify writes its snapshot into the rotating ring column
+    ``(prev + 1) % cache_steps`` and the commit points ``prev`` there; a track
+    replay into the same column would overwrite it. The ring depth is the
+    allocated ``snap_cache.shape[1]``, not the draft width ``T``: mixing the
+    two only looks right while ``T`` divides the depth.
+    """
+    track = (track32 >= 0) & (track32 < T)
+    ring = torch.remainder(prev32.to(torch.int64) + 1, int(cache_steps))
+    track &= track32.to(torch.int64) != ring
+    track &= (~trunc) | (track32 != last32.to(torch.int64))
+    return track
+
+
 def commit_prev(backend, rows, last_correct, T: int, cache_steps: int) -> bool:
     """Advance the committed row; no state copy."""
     if not enabled():
@@ -354,6 +404,7 @@ def commit_prev(backend, rows, last_correct, T: int, cache_steps: int) -> bool:
     st = state(backend)
     if st.prev is None or st.commit_failed or st.disabled or not st.step_ok:
         return False
+    _seal(st)
     try:
         cap = int(st.prev.numel())
         idx = rows.to(torch.int64)
@@ -504,6 +555,8 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
     capacity = int(snap_cache.shape[0])
     if not _geometry_ok(backend, capacity):
         return None
+    # The commit rotates ``prev`` modulo this; graph replay keeps the value.
+    st.cache_steps = cache_steps
     # One batch-row map per verify forward, not one per GDN layer: a fresh
     # tensor per layer misses ``shared_step_values``' pointer cache and bakes
     # the whole per-step setup into the captured graph 48 times.
@@ -716,6 +769,7 @@ def compensate_from_stash(backend, rows, last_correct,
             backend, plain_rows, last_correct, mamba_track_indices,
             mamba_steps_to_track)
     st = state(backend)
+    _seal(st)
     try:
         # Graph replay skips verify's Python: prefer the live value.
         T = int(st.live_T or st.capture_T)
@@ -734,7 +788,9 @@ def compensate_from_stash(backend, rows, last_correct,
         track, track_step = None, None
         if mamba_steps_to_track is not None:
             track32 = mamba_steps_to_track[:n].to(torch.int32)
-            track = live & (track32 >= 0) & (track32 < T)
+            track = live & _handoff_track_mask(
+                prev32, track32, trunc, last32, T, st.cache_steps
+            )
             track_step = torch.where(track, track32,
                                      torch.full_like(track32, -1))
         D, m = T, n * T
