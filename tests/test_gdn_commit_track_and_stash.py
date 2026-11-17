@@ -10,9 +10,9 @@ Two properties the radix-on plain B+ commit depends on:
   see with the *current* step's indices, so a stale entry silently commits the
   wrong token window.
 * The upstream extra_buffer commit scatters the interval-crossing state from
-  ``intermediate_ssm[snap_row, track_step]``, but verify only writes the full-run
-  row. Every crossing step that is neither ``T - 1`` nor the truncated-slot
-  replay's ``last_correct`` must be replayed once into that row.
+  ``intermediate_ssm[snap_row, track_step]``, but verify only writes the
+  handoff ring column. Every crossing step that is neither that column nor the
+  truncated-slot replay's ``last_correct`` must be replayed once into the row.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ def _backend(entries=None, with_pool=False):
     st.snap_idx = torch.arange(N, dtype=torch.int32)
     st.capture_T = T
     st.live_T = None
+    st.cache_steps = 6  # deliberately != T
     return backend
 
 
@@ -211,6 +212,43 @@ class TrackReplayTest(_PpOff):
             )
         self.assertTrue(ok)
         self.assertEqual(len(calls), 1)
+
+
+class HandoffTrackAndSealTest(unittest.TestCase):
+    def test_handoff_track_skips_the_ring_column_and_the_truncated_replay(self):
+        prev = torch.tensor([2, 2, 2, -1], dtype=torch.int32)
+        step = torch.tensor([3, 1, 0, 3], dtype=torch.int32)
+        trunc = torch.tensor([False, False, True, False])
+        last = torch.tensor([0, 0, 0, 0], dtype=torch.int32)
+        mask = gdn_commit._handoff_track_mask(prev, step, trunc, last, 5, 6)
+        self.assertEqual(mask.tolist(), [False, True, False, True])
+
+    def test_ring_depth_is_not_the_draft_width(self):
+        # prev=5: ring column is 0 for cache_steps=6, but 1 for T=5.
+        prev = torch.tensor([5, 5, 5], dtype=torch.int32)
+        step = torch.tensor([0, 1, 2], dtype=torch.int32)
+        trunc = torch.zeros(3, dtype=torch.bool)
+        last = torch.zeros(3, dtype=torch.int32)
+        mask = gdn_commit._handoff_track_mask(prev, step, trunc, last, 5, 6)
+        self.assertEqual(mask.tolist(), [False, True, True])
+
+    def test_adaptive_draft_width_uses_the_allocated_ring(self):
+        # Runtime T=4 with cache_steps=5: prev=4 wraps to column 0.
+        prev = torch.tensor([4, 4, 4, 4], dtype=torch.int32)
+        step = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        trunc = torch.zeros(4, dtype=torch.bool)
+        last = torch.zeros(4, dtype=torch.int32)
+        mask = gdn_commit._handoff_track_mask(prev, step, trunc, last, 4, 5)
+        self.assertEqual(mask.tolist(), [False, True, True, True])
+
+    def test_seal_rejects_a_stash_from_another_step(self):
+        backend = types.SimpleNamespace()
+        st = gdn_commit.state(backend)
+        st.step_gen = 7
+        st.stash = {0: object()}
+        st.step_ok = False
+        with self.assertRaises(AssertionError):
+            gdn_commit._seal(st)
 
 
 if __name__ == "__main__":
