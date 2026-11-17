@@ -43,7 +43,6 @@ def _old_per_layer(prev_buf, slots, cache_steps, draft):
 class SharedStepTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
-        gdn_commit._HANDOFF_OK = None
         self.backend = types.SimpleNamespace()
         self.params = _params()
         self.prev_buf = torch.randint(
@@ -54,8 +53,6 @@ class SharedStepTest(unittest.TestCase):
         self.slots[3] = -1
         self.slots[9] = -1
 
-    def tearDown(self):
-        gdn_commit._HANDOFF_OK = None
 
     def assertBitEqual(self, got, want):
         self.assertEqual(got.dtype, want.dtype)
@@ -217,11 +214,7 @@ class SharedStepTest(unittest.TestCase):
         want.index_copy_(0, put_idx, keep)
 
         gdn_commit.state(self.backend).prev = self.prev_buf.clone()
-        env = {
-            "SGLANG_GDN_HIP_BPLUS": "1",
-            "SGLANG_GDN_HIP_HANDOFF": "1",
-            "SGLANG_GDN_HIP_HANDOFF_SKIP_TRACK": "1",
-        }
+        env = {"SGLANG_GDN_HIP": "all"}
         with patch.dict(os.environ, env):
             ok = gdn_commit.commit_prev(self.backend, idx, last, T, CACHE_STEPS)
         self.assertTrue(ok)

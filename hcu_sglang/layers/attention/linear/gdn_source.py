@@ -2,8 +2,9 @@
 
 Everything not redefined here is upstream code. Ours: ``forward_decode``
 (B+ commit/handoff, HIP recurrent, HCU conv), ``forward_extend`` (verify
-kernel entries; prefill stays upstream), ``_convolve_prefill`` and
-``conv_update`` (HCU causal_conv1d). General fixes belong upstream.
+kernel entries; prefill stays upstream) and ``_convolve_prefill``; the
+decode conv update itself is ``gdn_conv.update``. General fixes belong
+upstream.
 """
 
 from __future__ import annotations
@@ -38,6 +39,16 @@ if _is_hcu and get_bool_env_var("SGLANG_USE_CAUSAL_CONV1D"):
             "SGLANG_USE_CAUSAL_CONV1D=1 but HCU causal_conv1d import failed "
             f"({exc}); falling back to Triton."
         )
+
+from hcu_sglang.layers.attention.linear import gdn_conv
+
+gdn_conv.configure(
+    is_hcu=_is_hcu,
+    triton=causal_conv1d_update,
+    hcu=causal_conv1d_update_hcu if _use_hcu_causal_conv1d else None,
+    log=rank0_log,
+)
+conv_update = gdn_conv.update
 
 def forward_decode(
     self,
@@ -317,32 +328,6 @@ def _gdn_hip_kernel_enabled() -> bool:
 def _gdn_recurrent_enabled() -> bool:
     return _is_hcu and gdn_commit.enabled() and gdn_recurrent.enabled()
 
-_CONV_HIP_LOG = {"done": False}
-
-def conv_update(x, conv_state, weight, bias=None, activation=None, **kwargs):
-    """Triton causal_conv1d_update, or its HIP twin under SGLANG_GDN_HIP_CONV=1."""
-    if _is_hcu:
-        try:
-            if gdn_recurrent.conv_enabled():
-                out = gdn_recurrent.conv_update(
-                    x, conv_state, weight, bias, activation, **kwargs
-                )
-                if out is not None:
-                    return out
-                if not _CONV_HIP_LOG["done"]:
-                    _CONV_HIP_LOG["done"] = True
-                    rank0_log(
-                        "SGLANG_GDN_HIP_CONV=1 but this conv call is outside "
-                        "the HIP kernel "
-                        f"({gdn_recurrent.conv_last_reason()}); using Triton."
-                    )
-        except Exception as exc:  # noqa: BLE001 - never fail a forward here
-            if not _CONV_HIP_LOG["done"]:
-                _CONV_HIP_LOG["done"] = True
-                rank0_log(f"SGLANG_GDN_HIP_CONV path disabled: {exc}")
-    update = causal_conv1d_update_hcu if _use_hcu_causal_conv1d else causal_conv1d_update
-    return update(x, conv_state, weight, bias, activation, **kwargs)
-
 def forward_extend(
     self,
     layer: RadixLinearAttention,
@@ -353,8 +338,9 @@ def forward_extend(
     **kwargs,
 ):
     """Prefill stays upstream; target verify takes the B+/HIP entries."""
-    if _verify_kernel_path(self, layer, forward_batch, mixed_qkv):
-        return _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b)
+    hip_out = _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b)
+    if hip_out is not None:
+        return hip_out
     core_attn_out = _UPSTREAM_FORWARD_EXTEND[0](
         self, layer, forward_batch, mixed_qkv, a, b, **kwargs
     )
@@ -372,21 +358,21 @@ def forward_extend(
     return core_attn_out
 
 
-def _verify_kernel_path(self, layer, forward_batch, mixed_qkv) -> bool:
-    """Only target verify, only with a kernel entry, and never on ReplaySSM."""
-    if not forward_batch.forward_mode.is_target_verify():
-        return False
-    if not (_gdn_recurrent_enabled() or _gdn_hip_kernel_enabled()):
-        return False
-    if self.mis_metadata is not None or not isinstance(mixed_qkv, torch.Tensor):
-        return False
-    if mixed_qkv.shape[0] == 0:
-        return False
-    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-    return mamba_cache.replayssm_d is None and mamba_cache.replayssm_rawv is None
-
-
 def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
+    """The overlaid verify result, or None when this forward is not ours."""
+    if not forward_batch.forward_mode.is_target_verify():
+        return None
+    recurrent = _gdn_recurrent_enabled()
+    kernel = _gdn_hip_kernel_enabled()
+    if not (recurrent or kernel):
+        return None
+    if self.mis_metadata is not None or not isinstance(mixed_qkv, torch.Tensor):
+        return None
+    if mixed_qkv.shape[0] == 0:
+        return None
+    mamba_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    if mamba_cache.replayssm_d is not None or mamba_cache.replayssm_rawv is not None:
+        return None
     if not _OVERLAY_LOG["done"]:
         _OVERLAY_LOG["done"] = True
         logger.info(
@@ -457,7 +443,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         key = key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim)
 
-    if _gdn_recurrent_enabled():
+    if recurrent:
         hip_out = gdn_commit.verify_step(
             backend=self,
             layer=layer,
@@ -477,7 +463,7 @@ def _verify_kernel_forward(self, layer, forward_batch, mixed_qkv, a, b):
         )
         if hip_out is not None:
             return hip_out
-    if _gdn_hip_kernel_enabled():
+    if kernel:
         if not _HIP_LOG["done"]:
             rank0_log("GDN HIP kernel-only verify path active")
             _HIP_LOG["done"] = True
