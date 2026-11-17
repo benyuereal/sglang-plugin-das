@@ -196,7 +196,7 @@ class SharedStepTest(unittest.TestCase):
         snap_idx = torch.zeros(BATCH, dtype=torch.int32)
         store = torch.full((BATCH,), DRAFT - 1, dtype=torch.int32)
         store_row = torch.zeros(BATCH, dtype=torch.int32)
-        with patch.object(gdn_recurrent, "_lib", lambda: FakeLib()):
+        with patch.object(gdn_recurrent, "_gdn", FakeLib()):
             gdn_recurrent.verify(
                 q, q, v, q, q, q, q, None, v, snap_idx, v, snap_idx,
                 CACHE_STEPS, DRAFT, v, prev_step=self.prev_buf,
@@ -221,7 +221,7 @@ class SharedStepTest(unittest.TestCase):
         snap_idx = self.rows
         # The library-side default row arithmetic has no unseeded-row mask.
         self.prev_buf.clamp_min_(0)
-        with patch.object(gdn_recurrent, "_lib", lambda: FakeLib()):
+        with patch.object(gdn_recurrent, "_gdn", FakeLib()):
             gdn_recurrent.verify(
                 q, q, v, q, q, q, q, None, v, snap_idx, v, snap_idx,
                 CACHE_STEPS, DRAFT, v, prev_step=self.prev_buf,
@@ -389,18 +389,20 @@ class CompensateMaskTest(unittest.TestCase):
                                  + [-1] * (SCRATCH_ROWS - 5),
                                  dtype=torch.int32)
         inter = torch.zeros(SCRATCH_ROWS, DRAFT, 2)
-        ent = {
-            "dims": gdn_commit.HeadDims(1, 2, 1, 2, 1, 2),
-            "q": torch.zeros(BATCH * DRAFT, 2),
-            "k": torch.zeros(BATCH * DRAFT, 2),
-            "v": torch.zeros(BATCH * DRAFT, 2),
-            "a": torch.zeros(BATCH * DRAFT, 1),
-            "b": torch.zeros(BATCH * DRAFT, 1),
-            "out": torch.zeros(1, 1, 1, 2),
-            "A_log": torch.zeros(1), "dt_bias": torch.zeros(1),
-            "layer_cache": types.SimpleNamespace(
-                intermediate_ssm=inter, temporal=torch.zeros(SCRATCH_ROWS, 1, 2)),
-        }
+        ent = gdn_commit.StashEntry(
+            rows=BATCH * DRAFT,
+            dims=gdn_commit.HeadDims(1, 2, 1, 2, 1, 2),
+            qkv=torch.zeros(BATCH * DRAFT, 6),
+            q=torch.zeros(BATCH * DRAFT, 2),
+            k=torch.zeros(BATCH * DRAFT, 2),
+            v=torch.zeros(BATCH * DRAFT, 2),
+            a=torch.zeros(BATCH * DRAFT, 1),
+            b=torch.zeros(BATCH * DRAFT, 1),
+            out=torch.zeros(1, 1, 1, 2),
+        )
+        ent.A_log, ent.dt_bias = torch.zeros(1), torch.zeros(1)
+        ent.layer_cache = types.SimpleNamespace(
+            intermediate_ssm=inter, temporal=torch.zeros(SCRATCH_ROWS, 1, 2))
         self.backend = types.SimpleNamespace()
         self.st = gdn_commit.state(self.backend)
         self.st.prev = self.prev
