@@ -1,4 +1,4 @@
-// GDN 递推步的手写核（实验版，不进货线，先在 experiments/ 里对拍）。
+// GDN 递推步的手写核（生产版，随 lightop 发布）。
 //
 // 目标：替换 aiter 的 `fused_sigmoid_gating_delta_rule_update_kernel` 里
 // 那个占 20.8% 的 per-token 循环。
@@ -21,8 +21,7 @@
 // （只有 bank2 对），`"+v"` 的读改写形式更是全 0。这套工具链上不可靠，故用
 // `__shfl_xor`（宽 8，组内连续 8 lane）。
 //
-// 构建：scripts/build.sh 同一套编译器与 flag，
-//   experiments/gdn/build_gdn.sh -> build/gdn_exp.so
+// 构建：scripts/build_gdn.sh（aicc + 调优 flags，产物 lib/_gdn<ext>.so）。
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
