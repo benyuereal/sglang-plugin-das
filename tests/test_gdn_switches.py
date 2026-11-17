@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SGLANG_GDN_HIP parsing and the capabilities each module derives from it."""
+"""SGLANG_GDN_HIP is one binary switch, resolved to an immutable mode."""
 
 from __future__ import annotations
 
@@ -9,122 +9,94 @@ import os
 import unittest
 from unittest import mock
 
-from hcu_sglang.layers.attention.linear import gdn_commit, gdn_recurrent
+from hcu_sglang.layers.attention.linear import gdn_commit
 from hcu_sglang.layers.attention.linear import gdn_switches as switches
 
-DELIVERED = frozenset({
-    switches.CONV, switches.PRENORM, switches.KERNEL,
-    switches.BPLUS, switches.HANDOFF,
-})
+try:
+    from hcu_sglang import server_args_hooks
+except ImportError:  # the installed sglang may lack the pinned arg-group API
+    server_args_hooks = None
 
 
 class ParseTest(unittest.TestCase):
     def setUp(self):
-        switches._warned = False
+        switches._warned_legacy = False
         quiet = mock.patch.object(switches._LOG, "warning")
         quiet.start()
         self.addCleanup(quiet.stop)
 
-    def parse(self, value, *, set_var=True):
+    def mode(self, value, *, set_var=True):
         env = {switches.ENV: value} if set_var else {}
-        env.update({
-            name: "" for name in os.environ
-            if name.startswith("SGLANG_GDN_HIP_")
-        })
         with mock.patch.dict(os.environ, env, clear=True):
-            return switches.active()
+            return switches.mode()
 
-    def test_unset_and_off_values_disable_everything(self):
-        self.assertEqual(self.parse("", set_var=False), frozenset())
-        for value in ("", "0", "off", "none", "false", "no"):
+    def test_unset_and_off_values_disable_the_stack(self):
+        self.assertFalse(self.mode("", set_var=False).enabled)
+        for value in ("", "0", "off", "none", "false", "no", " OFF "):
             with self.subTest(value=value):
-                self.assertEqual(self.parse(value), frozenset())
+                self.assertFalse(self.mode(value).enabled)
 
-    def test_on_values_enable_the_delivered_stack(self):
-        for value in ("1", "all", "on", "true", "yes", "ALL"):
+    def test_on_values_enable_the_stack(self):
+        for value in ("1", "all", "on", "true", "yes", " 1 "):
             with self.subTest(value=value):
-                self.assertEqual(self.parse(value), DELIVERED)
+                self.assertTrue(self.mode(value).enabled)
+                switches._LOG.warning.assert_not_called()
 
-    def test_a_subset_is_an_isolation_arm(self):
-        self.assertEqual(self.parse("conv,prenorm"),
-                         frozenset({switches.CONV, switches.PRENORM}))
-        self.assertEqual(self.parse("conv + prenorm"),
-                         frozenset({switches.CONV, switches.PRENORM}))
-        self.assertEqual(self.parse("kernel"), frozenset({switches.KERNEL}))
+    def test_an_unknown_value_is_on_with_one_warning(self):
+        self.assertTrue(self.mode("conv,prenorm").enabled)
+        switches._LOG.warning.assert_called_once()
+        self.assertIn("treating it as on", switches._LOG.warning.call_args[0][0])
 
-    def test_handoff_implies_bplus_but_not_the_reverse(self):
-        self.assertEqual(self.parse("handoff"),
-                         frozenset({switches.HANDOFF, switches.BPLUS}))
-        self.assertEqual(self.parse("bplus"), frozenset({switches.BPLUS}))
-
-    def test_replay_all_is_additive(self):
-        self.assertEqual(self.parse("all,replay-all"),
-                         DELIVERED | {switches.REPLAY_ALL})
-
-    def test_unknown_tokens_are_ignored_not_fatal(self):
-        self.assertEqual(self.parse("conv,typo"), frozenset({switches.CONV}))
-        switches._LOG.warning.assert_called_with(
-            "[gdn] ignoring unknown %s token(s): %s", switches.ENV, ["typo"]
-        )
-
-    def test_a_parsed_value_is_cached_by_the_raw_string(self):
-        first = self.parse("all")
-        second = self.parse("all")
+    def test_the_parsed_mode_is_cached_by_raw_value(self):
+        first, second = self.mode("1"), self.mode("1")
         self.assertIs(first, second)
-
-
-class CapabilityTest(unittest.TestCase):
-    def setUp(self):
-        switches._warned = False
-
-    def _env(self, value):
-        patch = mock.patch.dict(os.environ, {switches.ENV: value}, clear=False)
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_kernel_predicates_need_the_operator_library(self):
-        self._env("all")
-        with mock.patch.object(gdn_recurrent, "_gdn", None):
-            self.assertFalse(gdn_recurrent.enabled_kernel())
-            self.assertFalse(gdn_recurrent.prenorm_enabled())
-            self.assertFalse(gdn_recurrent.conv_enabled())
-        with mock.patch.object(gdn_recurrent, "_gdn", object()):
-            self.assertTrue(gdn_recurrent.enabled_kernel())
-            self.assertTrue(gdn_recurrent.prenorm_enabled())
-            self.assertTrue(gdn_recurrent.prenorm_gate_enabled())
-            self.assertTrue(gdn_recurrent.conv_enabled())
-
-    def test_the_prenorm_gate_ships_with_prenorm(self):
-        self._env("kernel")
-        with mock.patch.object(gdn_recurrent, "_gdn", object()):
-            self.assertFalse(gdn_recurrent.prenorm_enabled())
-            self.assertFalse(gdn_recurrent.prenorm_gate_enabled())
-        self._env("prenorm")
-        with mock.patch.object(gdn_recurrent, "_gdn", object()):
-            self.assertTrue(gdn_recurrent.prenorm_gate_enabled())
-
-    def test_commit_capabilities(self):
-        for value, bplus, handoff in (
-            ("all", True, True),
-            ("bplus", True, False),
-            ("handoff", True, True),
-            ("conv", False, False),
-            ("0", False, False),
-        ):
-            with self.subTest(value=value):
-                self._env(value)
-                self.assertEqual(gdn_commit.enabled(), bplus)
-                self.assertEqual(gdn_commit.handoff_enabled(), handoff)
 
     def test_legacy_switches_are_ignored_and_reported(self):
         with mock.patch.dict(os.environ, {
-            switches.ENV: "all",
+            switches.ENV: "1",
             "SGLANG_GDN_HIP_BPLUS": "1",
         }, clear=True), mock.patch.object(switches._LOG, "warning") as warning:
-            switches._warned = False
-            self.assertTrue(switches.has(switches.CONV))
+            switches._warned_legacy = False
+            self.assertTrue(switches.enabled())
         warning.assert_called_once()
         self.assertIn("SGLANG_GDN_HIP_BPLUS", warning.call_args[0][1])
+
+    def test_the_commit_chain_follows_the_switch(self):
+        for value, expected in (("1", True), ("0", False)):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {switches.ENV: value}):
+                self.assertEqual(gdn_commit.enabled(), expected)
+
+
+@unittest.skipIf(server_args_hooks is None,
+                 "server args hook needs the pinned sglang tree")
+class StartupAssertTest(unittest.TestCase):
+    def _run(self, hip, disable_radix):
+        import types
+        args = types.SimpleNamespace(
+            custom_all_reduce_backend=None, minimax_opt=None, hy3_sp=None,
+            hcu_plugin_cp_cache_layer_split=None,
+        )
+        result = types.SimpleNamespace(disable_radix_cache=disable_radix)
+        with mock.patch.dict(os.environ, {"SGLANG_GDN_HIP": hip}), \
+                mock.patch.object(server_args_hooks, "is_record", lambda r: False), \
+                mock.patch.object(server_args_hooks, "is_hcu", lambda: True), \
+                mock.patch.object(server_args_hooks, "minimax_opt_enabled",
+                                  lambda: False), \
+                mock.patch.object(server_args_hooks, "hy3_sp_enabled",
+                                  lambda: False):
+            return server_args_hooks.after_from_cli_args(
+                result, type(result), args)
+
+    def test_the_switch_requires_a_disabled_radix_cache(self):
+        with self.assertRaisesRegex(ValueError, "disable-radix-cache"):
+            self._run("1", disable_radix=False)
+
+    def test_the_switch_is_fine_with_a_disabled_radix_cache(self):
+        self.assertIsNotNone(self._run("1", disable_radix=True))
+
+    def test_the_switch_off_does_not_constrain_the_cache(self):
+        self.assertIsNotNone(self._run("0", disable_radix=False))
 
 
 if __name__ == "__main__":

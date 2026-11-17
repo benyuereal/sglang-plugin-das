@@ -17,6 +17,7 @@ from unittest import mock
 import torch
 
 from hcu_sglang.layers.attention.linear import gdn_conv, gdn_recurrent
+from hcu_sglang.layers.attention.linear import gdn_switches
 
 
 class ConvUpdateFallbackTests(unittest.TestCase):
@@ -27,7 +28,8 @@ class ConvUpdateFallbackTests(unittest.TestCase):
         self.x = torch.zeros(1, 8)
         self.kwargs = {"conv_state_indices": torch.zeros(1, dtype=torch.int32)}
 
-    def _call(self, *, is_hcu=True, use_hcu=False, enabled=False, hip=None):
+    def _call(self, *, is_hcu=True, use_hcu=False, enabled=False, hip=None,
+              required=False):
         """Run update() with lightop and both upstream updates stubbed."""
 
         def hcu(*args, **kwargs):
@@ -49,7 +51,8 @@ class ConvUpdateFallbackTests(unittest.TestCase):
             log=self.logs.append,
         )
         patches = [
-            mock.patch.object(gdn_recurrent, "conv_enabled", lambda: enabled),
+            mock.patch.object(gdn_switches, "enabled", lambda: enabled),
+            mock.patch.object(gdn_recurrent, "enabled", lambda: True),
             mock.patch.object(gdn_recurrent, "conv_update", lightop),
             mock.patch.object(gdn_recurrent, "conv_last_reason",
                               lambda: "outside the kernel"),
@@ -58,7 +61,7 @@ class ConvUpdateFallbackTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         return gdn_conv.update(
-            self.x, None, None, None, "silu", **self.kwargs
+            self.x, None, None, None, "silu", required=required, **self.kwargs
         )
 
     def test_lightop_off_runs_triton(self):
@@ -98,6 +101,14 @@ class ConvUpdateFallbackTests(unittest.TestCase):
         self.assertEqual(self._call(is_hcu=False, enabled=True, hip="hip"),
                          "triton")
         self.assertEqual(self.calls, ["triton"])
+
+    def test_a_decline_in_the_verify_path_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "HIP conv update"):
+            self._call(enabled=True, use_hcu=True, hip=None, required=True)
+
+    def test_required_without_the_switch_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "but it is off"):
+            self._call(enabled=False, required=True)
 
     def test_update_before_configure_is_a_programming_error(self):
         gdn_conv.configure(is_hcu=False, triton=None, hcu=None,

@@ -28,7 +28,7 @@ PINNED = {
     "forward_decode": "e991f711b27f57102cd81e32a9a6fa945243e73937c5387f1541ff48996d0121",
     "_convolve_prefill": "872dd8b3633f91a1299d7743537b2423734fa1707f57ce9c06d3924ed5b9a872",
     "forward_extend": "1acc74f7e3822ea039ce0e2662252691cfaa0351ed498f704e8dc34bd84eaa11",
-    "_verify_kernel_forward": "9fc00333fd2eb0fd0bfa4aab7a0fd1be7dada247956cade690e55c3879fc75e9",
+    "_verify_kernel_forward": "898d06f9df7264060c7196b88894314f7d9ae74c5fa80c5f09627ae99cd59ac3",
 }
 
 # The deltas that make the copy ours; losing one of these is the regression.

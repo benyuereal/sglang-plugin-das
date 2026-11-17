@@ -1,16 +1,14 @@
 """GDN recurrent kernels, served by ``lightop.gdn`` when it is installed.
 
 The kernel and its tensor marshalling live in the lightop operator library;
-this module only maps the plugin's env switches onto that API and reports
-availability. When lightop is absent the plugin keeps the upstream Triton
-dispatcher path (every ``*_enabled`` predicate below returns False).
+this module only maps the binary switch onto that API and reports
+availability. When lightop is absent the overlay keeps the upstream
+Triton dispatcher path.
 """
 
 import logging
 
 import torch
-
-from hcu_sglang.layers.attention.linear import gdn_switches as switches
 
 try:
     from lightop import gdn as _gdn
@@ -29,24 +27,6 @@ def _lib():
 def enabled() -> bool:
     """Whether the operator library that serves these kernels is importable."""
     return _gdn is not None
-
-
-def _capability(name: str) -> bool:
-    return enabled() and switches.has(name)
-
-
-def enabled_kernel() -> bool:
-    return _capability(switches.KERNEL)
-
-
-def prenorm_enabled() -> bool:
-    """Hoist q/k l2norm + gating out of the 12x-redundant verify CTAs."""
-    return _capability(switches.PRENORM)
-
-
-def prenorm_gate_enabled() -> bool:
-    # The gate ships inside the prenorm kernel; it is not a separate choice.
-    return prenorm_enabled()
 
 
 def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
@@ -68,7 +48,7 @@ def verify(q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
         q, k, v, a, b, A_log, dt_bias, cu_seqlens, ssm_states, cache_indices,
         snap_flat, snap_idx, cache_steps, draft_token_num, o,
         prev_step=prev_step, store=store, store_row=store_row,
-        prenorm=prenorm_enabled(), prenorm_gate=prenorm_gate_enabled(),
+        prenorm=True, prenorm_gate=True,
     )
 
 
@@ -113,10 +93,6 @@ def f32(x: torch.Tensor) -> torch.Tensor:
 _CONV_LAST_REASON = None
 
 
-def conv_enabled() -> bool:
-    return _capability(switches.CONV)
-
-
 def conv_last_reason():
     """Why the last conv_update() call stayed on Triton (None if it ran)."""
     return _CONV_LAST_REASON
@@ -130,9 +106,6 @@ def conv_update(x, conv_state, weight, bias=None, activation=None,
                 pad_slot_id=-1):
     """Launch lightop's conv update; None means the caller keeps Triton."""
     global _CONV_LAST_REASON
-    if not conv_enabled():
-        _CONV_LAST_REASON = "lightop.gdn is not installed"
-        return None
     reason = _gdn.gdn_conv1d_unsupported_reason(
         x, conv_state, weight, bias,
         cache_seqlens=cache_seqlens, conv_state_indices=conv_state_indices,

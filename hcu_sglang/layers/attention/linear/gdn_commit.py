@@ -78,11 +78,7 @@ def state(backend) -> CommitState:
     return st
 
 def enabled() -> bool:
-    return switches.has(switches.BPLUS)
-
-def handoff_enabled() -> bool:
-    """Zero-copy state handoff: verify reads h0 from the committed row."""
-    return switches.has(switches.HANDOFF)
+    return switches.enabled()
 
 def _slot_ids(slots) -> torch.Tensor:
     return slots.to(torch.int64).clamp_min(0)
@@ -106,7 +102,7 @@ def _buf(st, name: str, key, rows: int, dtype, device) -> torch.Tensor:
 
 def seed_prev(backend, slots, mamba_cache_params, cache_steps: int) -> None:
     """Publish a freshly written temporal state to the handoff scratch rows."""
-    if not handoff_enabled():
+    if not enabled():
         return
     temporal = mamba_cache_params.temporal
     inter = getattr(mamba_cache_params, "intermediate_ssm", None)
@@ -203,7 +199,7 @@ def h0_rows(slots: torch.Tensor, prev: torch.Tensor, row_stride: int) -> torch.T
 
 def commit_prev(backend, state_indices, last_correct, T: int, cache_steps: int) -> bool:
     """Advance the committed row; no state copy."""
-    if not handoff_enabled():
+    if not enabled():
         return False
     st = state(backend)
     if st.prev is None or st.commit_failed:
@@ -306,8 +302,7 @@ def stash(backend, layer, q, k, v, a, b, draft_token_num) -> bool:
         return False
 
 def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache,
-                cache_indices, intermediate_indices, mamba_cache, ss_states,
-                query_start_loc):
+                cache_indices, mamba_cache, query_start_loc):
     """Write this step's snapshot row and hand the truncated rows to ``stash``.
 
     Returns the kernel output, or None when the chain declined.
@@ -315,30 +310,23 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
     if not stash(backend, layer, q, k, v, a, b, draft_token_num):
         return None
     flat = snap_cache.reshape(-1, *snap_cache.shape[2:])
-    store_arg = store_row_arg = None
     st = state(backend)
-    if handoff_enabled():
-        # Slot-indexed scratch rows give the committed row a stable address,
-        # so commit only moves an int32 pointer; stride is the allocated
-        # cache_steps, not the runtime draft-token count.
-        cache_steps = int(snap_cache.shape[1])
-        snap_idx = cache_indices[:n].to(torch.int32)
-        begin_verify_step(backend, layer.layer_id)
-        sh = shared_step_values(backend, snap_idx, mamba_cache, cache_steps,
-                                int(draft_token_num))
-        row = sh["rows"][cache_steps]
-        h0_src, h0_idx, prev_arg = flat, row["h0"], st.prev
-        store_arg, store_row_arg = sh["store"], row["store_row"]
-    else:
-        snap_idx = intermediate_indices[:n].to(torch.int32)
-        h0_src, h0_idx, prev_arg = ss_states, cache_indices[:n].to(torch.int32), None
+    # Slot-indexed scratch rows give the committed row a stable address, so
+    # commit only moves an int32 pointer; stride is the allocated cache_steps,
+    # not the runtime draft-token count.
+    cache_steps = int(snap_cache.shape[1])
+    snap_idx = cache_indices[:n].to(torch.int32)
+    begin_verify_step(backend, layer.layer_id)
+    sh = shared_step_values(backend, snap_idx, mamba_cache, cache_steps,
+                            int(draft_token_num))
+    row = sh["rows"][cache_steps]
     st.snap_idx = snap_idx
     out = q.new_empty((1, q.shape[1], v.shape[2], v.shape[3]))
     gdn_recurrent.verify(
         q, k, v, a, b, layer.A_log, layer.dt_bias, query_start_loc[: n + 1],
-        h0_src, h0_idx, flat, snap_idx, int(snap_cache.shape[1]),
+        flat, row["h0"], flat, snap_idx, cache_steps,
         int(draft_token_num), out,
-        prev_step=prev_arg, store=store_arg, store_row=store_row_arg)
+        prev_step=st.prev, store=sh["store"], store_row=row["store_row"])
     return out
 
 def compensate_from_stash(backend, state_indices, last_correct) -> bool:
@@ -346,43 +334,25 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
     if not enabled():
         return False
     st = state(backend)
-    if not st.stash or st.snap_idx is None:
+    if not st.stash or st.snap_idx is None or st.prev is None:
         return False
-    handoff = handoff_enabled()
     try:
         # Graph replay skips verify's Python: prefer the live value.
         T = int(st.live_T or st.capture_T)
         if T <= 1:
             return False
         n, idx32 = int(state_indices.shape[0]), state_indices.to(torch.int32)
-        if handoff:
-            snap32 = idx32
-        else:
-            from sglang.srt.layers.attention.linear.utils import (
-                pp_spec_stable_rows_enabled,
-            )
-            if pp_spec_stable_rows_enabled():
-                if int(st.snap_idx.numel()) != n:
-                    return False
-                snap32 = st.snap_idx.to(torch.int32)
-            else:
-                # Default verify rows are batch positions; rebuild for the live batch.
-                snap32 = torch.arange(n, dtype=torch.int32,
-                                      device=state_indices.device)
+        # Handoff rows are slot-indexed, so the live batch indices address them.
+        snap32 = idx32
         last32 = last_correct.to(torch.int32)
         trunc = (idx32 > 0) & (last32 >= 0) & (last32 < T - 1)
         store_step = torch.where(trunc, last32, torch.full_like(last32, -1))
         D, m = T, n * T
-        prev_now = None
-        if handoff and st.prev is None:
-            return False
-        skip_full = not switches.has(switches.REPLAY_ALL)
         # A full accept already committed verify's row, so replay only the
         # truncated slots. ``neg`` is built unconditionally: ``torch.where``
-        # rejects None, and the per-layer except would drop every layer.
-        # With the switch off a full accept still replays.
-        neg = torch.full_like(idx32, -1) if skip_full else idx32
-        h0_by_stride, h0_plain, rows = {}, None, []
+        # rejects None.
+        neg = torch.full_like(idx32, -1)
+        h0_by_stride, prev_now, rows = {}, None, []
         for lid, ent in st.stash.items():
             try:
                 layer_cache = ent.get("layer_cache")
@@ -397,26 +367,18 @@ def compensate_from_stash(backend, state_indices, last_correct) -> bool:
                 if flat is None:
                     flat = ent["flat"] = inter.reshape(-1, *inter.shape[2:])
                 stride = int(inter.shape[1])
-                if handoff:
-                    ssm = flat
-                    h0_idx = h0_by_stride.get(stride)
+                h0_idx = h0_by_stride.get(stride)
+                if h0_idx is None:
+                    h0_idx = step_h0(backend, idx32, stride)
                     if h0_idx is None:
-                        h0_idx = step_h0(backend, idx32, stride)
-                        if h0_idx is None:
-                            if prev_now is None:
-                                prev_now = st.prev.index_select(
-                                    0, idx32.to(torch.int64).clamp_min(0)
-                                ).to(torch.int32)
-                            h0_idx = h0_rows(idx32, prev_now, stride)
-                        if skip_full:
-                            h0_idx = torch.where(trunc, h0_idx, neg)
-                        h0_by_stride[stride] = h0_idx
-                else:
-                    ssm = layer_cache.temporal
-                    if h0_plain is None:
-                        h0_plain = torch.where(trunc, idx32, neg)
-                    h0_idx = h0_plain
-                rows.append((ent, ssm, flat, h0_idx, stride, lid))
+                        if prev_now is None:
+                            prev_now = st.prev.index_select(
+                                0, idx32.to(torch.int64).clamp_min(0)
+                            ).to(torch.int32)
+                        h0_idx = h0_rows(idx32, prev_now, stride)
+                    h0_idx = torch.where(trunc, h0_idx, neg)
+                    h0_by_stride[stride] = h0_idx
+                rows.append((ent, flat, flat, h0_idx, stride, lid))
             except Exception:  # noqa: BLE001 - optional path
                 logger.warning("[gdn-bplus] compensate failed for layer %s",
                                lid, exc_info=True)

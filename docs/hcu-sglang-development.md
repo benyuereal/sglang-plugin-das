@@ -2968,8 +2968,9 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 
 - 依赖 lightop wheel 携带 `lib/_gdn*.so`（`scripts/build_gdn.sh`，aicc 构建并断言 8 个导出
   符号）；设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
-- 回退：`SGLANG_GDN_HIP=0`（或只给子能力，如 `prenorm`）回到上游 Triton；lightop
-  缺失时同一开关不生效。旧的分项变量已废弃，设置时进程只打一条告警并忽略。
+- 回退：`SGLANG_GDN_HIP=0` 回到上游 Triton；lightop 缺失时同一开关不生效。旧的
+  分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 要求 `--disable-radix-cache`，
+  启动时断言；开启 radix 的前缀复用与 handoff 的单行提交互斥。
 
 ## 2026-11-17 FA 分页布局、silu 回退与投机兼容：SGLang 0.5.22
 

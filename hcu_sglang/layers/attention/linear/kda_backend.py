@@ -1889,7 +1889,7 @@ class _HybridMethods:
 
         # Pipeline-parallel rows are request-pool indices; the pointer
         # arithmetic below assumes the forward's own row layout.
-        if not gdn_commit.handoff_enabled() or src_indices_raw is not None:
+        if not gdn_commit.enabled() or src_indices_raw is not None:
             return False
         # Host int on purpose: .item() would serialize the CPU behind the
         # verify every decode step; the captured width is the fallback.

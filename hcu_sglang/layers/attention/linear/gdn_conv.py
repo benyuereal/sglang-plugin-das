@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 
 from hcu_sglang.layers.attention.linear import gdn_recurrent
+from hcu_sglang.layers.attention.linear import gdn_switches as switches
 
 logger = logging.getLogger(__name__)
 
@@ -32,15 +33,25 @@ def configure(*, is_hcu, triton, hcu=None, log=None):
         _state["log"] = log
 
 
-def update(x, conv_state, weight, bias=None, activation=None, **kwargs):
-    """The HIP conv update, or the upstream one when it declines."""
-    if _state["is_hcu"] and gdn_recurrent.conv_enabled():
+def update(x, conv_state, weight, bias=None, activation=None, required=False,
+           **kwargs):
+    """The HIP conv update, or the upstream one when it declines.
+
+    ``required`` is the verify path: the upstream update has no
+    intermediate-window arguments, so a decline raises instead of falling back.
+    """
+    if _state["is_hcu"] and switches.enabled() and gdn_recurrent.enabled():
         try:
             out = gdn_recurrent.conv_update(
                 x, conv_state, weight, bias, activation, **kwargs
             )
             if out is not None:
                 return out
+            reason = gdn_recurrent.conv_last_reason()
+            if required:
+                raise RuntimeError(
+                    f"GDN verify needs the HIP conv update ({reason})"
+                )
             if not _logged["done"]:
                 _logged["done"] = True
                 _state["log"](
@@ -49,10 +60,14 @@ def update(x, conv_state, weight, bias=None, activation=None, **kwargs):
                     "using the upstream update."
                 )
         except Exception as exc:  # noqa: BLE001 - never fail a forward here
+            if required:
+                raise
             if not _logged["done"]:
                 _logged["done"] = True
                 _state["log"](f"SGLANG_GDN_HIP conv path disabled: {exc}")
     updater = _state["hcu"] or _state["triton"]
     if updater is None:
         raise RuntimeError("gdn_conv.update() used before configure()")
+    if required:
+        raise RuntimeError("GDN verify needs the HIP conv update, but it is off")
     return updater(x, conv_state, weight, bias, activation, **kwargs)
