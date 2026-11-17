@@ -3826,11 +3826,16 @@ ROCm/AITER 后端选择 Hook 仅向实际 ROCm 平台注册，HCU OOT 不加载�
 
 **未纳入**：HND page-major 池识别（本栈未启用 `SGLANG_USE_HND_KVCACHE`，`SGLANG_HCU_FA_PAGED_BSHD` 无消费方，已移除）；`server_args_hooks.py` 的 `hasattr` 清理；`speculative_compat.py` 的 EAGLE rejection-sampling 默认（本栈走 NEXTN，且上游已有 HIP 策略）。交付分支 `pyproject.toml` 的差异属于 GDN 分支内容。`SGLANG_HCU_FUSE_QKVZBA_VERIFY` 与 `SGLANG_GDN_ZBA_STRIDED` 同样未纳入。
 
-**实际验证（本机 Linux）**：
+**集成栈验证（2026-11-17）**：
 
-- 改动文件 `python3 -m py_compile` 通过。
-- `python3 ci/l0_gate.py`：passed（755 个 Python 文件，8 个 skill）。
-- HND 路由及其单测随开关一起移除；本轮未重跑完整 `unittest discover`。
+- 40 请求 × 2k/2k、TEMP=0、radix cache 开启、mamba 160、mem 0.89、
+  `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`，全部加速项开启：40/40，
+  **1231.48 tok/s / Mean TPOT 25.05 ms / Mean TTFT 12.40 s**，
+  `#running-req: 40 / #queue-req: 0`。
+- 同配置基线树：40/40，1195.23 tok/s / Mean TPOT 25.92 ms。
+- HumanEval：163/164 = 99.4%（evalscope，2026-11-16，Qwen3.8-27B）。
+- 错题 9×4 复跑（radix 修复树）：28/36 通过（77.8%），与无 radix 基线 29/36 同档。
+- `python3 -m py_compile` 通过；`python3 ci/l0_gate.py` passed（755 个 Python 文件，8 个 skill）。
 
 **未验证项**：
 
