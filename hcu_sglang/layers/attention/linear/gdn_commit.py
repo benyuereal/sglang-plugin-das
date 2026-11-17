@@ -83,21 +83,25 @@ def _head_dims(*tensors) -> list[int]:
 def _fused_qkv_view(q, k, v, n: int, T: int):
     """[n, T, W] view over one fused q|k|v buffer, or None when they are apart."""
     qd, kd, vd = _head_dims(q, k, v)
-    W, ts = int(q.stride(1)), (q, k, v)
-    if (q.dtype != k.dtype or q.dtype != v.dtype or W != qd + kd + vd
-            or any(int(t.stride(1)) != W for t in ts)):
-        return None
-    # Row-major within the head dim: the head axis sits immediately above it.
-    if any(int(t.stride(3)) != 1 or int(t.stride(2)) != int(t.shape[3]) for t in ts):
-        return None
-    base, esz = q.untyped_storage().data_ptr(), q.element_size()
-    for t, off in zip(ts, (0, qd, qd + kd)):
-        if (t.untyped_storage().data_ptr() != base
-                or int(t.data_ptr()) - int(q.data_ptr()) != off * esz):
-            return None
-    if int(q.shape[1]) != n * T:
+    W, parts = int(q.stride(1)), (q, k, v)
+    esz, base = q.element_size(), q.untyped_storage().data_ptr()
+    offsets = (0, qd, qd + kd)
+    checks = (
+        all(t.dtype == q.dtype for t in parts),
+        W == qd + kd + vd,
+        all(int(t.stride(1)) == W for t in parts),
+        # Row-major within the head dim: the head axis sits immediately above it.
+        all(int(t.stride(3)) == 1 and int(t.stride(2)) == int(t.shape[3])
+            for t in parts),
+        all(t.untyped_storage().data_ptr() == base
+            and int(t.data_ptr()) - int(q.data_ptr()) == off * esz
+            for t, off in zip(parts, offsets)),
+        int(q.shape[1]) == n * T,
+    )
+    if not all(checks):
         return None
     return torch.as_strided(q, (n, T, W), (T * W, W, 1))
+
 
 def _ensure_layer_entry(backend, layer, q, k, v, a, b, D: int):
     st = state(backend)
