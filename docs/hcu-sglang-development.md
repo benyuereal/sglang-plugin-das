@@ -4054,3 +4054,11 @@ TEMP=0，无 rejection sampling，40×2048 in / 40×2048 out）：
 - hbird packed/W12 路径、c40 绝对 ≥1200 目标未达成。
 - 本轮 A/B 在 GPU5/9162 顺序完成，但机器上仍有其他 GPU（0/4）的服务常驻；绝对数受
   共享主机资源影响，两臂相对差在同一次会话内可比。
+
+## 2026-11-17（五）handoff 全栈 40 请求单波
+
+int-handoff（main + misc/FA + GDN handoff + gemm/draft），radix ON、mamba 160、
+mem 0.89、`SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`：40/40，**1273.35 tok/s /
+Mean TPOT 22.91 ms / Mean TTFT 12.51 s**，服务端 `#running-req: 40 /
+#queue-req: 0`。对比同配置 plain 集成 1231.48 / 25.05：**+3.4% / −2.14 ms**。
+证据：`logs/bench_handoff_int_r1.log`、`logs/serve_handoff_int_r1.log`。
