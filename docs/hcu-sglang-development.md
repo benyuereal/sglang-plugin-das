@@ -3739,3 +3739,25 @@ ROCm/AITER 后端选择 Hook 仅向实际 ROCm 平台注册，HCU OOT 不加载�
 新增双入口与其他 Hook 共存的旧实现失败反例，注册与 rotary 专项、
 结构/导览及当前组合模型的实际结果随本 PR 验证说明提供；历史 INT8
 设备结果仍只属于其原版本，不将同步主分支视为重新验收所有配方。
+
+## 2026-11-17 FA 查询准备钩子与 silu 回退
+
+**问题来源**：从交付分支 `qwen3.8-27b-perf` 拆出与 GDN 无关的平台适配改动，形成独立 PR（分支 `qwen3.8-27b-perf-misc`，基线 `main` `289b7fb`）。
+
+**改动范围**：
+
+- `hcu_sglang/layers/attention/flashattention_backend.py`：新增 `prepare_paged_mha_query` AROUND 钩子，0.5.22 下补 fp8 KV 的 k/v descale tile；`around_init` 同步改写模块级 `flash_attn_varlen_func`/`flash_attn_with_kvcache`，否则 forward 仍调用上游模块全局、插件路由不生效。
+- `hcu_sglang/layers/norm_activation.py`：`lightop` 不可导入时回退官方 `SiluAndMul` 实现。
+
+**未纳入**：HND page-major 池识别（本栈未启用 `SGLANG_USE_HND_KVCACHE`，`SGLANG_HCU_FA_PAGED_BSHD` 无消费方，已移除）；`server_args_hooks.py` 的 `hasattr` 清理；`speculative_compat.py` 的 EAGLE rejection-sampling 默认（本栈走 NEXTN，且上游已有 HIP 策略）。交付分支 `pyproject.toml` 的差异属于 GDN 分支内容。`SGLANG_HCU_FUSE_QKVZBA_VERIFY` 与 `SGLANG_GDN_ZBA_STRIDED` 同样未纳入。
+
+**实际验证（本机 Linux）**：
+
+- 改动文件 `python3 -m py_compile` 通过。
+- `python3 ci/l0_gate.py`：passed（755 个 Python 文件，8 个 skill）。
+- HND 路由及其单测随开关一起移除；本轮未重跑完整 `unittest discover`。
+
+**未验证项**：
+
+- 未在真实 HCU 设备上运行模型；fp8 descale tile 与 lightop 回退缺少实机/整模型验证。
+- 未运行 GitHub CI。
