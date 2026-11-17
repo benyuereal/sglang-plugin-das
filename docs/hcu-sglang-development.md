@@ -2972,3 +2972,61 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   结果当成本候选通过。
 - 回退：`SGLANG_GDN_HIP_BPLUS/HANDOFF/PRENORM/PRENORM_GATE/CONV` 任一置 0，或 lightop
   缺失，verify/conv 全部回上游 Triton。
+
+## 2026-11-17 FA 分页布局钩子、silu 回退与投机兼容
+
+**问题来源**：从交付分支 `qwen3.8-27b-perf` 拆出与 GDN 无关的平台适配改动，形成独立 PR（分支 `qwen3.8-27b-perf-misc`，基线 `main` `534f9be`）。
+
+**改动范围**：
+
+- `hcu_sglang/layers/attention/flashattention_interface.py`：识别 `paged_kv_view()` 产生的 HND 物理布局（按 stride 判断），还原为 `[pages, heads, page, dim]` 并走 `layout="bhsd"` 的 varlen 入口；间隙回退 `_restore_hcu_cache_layout`；fp8 查询缺省 descale 补 1.0；decode 传 `s_aux` 与 `layout` 开关。
+- `hcu_sglang/layers/attention/flashattention_backend.py`：新增 `prepare_paged_mha_query` AROUND 钩子，0.5.22 下补 fp8 KV 的 k/v descale tile；`around_init` 同步改写模块级 `flash_attn_varlen_func`/`flash_attn_with_kvcache`。
+- `hcu_sglang/layers/norm_activation.py`：`lightop` 不可导入时回退官方 `SiluAndMul` 实现。
+- `hcu_sglang/server_args_hooks.py`：去掉 `_declare`/`_resolved` 的 `hasattr` 兼容分支，统一走 `declare_resolution`/`resolving_view`/`model_config_of`。
+- `hcu_sglang/speculative_compat.py`：新增 `_handle_eagle_family` 自动开启 rejection sampling（受 `SGLANG_HCU_AUTO_REJECTION_SAMPLING` 控制）与 torchaudio 探测重构；**不包含** GDN 的 `commit_mamba_states_after_verify` 钩子及其 `gdn_commit` 导入。
+- `hcu_sglang/environ.py`：仅新增 `SGLANG_HCU_AUTO_REJECTION_SAMPLING`（默认 True）与 `SGLANG_HCU_FA_PAGED_BSHD`（默认 False）。
+- `tests/test_fa_paged_switch.py`：HND/NHD 判定与还原的 CPU 单测。
+
+**未纳入**：交付分支 `pyproject.toml` 的差异不是版本号，而是 `layers/attention/linear/lib/*` 的 package-data，属于 GDN 分支内容，本 PR 跳过。`SGLANG_HCU_FUSE_QKVZBA_VERIFY` 与 `SGLANG_GDN_ZBA_STRIDED` 同样未纳入。
+
+**实际验证（本机 Linux）**：
+
+- 改动文件 `python3 -m py_compile` 通过；changed files 中无 `hcu_sglang.layers.attention.linear`/`gdn_commit`/`commit_mamba` 引用。
+- `python3 ci/l0_gate.py`：passed（703 个 Python 文件，8 个 skill）。
+- `python3 -m unittest discover -s tests`：246 项，13 failures / 3 errors / 17 skipped。失败集中在既存快照/运行时 triage 类测试，与 main 基线一致；`tests/test_fa_paged_switch.py` 3 项全部通过。
+
+**未验证项**：
+
+- 未在真实 HCU 设备上运行模型；HND 布局识别、fp8 descale 填充与 lightop 回退缺少实机/整模型验证。
+- `SGLANG_HCU_FA_PAGED_BSHD` 在本仓仅声明，消费方不在本仓，未验证其路由行为。
+- 未运行 GitHub CI。
+## 2026-11-17 FA paged layout、silu 回退与 speculative compat：SGLang 0.5.22
+
+用途：让 NHD 分页池走到 wheel 的直通 paged 核、补齐 fp8 KV 的 descale，并在 lightop
+缺失时回退上游 silu；同时把自动拒绝采样接入官方入口。归属判据：平台与框架适配属
+plugin；FA wheel 的布局选择属 flash-attention-das。
+
+### 代码与组合边界
+
+- plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；FA 侧对应
+  `flash-attention-das` 分支 `fix/varlen-layout` @ `ca3e6cb39bd790580ddb15d998304e6299b37173`。
+- `flashattention_interface.py`：NHD pool 的 varlen 直通与 HND 视图；
+  `flashattention_backend.py`：fp8 KV descale 补齐 hook；`norm_activation.py`：lightop
+  silu 缺失时回退；`speculative_compat.py`：自动拒绝采样与 torchaudio 探测
+  （B+ commit hook 归 GDN PR）。
+- 部署前置：flash_attn wheel 的 varlen layout 补丁
+  （`patches/0001-flash-attn-varlen-layout.patch`）；缺失时 TPOT 会回到 25 ms 以上。
+
+### 已有设备与模型证据（2026-11-17）
+
+- 交付候选 `e7a0da6`（`SGLANG_HCU_FA_PAGED_BSHD=1`）：40/40 1300.07 tok/s / TPOT 23.34；
+  同臂 A/B（fp8 头）：splitkv 1133.35/25.48 vs bshd 1185.45/25.03。
+- `tests/test_fa_paged_switch.py` 3/3；L0 passed；单测 13F/3E/17。
+
+### 依赖、回退及证据
+
+- HND 支持为休眠路径（交付用 NHD）；`SGLANG_HCU_FA_PAGED_BSHD` 的消费方在 adapter/wheel
+  侧，本仓只做登记；FA 其他模型的影响面未在本 PR 验证。
+- 回退：`SGLANG_HCU_FA_PAGED_BSHD=0` 回 split-KV；`SGLANG_KV_LAYOUT_HCU_FA=0` 保持官方
+  布局；`SGLANG_HCU_AUTO_REJECTION_SAMPLING=0` 回上游采样。
+- 本 PR 分支未重跑完整镜像与精度；候选提交上的复测待合入前完成。

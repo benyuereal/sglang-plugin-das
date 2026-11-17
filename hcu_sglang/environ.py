@@ -18,6 +18,7 @@ _ENV_SPECS: dict[str, tuple[type, Any]] = {
     "SGLANG_HCU_W8A8_USE_LIGHTOP": (EnvBool, False),
     "SGLANG_HCU_GLM_CT_BF16_ROUTER": (EnvBool, False),
     "SGLANG_LIGHTOP_KVALLOC_KERNEL": (EnvBool, False),
+    "SGLANG_HCU_AUTO_REJECTION_SAMPLING": (EnvBool, True),
     "SGLANG_USE_FUSED_SILU_MUL_CLAMP_QUANT": (EnvBool, False),
     'SGLANG_EXPERIMENTAL_LPLB_STATIC_PROBS': (EnvStr, None),
     'SGLANG_SIMULATED_EXPERT_BALANCE': (EnvBool, False),
@@ -92,6 +93,9 @@ _ENV_SPECS: dict[str, tuple[type, Any]] = {
     # the default now; this layout stays for perf A/B with the vllm_-prefixed
     # HCU FA attention kernels that consume it.
     "SGLANG_KV_LAYOUT_HCU_FA": (EnvBool, False),
+    # Route NHD-pool decode/MTP-verify varlen calls to the wheel's direct
+    # paged kernel (layout="bshd"). Changes T=0 output: different kernel.
+    "SGLANG_HCU_FA_PAGED_BSHD": (EnvBool, False),
     # Fork-source JIT overlay: opt-in only. The adapter already owns DTK
     # compile-time shims for official sources; the overlay's global header
     # shadowing breaks official-source JIT builds in stacked runs.

@@ -58,6 +58,30 @@ def _restore_hcu_cache_layout(k_cache: torch.Tensor, v_cache: torch.Tensor):
     )
 
 
+def _is_hnd(t) -> bool:
+    """True for sglang's [pages, page_size, heads, dim] view of an HND pool.
+
+    paged_kv_view() swaps head and page dims of a physical
+    [pages, heads, page_size, dim] buffer; the resulting stride-1 head dim is
+    head_dim, unlike a contiguous NHD pool whose token stride is heads*head_dim.
+    """
+    return (
+        t.dim() == 4
+        and t.shape[-2] > 1
+        and t.stride(1) == t.shape[-1]
+        and t.stride(2) == t.shape[-3] * t.shape[-1]
+    )
+
+
+def _to_hnd_buffers(k_cache, v_cache):
+    """Undo paged_kv_view's permute: the physical [pages, heads, page, dim] view."""
+    k = k_cache.permute(0, 2, 1, 3)
+    v = v_cache.permute(0, 2, 1, 3)
+    if not (k.is_contiguous() and v.is_contiguous()):
+        k, v = k.contiguous(), v.contiguous()
+    return k, v
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -104,11 +128,25 @@ def flash_attn_with_kvcache(
     layout=None,
 ):
     from flash_attn import (
+        flash_attn_varlen_func as fa3_varlen_func,
         vllm_flash_attn_varlen_func,
         vllm_flash_attn_with_kvcache,
     )
 
-    k_cache, v_cache = _restore_hcu_cache_layout(k_cache, v_cache)
+    # SGLANG_USE_HND_KVCACHE pools are physically [pages, heads, page, dim].
+    # get_paged_mha_kv_cache() hands us the permuted NHD view; take it back to
+    # the physical HND buffers and let the wheel read them with layout="bhsd".
+    # The NHD/HND choice is read off the strides so a plain pool stays on the
+    # existing path untouched.
+    hnd_layout = (
+        not _layout_enabled()
+        and _is_hnd(k_cache)
+        and _is_hnd(v_cache)
+    )
+    if hnd_layout:
+        k_cache, v_cache = _to_hnd_buffers(k_cache, v_cache)
+    else:
+        k_cache, v_cache = _restore_hcu_cache_layout(k_cache, v_cache)
 
     # Varlen calls (prefill / MTP verify carry cu_seqlens_q) must go
     # through the wheel's varlen entry for both KV layouts: the paged
@@ -117,7 +155,7 @@ def flash_attn_with_kvcache(
     # kernel then faults). The varlen entry takes the pool plus
     # block_table directly and handles both page layouts (pa_layout).
     if cu_seqlens_q is not None:
-        if _layout_enabled():
+        if hnd_layout or _layout_enabled():
             page_size = k_cache.shape[2]  # [NP, H, PS, D]
         else:
             page_size = k_cache.shape[1]  # [NP, PS, H, D]
@@ -128,7 +166,9 @@ def flash_attn_with_kvcache(
             if max_seqlen_k is None and page_table is not None
             else max_seqlen_k
         )
-        result = vllm_flash_attn_varlen_func(
+        if q_descale is None and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
+        varlen_kwargs = dict(
             q=q,
             k=k_cache,
             v=v_cache,
@@ -140,13 +180,22 @@ def flash_attn_with_kvcache(
             causal=causal,
             window_size=window_size,
             block_table=page_table,
-            fa_version=2,
             softcap=softcap,
             s_aux=sinks,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            return_softmax_lse=return_softmax_lse,
         )
+        if hnd_layout:
+            # bhsd is HND K/V with the page tokens contiguous per head; the
+            # vllm wrapper hardcodes "custom" (transposed V), which this pool
+            # is not, so the varlen entry is the only correct route here.
+            result = fa3_varlen_func(layout="bhsd", **varlen_kwargs)
+        else:
+            # The wheel's layout choice is replaced at import by
+            # hcu_sglang.compat.flash_attn.
+            result = vllm_flash_attn_varlen_func(fa_version=2, **varlen_kwargs)
         return _apply_out(result, out, return_softmax_lse)
 
     q_4d = q
@@ -163,7 +212,9 @@ def flash_attn_with_kvcache(
         window_size=window_size,
         softcap=softcap,
         return_softmax_lse=return_softmax_lse,
+        s_aux=sinks,
         num_splits=num_splits,
+        layout=1 if hnd_layout else 0,
     )
     return _apply_out(result, out, return_softmax_lse)
 
