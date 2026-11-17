@@ -3821,6 +3821,7 @@ ROCm/AITER 后端选择 Hook 仅向实际 ROCm 平台注册，HCU OOT 不加载�
 **改动范围**：
 
 - `hcu_sglang/layers/attention/flashattention_backend.py`：新增 `prepare_paged_mha_query` AROUND 钩子，0.5.22 下补 fp8 KV 的 k/v descale tile；`around_init` 同步改写模块级 `flash_attn_varlen_func`/`flash_attn_with_kvcache`，否则 forward 仍调用上游模块全局、插件路由不生效。
+- `hcu_sglang/layers/attention/flashattention_interface.py`：fp8 查询缺省 descale 补 1.0（与 backend 的 k/v descale tile 配套；三者缺一 wheel 会拒绝 varlen）。
 - `hcu_sglang/layers/norm_activation.py`：`lightop` 不可导入时回退官方 `SiluAndMul` 实现。
 
 **未纳入**：HND page-major 池识别（本栈未启用 `SGLANG_USE_HND_KVCACHE`，`SGLANG_HCU_FA_PAGED_BSHD` 无消费方，已移除）；`server_args_hooks.py` 的 `hasattr` 清理；`speculative_compat.py` 的 EAGLE rejection-sampling 默认（本栈走 NEXTN，且上游已有 HIP 策略）。交付分支 `pyproject.toml` 的差异属于 GDN 分支内容。`SGLANG_HCU_FUSE_QKVZBA_VERIFY` 与 `SGLANG_GDN_ZBA_STRIDED` 同样未纳入。
