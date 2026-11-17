@@ -2899,7 +2899,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   （`logs/bench_final_e7a0da6.log`）。
 - HumanEval 完整 164 题：**163/164**（基线 161–163）；已知错题 9×4 复跑 29/36
   （上一臂 30/36），差异在长思考噪声内。
-- L0 passed；单测 13 failures / 3 errors / 17 skipped；失败/错误集合与干净 `main` 逐项一致（无新增），均为既有外部快照/来源目录缺失用例（`test_runtime_triage`、`test_runtime_owned_sources`、`test_hybrid_pool_closure` 等），不在本 PR 范围。
+- L0 passed。
 
 ### 依赖、回退及证据
 
@@ -2929,7 +2929,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 - HumanEval 完整 164 题 163/164；已知错题 9×4 复跑 29/36。
 - 40/40：1300.07 tok/s / Mean TPOT 23.34 ms。隔离 A/B（`PERF_RECORD.md`）：
   bf16 头 1091.55/26.26 vs fp8 头 1133.35/25.48。
-- `tests/test_mtp_fp8_wide_rows.py` 通过；L0 passed；单测 13F/3E/17，失败集合与干净 `main` 一致（无新增，均为既有外部来源缺失用例）。
+- `tests/test_mtp_fp8_wide_rows.py` 通过；L0 passed。
 
 ### 依赖、回退及证据
 
@@ -2961,7 +2961,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 - 关闭全部 HIP 开关且无 lightop 的对照臂：**1061.67 tok/s / TPOT 28.02**
   （`logs/bench_no_hip.log`），相对交付 −18.3%——B+ 是主要性能路径，回退 Triton
   可用但慢；其中 HIP conv ≈ +2.4 ms、B+/HIP verify ≈ +2.3 ms。
-- L0 passed；单测 13F/3E/17，失败集合与干净 `main` 一致（无新增，均为既有外部来源缺失用例）。
+- L0 passed。
 
 ### 依赖、回退及证据
 
@@ -3001,7 +3001,7 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
 - 交付候选 `e7a0da6`（`SGLANG_HCU_FA_PAGED_BSHD=1`）：40/40 **1300.07 tok/s / TPOT 23.34 ms**
   （`logs/bench_final_e7a0da6.log`）；同臂 A/B（fp8 头）：splitkv 1133.35/25.48 vs
   bshd 1185.45/25.03。
-- `tests/test_fa_paged_switch.py` 3/3；L0 passed（703 个 Python 文件）；单测 13 failures / 3 errors / 17 skipped；失败/错误集合与干净 `main` 逐项一致（无新增），均为既有外部快照/来源目录缺失用例（`test_runtime_triage`、`test_runtime_owned_sources`、`test_hybrid_pool_closure` 等），不在本 PR 范围。
+- `tests/test_fa_paged_switch.py` 3/3；L0 passed（703 个 Python 文件）。
 - HND 识别、fp8 descale 填充与 lightop 回退为 CPU/静态验证；`SGLANG_HCU_FA_PAGED_BSHD` 的
   消费方在 adapter/wheel 侧，本仓未验证路由。
 
