@@ -3834,6 +3834,10 @@ ROCm/AITER 后端选择 Hook 仅向实际 ROCm 平台注册，HCU OOT 不加载�
   `#running-req: 40 / #queue-req: 0`。
 - 同配置基线树：40/40，1195.23 tok/s / Mean TPOT 25.92 ms。
 - HumanEval：163/164 = 99.4%（evalscope，2026-11-16，Qwen3.8-27B）。
+- 2026-11-17 集成栈全量复测：160/164；失败 78/116/145/146；4 题 2× 复跑 plain 5/8、
+  handoff 5/8（#145 稳定 0/2，历史 0/4），与单轮噪声 + 已知难题一致。
+- handoff 全栈：1273.35 tok/s / TPOT 22.91 ms vs plain 1231.48 / 25.05（+3.4% / −2.14 ms）；
+  同栈固定 8 prompt、greedy c=1 逐字节 8/8 一致。
 - 错题 9×4 复跑（radix 修复树）：28/36 通过（77.8%），与无 radix 基线 29/36 同档。
 - `python3 -m py_compile` 通过；`python3 ci/l0_gate.py` passed（755 个 Python 文件，8 个 skill）。
 
