@@ -2874,3 +2874,39 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+## 2026-11-17 GEMM 后端可插拔与量化头统一入口：SGLang 0.5.22 适配
+
+用途：把 bf16 linear、未量化 lm_head 与量化草稿头的 GEMM 收进一个可选择的接缝，
+让 hbird 只是其中一种实现，换后端不改模型代码。归属判据：新增 provider 与框架适配
+属于 plugin；本 PR 不修改上游。
+
+### 代码与组合边界
+
+- 官方 SGLang 固定为 v0.5.22；plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`。
+- 设备实测候选为交付分支 `qwen3.8-27b-perf` @ `e7a0da6`；本 PR 是其代码子集，
+  分支内未重新跑端到端。
+- `layers/gemm/backend.py` 是唯一接缝：`GemmProvider` 协议、后端选择、`convert_model`、
+  `lm_head_linear`、`prepare_quant_head`、`install_shim`，日志统一 `[gemm]`。
+- 选择按能力拆分：`SGLANG_GEMM_BACKEND` 管 bf16 linear 与未量化 lm_head
+  （legacy `HBIRD_GEMM_SGLANG=1` 等价 hbird）；`SGLANG_QUANT_HEAD_BACKEND` 管量化草稿头，
+  缺省跟随前者。`quant_lm_head.py` 收敛为薄壳，hbird 实现集中在 `providers/hbird.py`。
+
+### 已有设备与模型证据（2026-11-17）
+
+单卡 gfx938，模型 `/data/Qwen3.8-27B`，TP1/PP1，`fa3`、page 64、fp8 e4m3 KV、
+NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
+
+- 40/40（c40/2k2k，`TEMP=0`）：**1300.07 tok/s / Mean TPOT 23.34 ms**
+  （`logs/bench_final_e7a0da6.log`）。
+- HumanEval 完整 164 题：**163/164**（基线 161–163）；已知错题 9×4 复跑 29/36
+  （上一臂 30/36），差异在长思考噪声内。
+- L0 passed；单测 13 failures / 3 errors / 17 skipped（main 派生基线）。
+
+### 依赖、回退及证据
+
+- lightop/torch 选择器已接受但暂无实现：告警并保持上游 GEMM；量化头依赖 provider
+  成功加载（BF16 能力），若将来只需 fp8 头需再拆 provider。
+- 回退：`SGLANG_GEMM_BACKEND=none`（或 `HBIRD_GEMM_SGLANG=0`）全部回上游 GEMM，
+  草稿头保持 bf16。
+- 本 PR 分支未重跑完整镜像与精度；上述设备证据属于交付候选 `e7a0da6`，
+  合入前需在候选提交上复测。
