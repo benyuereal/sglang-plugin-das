@@ -202,3 +202,16 @@ LoRA 名称登记须发生在请求的最终 extra_key 确定之后，并与树�
 新增 owned crate 时成对检查 backend 预检和实际 loader，不让源码已随插件交付的后端因官方 manifest 缺失而错误回退。保留有效 original 的能力/自定义限制、显式 workspace、cache/build mode 和 features；用独立模块名区分旧 binding。验证来自 wheel 的 Cargo.lock/header/源码完整性和真实编译加载，不能用模拟 tuple 代替 Rust 生产事件。store/remove 必须携带同一 namespace，测试后消费 eviction 返回的索引并核对数量，不能忽略 destructor 的 ownership 报错。
 
 改变 token 的编码范围时，Rust 与 C++/Python 输入转换须一起更新。覆盖 u32 边界、int64 最大值、负数拒绝、普通/bigram、逐页混合宽窄编码及 prior 链，用独立 hashlib oracle 与两种真实编译后端对照。普通 token 的历史哈希需保持一致；CPU binding 通过不外推为 GPU、L3 或完整模型验证。
+
+### 原生 RoPE 的 keyword-only 状态
+
+包装器区分 keyword-only 状态未传与显式 None，完整转发给当前有效 original，
+保留旧接口；回归覆盖两种平台、对象身份和原生异常。diffusion 的独立 registry、
+平台与真实 worker 分别取证，不以 SRT 注册结果替代。涉及 TP 配置时复制实际
+rank/并行度并验证真实 group；局部接口、数值/Graph 与实际图片语义分别验收。
+
+同一 diffusion callback 的入口别名须避免重复包装同一个 target/type/callable，
+同时保留其他 Hook；覆盖双入口加载、registry reset 后重注册和注册异常传播。
+不得以永久模块标志跳过 reset 后的注册。入口和部署约定见安装指南。
+平台专用目标按已初始化的实际平台注册，分别覆盖 ROCm 与 OOT；不能通过
+补造 vendor 属性让无关后端的 import/apply 看似成功。

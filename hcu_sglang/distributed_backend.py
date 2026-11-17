@@ -544,6 +544,20 @@ def get_attn_cp_overlap_group():
     return getattr(P, '_ATTN_CP_OVERLAP', None) or P.get_attn_cp_group()
 
 
+def around_sync_eagle_verify_outputs(original, verify_state):
+    if not is_hcu():
+        return original(verify_state)
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    parallel = P.get_parallel()
+    if not is_dp_attention_enabled() or parallel.attn_dp_size == 1:
+        return original(verify_state)
+    # Attention DP ranks own different requests; only TP/CP peers share this state.
+    for group in (parallel.attn_tp_group, parallel.attn_cp_group):
+        if group.world_size > 1:
+            group.broadcast(verify_state, src=0)
+
+
 _SOURCE_COMM_METHODS = {}
 
 
@@ -624,5 +638,6 @@ def register_hooks():
         ("sglang.srt.distributed.parallel_state.init_world_group", around_init_world_group, HookType.AROUND),
         ("sglang.srt.distributed.parallel_state.init_model_parallel_group", around_init_model_parallel_group, HookType.AROUND),
         ("sglang.srt.distributed.bootstrap._set_all_reduce_flags", after_set_all_reduce_flags, HookType.AFTER),
+        ("sglang.srt.speculative.eagle_utils._sync_eagle_verify_outputs", around_sync_eagle_verify_outputs, HookType.AROUND),
     ):
         HookRegistry.register(target, wrapper, kind)

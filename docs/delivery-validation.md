@@ -422,3 +422,18 @@ python3 tools/build_guide.py --check → Guide is up to date
 **重叠文件复核**（远端新 main 与本地改动都触碰的 4 个文件，均未丢本地改动）：`docs/ci.md` 的「L0 迁移文件头」行在；`hcu_sglang/environ.py` 的 `SGLANG_REQUIRE_KV_CACHE_SCALES` 在；`hcu_sglang/layers/attention/flashattention_interface.py` 的 `q_4d` 构造在 varlen 分支之后；`architecture.html` 由生成器重建。远端新增的 `.github/workflows/quality-gate.yml` 亦在。
 
 **推送状态**：未执行。推送前须重新 `git fetch` 确认 `behind` 仍为 0（远端可能再次被 force push），之后 `git push origin main` 并用 `git ls-remote` 与 `rev-list` 核对远端新提交。
+## 2026-11-04 HCU KV 与 GDN 单流策略
+
+范围为现有 `HCUMHATokenToKVPool` 的构造参数策略与 Qwen3.5 GDN 构造 AROUND Hook；不修改官方、adapter 或数学 kernel。基线、职责/回退、MTP 受控 A/B 与限制见 [开发记录](hcu-sglang-development.md#2026-11-04-kv-与-gdn-单流提交验证)，评审入口见 [任务记录](board.md#6-hcu-kv-与-gdn-单流策略2026-11-04)。
+
+| 检查 | 实际结果与范围 |
+|---|---|
+| CPU 离线 | Python 3.10 无第三方启动注入的隔离环境，`python -m unittest discover -s tests -v`：117 项，104 passed / 13 条件 skipped。 |
+| HCU KV GPU | `tests/runtime/hcu_mha_single_stream_gpu.py`：3 passed；真实父类构造、位置/关键字/重复参数、公共写入、不同 K/V 维度、空输入/页边界/padding、变输入 Graph replay。 |
+| GDN GPU | `tests/runtime/hcu_gdn_single_stream_gpu.py`：4 passed；真实 HookRegistry、HCU/非 HCU、有效 original 异常保留、真实 BF16 投影、同流 capture 与变输入 replay。 |
+| 完整入口与目标合同 | 严格入口检查 registered 598 / applied 584；新增 GDN 构造与既有三个 HCU pool builder Hook 均 applied，注册集合与更新后目标合同一致。14 项多模态 Hook 未应用，严格检查记 failed，不能记为全量接线通过。未修改基线为 registered 597 / applied 583；前后 14 项 unapplied 及错误列表完全一致，仅新增 GDN 目标并成功应用。 |
+| 真实 TP2 服务与性能 | 本次先前四次 MTP 独立启动均通过 ready、模型身份及三道完整问答；320 次无 profiler 测量、八份完整 trace。提交整理新增的构造参数绑定另由真实 GPU 构造测试复验；性能数据不是最终提交后的新一轮服务测量。 |
+
+导览重建与 `--check`、L0、`git diff --check` 及桌面/390px 窄屏导览渲染和搜索/跳转交互纳入本次提交验收，日志与截图保留于本批次产物。当前复验日志位于 `${PLUGIN_ROOT}/artifacts/single-stream-pr-20261104`，原始服务/性能证据为独立批次 `qwen38-tp2-mtp-gdn-ab-20261104`，ignored 产物不随 Git 推送；共享统计、固定版本与解释已写入开发记录。
+
+收益限 gfx936、BF16 Qwen3.8-27B、TP2、batch1、指定 NEXTN/Graph/后端配置。1024→32 的 E2E 中位数下降 1.06%，decode-after-first 下降 1.41%；4096→1 prefill 增加 0.29%，每模式仅两个独立启动，未作全场景或严格零影响承诺。量化、其他模型/架构、短 prefill Graph、PD、并发及 wheel/embedded 未验收。提交对齐上游重写后的 `9755678`；与测量基线 `0aa4114` 相比仅协作规范变化，运行时代码一致。本轮提交评审，不包含合入或发布。

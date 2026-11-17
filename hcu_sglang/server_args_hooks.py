@@ -35,6 +35,22 @@ def _model_arch(server_args: Any) -> str | None:
     return architectures[0] if architectures else None
 
 
+def around_qwen4_fa3_fp8_fallback(original, view):
+    from hcu_sglang.utils.detection import get_gcn_arch
+    from sglang.srt.environ import envs
+
+    if (is_hcu() and view.attention_backend == "fa3"
+            and view.kv_cache_dtype == "fp8_e5m2"
+            and view.dtype in ("bfloat16", "bf16") and view.page_size == 64
+            and get_gcn_arch().split(":", 1)[0] == "gfx936"
+            and envs.SGLANG_KV_LAYOUT_HCU_FA.get()
+            and _model_arch(view) in (
+                "Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLMMTP")):
+        logger.info("Qwen4 HCU FA keeps fp8_e5m2 KV with BF16 attention")
+        return {}
+    return original(view)
+
+
 def _snapshot_env_fields(envs: Any, names: tuple[str, ...]) -> dict[str, str | None]:
     return {name: os.environ.get(getattr(envs, name).name) for name in names}
 
@@ -312,6 +328,9 @@ def register() -> None:
         ("from_cli_args", after_from_cli_args, HookType.AFTER),
     ):
         HookRegistry.register(f"sglang.srt.server_args.ServerArgs.{target}", hook, kind)
+    HookRegistry.register(
+        "sglang.srt.arg_groups.overrides._attention_backend_fa3_fp8_fallback",
+        around_qwen4_fa3_fp8_fallback, HookType.AROUND)
     if not _RESOLUTION_REGISTERED:
         for name, wrapper in (
             ("handle_model_specific_adjustments", _model_resolution),

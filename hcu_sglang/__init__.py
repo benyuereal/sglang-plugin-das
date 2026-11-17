@@ -1,12 +1,17 @@
 """SGLang HCU general plugin - model and layer adaptations."""
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 
 def register() -> None:
     """Entry point for sglang.srt.plugins (called by load_plugins)."""
+    from hcu_sglang import hook_guard
+
+    hook_guard.install()
+
     from hcu_sglang.compat.aiter import install_aiter_compat
 
     install_aiter_compat()
@@ -14,6 +19,11 @@ def register() -> None:
     from hcu_sglang.environ import register_envs
 
     register_envs()
+
+    if os.environ.get("HCU_KIMI31_DAY0") == "1":
+        from hcu_sglang.kimi31_day0 import register_hooks
+        register_hooks()
+        return
 
     from hcu_sglang import (
         batch_overlap,
@@ -119,6 +129,8 @@ def register() -> None:
     from hcu_sglang import dsa_utils
     dsa_utils.register_hooks()
     forward_batch.register_hooks()
+    from hcu_sglang import mrope_delta
+    mrope_delta.register_hooks()
     from hcu_sglang import prefill_output, prefill_graph_runner
     prefill_output.register_hooks()
     from hcu_sglang import speculative_vp
@@ -171,6 +183,9 @@ def register() -> None:
     dsv4_ops.register_hooks()
     from hcu_sglang.layers.moe import deepseek_gate
     deepseek_gate.register_hooks()
+    from hcu_sglang import http_worker
+
+    http_worker.register_hooks()
     quantization.register_hooks()
     norm_activation.register_hooks()
     linear_fusion.register_hooks()
@@ -202,6 +217,9 @@ def register() -> None:
     qwen2.register()
     qwen3.register()
     qwen3_moe.register()
+    qwen3_5.register()
+    from hcu_sglang.models.qwen import qwen4_exp
+    qwen4_exp.register_hooks()
     from hcu_sglang import speculative_dspark
     speculative_dspark.register_hooks()
     logger.info("[hcu_sglang] optimization hooks registered")

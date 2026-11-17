@@ -33,6 +33,16 @@ def around_load_jit(original: Callable[..., Any], *args, **kwargs):
     if overlay_include not in include_paths:
         include_paths.insert(0, overlay_include)
     kwargs["extra_include_paths"] = include_paths
+    files = (
+        *(kwargs["cpp_files"] or ()),
+        *(kwargs["cuda_files"] or ()),
+    )
+    if any(Path(file).is_relative_to(_OVERLAY_ROOT / "csrc") for file in files):
+        flag = f"-I{overlay_include}"
+        for key in ("extra_cflags", "extra_cuda_cflags"):
+            kwargs[key] = [flag] + [
+                value for value in (kwargs.get(key) or ()) if value != flag
+            ]
     return original(*args, **kwargs)
 
 

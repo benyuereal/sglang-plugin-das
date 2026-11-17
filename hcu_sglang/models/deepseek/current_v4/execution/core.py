@@ -131,6 +131,8 @@ from hcu_sglang.models.deepseek.current_v4.execution.mm_padding import pad_mm_to
 from hcu_sglang.utils.detection import is_hcu
 from sglang.srt.utils import get_bool_env_var
 _is_hcu = is_hcu()
+if _is_hcu:
+    _is_cuda = False
 MHC_POST_MULT_VALUE = mhc.MHC_POST_MULT_VALUE
 _FUSE_MHC_REPEAT_CP_SPLIT = envs.SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT.get()
 _use_aiter_tilelang_mhc = get_bool_env_var("SGLANG_ROCM_USE_AITER_TILELANG_MHC")

@@ -32,6 +32,30 @@ class Pool:
         self.data[kw['swa_loc'].long()]=kw['kv']
 
 class DsParkHiddenConsumerTests(unittest.TestCase):
+    @unittest.skipUnless(S._is_hcu, 'requires HCU hardware')
+    def test_tp_draft_constructor_with_actual_platform_dispatch(self):
+        cfg=NS(hidden_size=2,num_hidden_layers=8,hc_mult=1,hc_eps=1e-6,rms_norm_eps=1e-6,n_shared_experts=0,vocab_size=16,dspark_target_layer_ids=[6,7],dspark_markov_rank=4,dspark_block_size=2,dspark_noise_token_id=0)
+        class StageReached(Exception):pass
+        with patch.object(M,'model_parallel_is_initialized',return_value=True),patch.object(M,'get_parallel',return_value=NS(pp_rank=0,pp_size=1)),patch.object(M,'get_disagg',return_value=NS(disaggregation_mode='null')),patch.object(M,'is_shared_experts_fusion_disabled',return_value=False),patch.object(M,'DSparkV4Stage',side_effect=StageReached) as stage:
+            with self.assertRaises(StageReached):M.DeepseekV4ForCausalLMDSpark(cfg)
+        self.assertEqual(stage.call_count,1)
+
+    @unittest.skipUnless(S._is_hcu, 'requires HCU hardware')
+    def test_tp_draft_forward_preserves_platform_stage_state(self):
+        from contextlib import nullcontext
+        calls=[]
+        class Stage(nn.Module):
+            def forward(self,positions,x,batch,pre):
+                calls.append(pre)
+                return x+2,'state'
+        model=object.__new__(M.DeepseekV4ForCausalLMDSpark);nn.Module.__init__(model)
+        model.stages=nn.ModuleList([Stage(),Stage()]);model.hc_pre_from_prev_sublayer=False
+        values=torch.tensor([[1.,3.]])
+        with patch.object(M,'get_global_expert_distribution_recorder',return_value=NS(disable_this_region=nullcontext)):
+            result=model(torch.tensor([0]),torch.tensor([0]),NS(),input_embeds=values)
+        self.assertEqual(calls,[None,'state'])
+        torch.testing.assert_close(result.hidden_states,values+4)
+
     def model(self):
         model=object.__new__(M.DeepseekV4ForCausalLMDSpark);nn.Module.__init__(model)
         model.config=NS(hidden_size=2);model.num_target_features=2

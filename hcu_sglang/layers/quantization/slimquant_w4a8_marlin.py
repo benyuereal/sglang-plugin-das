@@ -294,8 +294,26 @@ def _patch_moe_c_align_non_cub_to_triton() -> None:
     import aiter.fused_moe_c as fmc
 
     orig = fmc.moe_align_block_size
+    native_sort = envs.SGLANG_MOE_C_NATIVE_SORT.get()
+    if native_sort:
+        import aiter
+        if not all(hasattr(aiter, name) for name in ("moe_sorting_fwd", "moe_sorting_ck_ids_to_moe_c")):
+            raise RuntimeError("native MoE sorting and ID conversion APIs are required")
+        from hcu_sglang.layers.moe.moe_c_native_sort import moe_c_native_sort
 
     def moe_align_block_size(topk_ids, block_size, num_experts, expert_map=None):
+        if (
+            native_sort and num_experts == 129 and expert_map is not None
+            and expert_map.numel() == num_experts and topk_ids.ndim == 2
+            and topk_ids.shape[1] == 10 and 0 < topk_ids.shape[0] < 2**24
+            and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+            and topk_ids.is_cuda and torch.version.hip is not None
+            and block_size in (16, 32, 64, 128)
+        ):
+            if not getattr(moe_align_block_size, "_native_reported", False):
+                logger.info("QWEN4_MOE_NATIVE_SORT experts=%s topk=%s block=%s", num_experts, topk_ids.shape[1], block_size)
+                moe_align_block_size._native_reported = True
+            return moe_c_native_sort(topk_ids, block_size, num_experts, expert_map)
         if num_experts in (64, 128, 256, 896) or (
             num_experts >= 224 and num_experts != 512
         ):
@@ -1162,6 +1180,13 @@ class SlimQuantW4A8Int8MarlinMoEMethod:
                     layer.w2_weight_scale.data * scale_mul,
                     requires_grad=False,
                 )
+                if _is_hcu:
+                    masked = get_bool_env_var("SGLANG_USE_W4A8_MASKED_HIPC")
+                    contiguous = get_bool_env_var("SGLANG_USE_W4A8_CONTIGUOUS_HIPC")
+                    if masked or contiguous:
+                        from hcu_sglang.layers.moe.deepep_w4a8 import configure_hipc
+
+                        configure_hipc(layer, masked=masked, contiguous=contiguous)
             else:
                 # mxfp4_to_int4.py packs (even_k << 4) | odd_k with two's
                 # complement nibbles and stores scale/16 (the legacy lightop
@@ -1736,6 +1761,8 @@ class SlimQuantW4A8Int8TritonMoEMethod:
 class SlimQuantW4A8Int8AiterMoEMethod:
     """MoE method for W4A8INT8 AITER."""
 
+    supports_int8_prequant = True
+
     def __new__(cls, *args, **kwargs):
 
         if not hasattr(cls, "_initialized"):
@@ -1882,12 +1909,27 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         self,
         layer: torch.nn.Module,
         dispatch_output,
+        i_q: Optional[torch.Tensor] = None,
+        i_s: Optional[torch.Tensor] = None,
+        use_int8_prequant: bool = False,
     ):
         from aiter.moe import MoeQuantType, aiter_moe, get_aiter_moe_config
 
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
         x = dispatch_output.hidden_states
+        if not use_int8_prequant:
+            i_q = i_s = None
+        elif i_q is None or i_s is None:
+            raise ValueError("explicit AITER INT8 dispatch requires codes and scales")
+        if i_q is not None and (
+            self.moe_runner_config.apply_router_weight_on_input
+            or x.dtype != torch.bfloat16 or i_q.dtype != torch.int8
+            or i_s.dtype != torch.float32 or i_q.shape != x.shape
+            or i_s.shape != (x.shape[0], 1) or i_q.device != x.device
+            or i_s.device != x.device or not i_q.is_contiguous() or not i_s.is_contiguous()
+        ):
+            raise ValueError("invalid AITER per-token INT8 codes/scales or weighted input")
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         # x, topk_weights = apply_topk_weights_cpu(
         #     self.moe_runner_config.apply_router_weight_on_input, topk_weights, x
@@ -1901,7 +1943,6 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         n2 = layer.w2_weight.size(1)
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(torch.float32)
-        from sglang.srt.distributed import get_moe_expert_parallel_world_size
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # moe_c GEMM zeros remote blocks when expert_id==-1. Cub align cannot
@@ -1909,7 +1950,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
         # - Triton dispatcher already remapped to local ids with -1 drops:
         #   retarget drops to extra expert `e`, then map that id back to -1.
         # - AITER dispatcher keeps global ids: pass the real EP expert_map.
-        ep_size = get_moe_expert_parallel_world_size()
+        ep_size = get_parallel().moe_ep_size
         ids_are_local = not get_moe_runner_backend().is_aiter()
         if ep_size > 1 and ids_are_local:
             drop_id = e
@@ -1970,7 +2011,7 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             self._logged_aiter_sol = True
 
         output = aiter_moe(
-            x,
+            x if i_q is None else i_q,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
             topk_weights=topk_weights,
@@ -1982,6 +2023,8 @@ class SlimQuantW4A8Int8AiterMoEMethod:
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+            a1_scale=i_s,
+            output_dtype=x.dtype,
         )
         return StandardCombineInput(hidden_states=output)
 

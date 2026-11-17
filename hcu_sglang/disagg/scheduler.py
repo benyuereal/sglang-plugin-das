@@ -95,6 +95,15 @@ def init_disaggregation(self):
 
     self._init_waiting_queue_prefetch_runtime()
 
+    # The external-KV abort/cleanup bookkeeping is initialised by the Hygon
+    # internal fork's Scheduler.__init__; official v0.5.22 has no such state.
+    # This module's prefill hooks add, discard and test these two sets
+    # unconditionally, so establish them here for every mode.
+    if not hasattr(self, "_external_kv_abort_rids"):
+        self._external_kv_abort_rids = set()
+    if not hasattr(self, "_external_kv_cleanup_rids"):
+        self._external_kv_cleanup_rids = set()
+
     # In rust-server mode the KV bootstrap registry is already serving on
     # the rust api listener (maybe_init_rust_server runs before this
     # method — the PrefillBootstrapQueue's KVManager below registers to it
@@ -284,6 +293,21 @@ def register_hooks():
     if not hasattr(native.Scheduler, "_init_waiting_queue_prefetch_runtime"):
         native.Scheduler._init_waiting_queue_prefetch_runtime = (
             _waiting_queue_prefetch_runtime_default
+        )
+
+    # get_next_disagg_prefill_batch_to_run calls _begin_scheduler_iteration before
+    # any mode check. That hook exists only in the Hygon-internal fork, where it
+    # drains background cache-prefetch acknowledgements and opens the next prefetch
+    # epoch. Neither this repository nor official sglang ships the external cache
+    # linker prefetch path, so on official v0.5.22 every PD prefill launch dies at
+    # the first scheduler iteration with AttributeError. Install a no-op default at
+    # hook-registration time; a host build that provides the method keeps it.
+    def _begin_scheduler_iteration_default(self):
+        return None
+
+    if not hasattr(native.Scheduler, "_begin_scheduler_iteration"):
+        native.Scheduler._begin_scheduler_iteration = (
+            _begin_scheduler_iteration_default
         )
 
     HookRegistry.register(

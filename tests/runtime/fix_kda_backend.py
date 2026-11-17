@@ -3,7 +3,7 @@ from types import SimpleNamespace as NS
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 import torch
 import torch.nn.functional as F
 from hcu_sglang.compat.aiter import bootstrap_aiter_compat
@@ -25,12 +25,12 @@ from sglang.srt.layers.attention.linear.utils import LinearAttnBackends,LinearAt
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
-def fixture(device='cpu',spec=False,dim=16):
+def fixture(device='cpu',spec=False,dim=16,track=False):
     shape=KimiLinearStateShape.create(tp_world_size=1,num_heads=2,head_dim=dim,conv_kernel_size=4,num_spec=2)
     params=KimiLinearCacheParams(shape=shape,layers=[0],dtype=Mamba2StateDType(conv=torch.bfloat16,temporal=torch.float32))
-    pool=HybridReqToTokenPool(size=2,mamba_size=3,mamba_spec_state_size=2,max_context_len=16,device=device,enable_memory_saver=False,cache_params=params,mamba_layer_ids=[0],enable_mamba_extra_buffer=False,speculative_num_draft_tokens=2,speculative_eagle_topk=1,enable_overlap_schedule=False,enable_linear_replayssm_spec=spec,linear_replayssm_cache_len=4)
+    pool=HybridReqToTokenPool(size=2,mamba_size=8 if track else 3,mamba_spec_state_size=2,max_context_len=64 if track else 16,device=device,enable_memory_saver=False,cache_params=params,mamba_layer_ids=[0],enable_mamba_extra_buffer=track,speculative_num_draft_tokens=2,speculative_eagle_topk=1,enable_overlap_schedule=False,enable_linear_replayssm_spec=spec,linear_replayssm_cache_len=4)
     pool.mamba_pool.clear_slots(torch.tensor([0,1,2],device=device))
-    runner=NS(device=device,is_draft_worker=False,req_to_token_pool=pool,token_to_kv_pool=None,server_args=NS(enable_mis=False),linear_attn_backends=LinearAttnBackends(decode=Backend.TRITON,prefill=Backend.TRITON,verify=Backend.TRITON))
+    runner=NS(device=device,is_draft_worker=False,req_to_token_pool=pool,token_to_kv_pool=None,server_args=NS(enable_mis=False),model_config=NS(hf_text_config=NS(mamba_chunk_size=4)),linear_attn_backends=LinearAttnBackends(decode=Backend.TRITON,prefill=Backend.TRITON,verify=Backend.TRITON))
     with patch.object(N,'get_spec',return_value=NS(speculative_eagle_topk=1)),patch.object(P.H,'get_spec',return_value=NS(speculative_eagle_topk=1)),patch.object(P.H,'get_memory',return_value=NS(enable_unified_memory=False)),patch('sglang.srt.utils.common.require_mlp_sync',return_value=False):
         backend=N.KDAAttnBackend(runner)
     backend.forward_metadata=NS(query_start_loc=torch.tensor([0,1,2],dtype=torch.int32,device=device),mamba_cache_indices=torch.tensor([1,2],dtype=torch.int32,device=device),retrieve_next_token=None,retrieve_next_sibling=None,retrieve_parent_token=None,has_mamba_track_mask=False)
@@ -71,6 +71,28 @@ class KdaConsumerTests(unittest.TestCase):
         self.assertIs(_ALIAS.commit,SU.commit_mamba_states_after_verify)
         with patch.object(SU,'mambaish_config',return_value=None):
             self.assertIsNone(_ALIAS.commit(NS(model_runner=NS(model_config=NS())),NS(),torch.tensor([1]),torch.tensor([[0]]),1))
+
+    def test_hcu_tracked_prefill_metadata_runs_without_a_kernel_dispatcher(self):
+        runner,backend,layer=fixture(track=True)
+        self.assertIsNone(backend.kernel_dispatcher)
+        fb=N.ForwardBatch(forward_mode=ForwardMode.EXTEND,batch_size=1,input_ids=torch.tensor([1,2,3,4]),req_pool_indices=torch.tensor([0]),seq_lens=torch.tensor([4]),out_cache_loc=torch.arange(4),seq_lens_sum=4,extend_num_tokens=4,extend_seq_lens=[4],extend_seq_lens_cpu=[4],extend_prefix_lens=torch.tensor([0]),extend_prefix_lens_cpu=[0],extend_start_loc=torch.tensor([0]),mamba_track_mask=torch.tensor([True]),mamba_track_indices=torch.tensor([1]),mamba_track_seqlens=torch.tensor([4]),mamba_track_seqlens_cpu=[4],mamba_prefill_track_mask_cpu=[True])
+        with patch('sglang.srt.model_executor.forward_batch_info.mamba_cache_chunk_size',return_value=4):
+            backend.init_forward_metadata(fb)
+        metadata=backend.forward_metadata
+        self.assertTrue(metadata.has_mamba_track_mask)
+        self.assertEqual(metadata.conv_states_mask_indices.tolist(),[1])
+        self.assertEqual(metadata.track_ssm_final_src.tolist(),metadata.mamba_cache_indices.tolist())
+        self.assertEqual(metadata.num_state_checkpoints,0)
+
+    def test_non_hcu_tracked_prefill_still_builds_the_flashinfer_checkpoint_plan(self):
+        runner,backend,layer=fixture(track=True)
+        fb=N.ForwardBatch(forward_mode=ForwardMode.EXTEND,batch_size=1,input_ids=torch.tensor([1,2,3,4]),req_pool_indices=torch.tensor([0]),seq_lens=torch.tensor([4]),out_cache_loc=torch.arange(4),seq_lens_sum=4,extend_num_tokens=4,extend_seq_lens=[4],extend_seq_lens_cpu=[4],extend_prefix_lens=torch.tensor([0]),extend_prefix_lens_cpu=[0],extend_start_loc=torch.tensor([0]),mamba_track_mask=torch.tensor([True]),mamba_track_indices=torch.tensor([1]),mamba_track_seqlens=torch.tensor([3]),mamba_track_seqlens_cpu=[3],mamba_prefill_track_mask_cpu=[True])
+        plan=Mock()
+        backend.use_hcu_kda=False
+        backend.kernel_dispatcher=NS(extend_kernel=NS(uses_state_checkpoints=True))
+        with patch('sglang.srt.model_executor.forward_batch_info.mamba_cache_chunk_size',return_value=4),patch('sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill.build_flashinfer_kda_checkpoint_plan',plan,create=True):
+            backend.init_forward_metadata(fb)
+        plan.assert_called_once()
 
     @unittest.skipUnless(torch.cuda.is_available(),'GPU required')
     def test_decode_executes_actual_hcu_kernel_and_updates_checkpoint_in_value_key_order(self):

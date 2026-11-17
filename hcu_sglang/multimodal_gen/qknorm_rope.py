@@ -15,8 +15,11 @@ def around_can_use_fused_inplace_qknorm_rope(
     return original(*args, **kwargs)
 
 
-def register_hooks() -> None:
+def register_hooks(registry=None) -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+    if registry is not None:
+        HookRegistry = registry
 
     HookRegistry.register(
         "sglang.kernels.ops.diffusion.rope.qknorm_rope_jit."

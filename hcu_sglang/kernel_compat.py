@@ -65,7 +65,8 @@ def around_assign_extend_cache_locs_func(
 
     from sglang.srt.utils import get_bool_env_var
 
-    if not get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"):
+    gather = getattr(torch.ops.sgl_kernel, "hcu_assign_extend_cache_locs", None)
+    if gather is None or not get_bool_env_var("SGLANG_ASSIGN_EXTEND_CACHE_LOCS", default="true"):
         return original(
             req_pool_indices,
             req_to_token,
@@ -76,12 +77,10 @@ def around_assign_extend_cache_locs_func(
             device,
         )
 
-    from sgl_kernel.kvcacheio import hcu_assign_extend_cache_locs
-
     out_cache_loc = torch.empty(
         (batch_size * draft_token_num,), dtype=torch.int64, device=device
     )
-    hcu_assign_extend_cache_locs(
+    gather(
         req_pool_indices,
         req_to_token,
         start_offset,
@@ -121,6 +120,14 @@ def around_mhc_fused_post_pre(
     original: Callable[..., Any], *args: Any, **kwargs: Any
 ):
     return _dispatch_mhc("mhc_fused_post_pre", original, *args, **kwargs)
+
+
+def around_moe_route_radix_covered(
+    original: Callable[..., Any], *args: Any, **kwargs: Any
+) -> bool:
+    if is_hcu():
+        return False
+    return original(*args, **kwargs)
 
 
 def around_vision_flash3_init(
@@ -168,5 +175,10 @@ def register_hooks() -> None:
     HookRegistry.register(
         "sglang.srt.layers.attention.vision.VisionFlash3Attention.__init__",
         around_vision_flash3_init,
+        HookType.AROUND,
+    )
+    HookRegistry.register(
+        "sglang.kernels.ops.moe.moe_route_radix.covered",
+        around_moe_route_radix_covered,
         HookType.AROUND,
     )

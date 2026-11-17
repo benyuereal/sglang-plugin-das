@@ -2,11 +2,33 @@
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Optional, Union
 
 import torch
 
 from hcu_sglang.utils.detection import is_hcu, is_hcu_native_fp8_supported
+
+
+def _note_fa(kind: str) -> None:
+    path = os.environ.get("HCU_ATTN_TRACE")
+    if not path:
+        return
+    counts = _note_fa.counts
+    n = counts.get(kind, 0) + 1
+    counts[kind] = n
+    if n != 1 and n % 200 != 0:
+        return
+    line = json.dumps({"pid": os.getpid(), "kind": kind, "n": n}, ensure_ascii=False) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
+
+
+_note_fa.counts = {}
 
 
 def _layout_enabled() -> bool:
@@ -52,9 +74,11 @@ def _restore_hcu_cache_layout(k_cache: torch.Tensor, v_cache: torch.Tensor):
     _, value_page_size, value_heads, value_dim = v_cache.shape
     if page_size != value_page_size or num_heads != value_heads:
         return k_cache, v_cache
+    # Uniform BHSD. The NHD carrier is only a view; both caches go back to
+    # [pages, heads, page, dim] before the wheel call with layout="bhsd".
     return (
         k_cache.view(num_pages, num_heads, page_size, head_dim),
-        v_cache.view(num_pages, value_heads, value_dim, value_page_size),
+        v_cache.view(num_pages, value_heads, page_size, value_dim),
     )
 
 
@@ -104,7 +128,8 @@ def flash_attn_with_kvcache(
     layout=None,
 ):
     from flash_attn import (
-        vllm_flash_attn_varlen_func,
+        flash_attn_varlen_func as hcu_flash_attn_varlen_func,
+        flash_attn_with_kvcache as hcu_flash_attn_with_kvcache,
         vllm_flash_attn_with_kvcache,
     )
 
@@ -128,14 +153,22 @@ def flash_attn_with_kvcache(
             if max_seqlen_k is None and page_table is not None
             else max_seqlen_k
         )
-        result = vllm_flash_attn_varlen_func(
+        # The wheel takes both page layouts; declare the one actually
+        # carried: BHSD pages with the HCU layout flag ([NP, H, PS, D]),
+        # BSHD pages on the default official pool ([NP, PS, H, D]). A
+        # hard-coded "bhsd" mislabels the page and head axes on the
+        # default path ([4,64,2,16] read as 64 heads / page 2) and the
+        # kernel then attends to wrong keys/positions.
+        kv_layout = "bhsd" if _layout_enabled() else "bshd"
+        _note_fa("fa_varlen_" + kv_layout)
+        result = hcu_flash_attn_varlen_func(
             q=q,
             k=k_cache,
             v=v_cache,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            seqused_k=cache_seqlens,
             max_seqlen_k=page_capacity,
+            seqused_k=cache_seqlens,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
@@ -146,13 +179,35 @@ def flash_attn_with_kvcache(
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            layout=kv_layout,
         )
         return _apply_out(result, out, return_softmax_lse)
 
     q_4d = q
     if q.ndim == 3:
         q_4d = q.contiguous().view(-1, 1, q.shape[-2], q.shape[-1])
-    result = vllm_flash_attn_with_kvcache(
+    if _layout_enabled():
+        _note_fa("fa_decode_bhsd")
+        result = vllm_flash_attn_with_kvcache(
+            q=q_4d,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=page_table,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            return_softmax_lse=return_softmax_lse,
+            num_splits=num_splits,
+            layout=1,
+        )
+        return _apply_out(result, out, return_softmax_lse)
+
+    if not is_native_fp8(k_cache.dtype):
+        k_cache = k_cache.to(q.dtype)
+        v_cache = v_cache.to(q.dtype)
+    result = hcu_flash_attn_with_kvcache(
         q=q_4d,
         k_cache=k_cache,
         v_cache=v_cache,

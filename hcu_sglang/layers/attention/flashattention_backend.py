@@ -152,12 +152,12 @@ def around_get_paged_mha_kv_cache(original_fn, backend, layer, *, head_group_num
     key, value = pool.get_kv_buffer(layer.layer_id)
     page = backend.page_size
     assert tuple(key.shape[1:]) == (layer.tp_k_head_num, page, layer.head_dim)
-    assert tuple(value.shape[1:]) == (layer.tp_v_head_num, layer.v_head_dim, page)
+    assert tuple(value.shape[1:]) == (layer.tp_v_head_num, page, layer.v_head_dim)
     if (head_group_num < 1 or layer.tp_k_head_num % head_group_num or
             layer.tp_v_head_num % head_group_num):
         raise ValueError('head_group_num must divide the K/V head counts')
     # These contiguous NHD-shaped carriers preserve HCU physical byte order.
-    # The plugin FA interface restores K[pages,H,page,D]/V[pages,H,D,page]
+    # The plugin FA interface restores K and V as [pages, heads, page, dim]
     # immediately before the native HCU call; a permute here would corrupt it.
     return (key.view(-1, page, layer.tp_k_head_num // head_group_num, layer.head_dim),
             value.view(-1, page, layer.tp_v_head_num // head_group_num, layer.v_head_dim))

@@ -53,3 +53,8 @@ V1 已建立方法、Skill、审计/回溯工具和 CPU 测试；V2 重整架构
 | 基线与工作树 | main 起始 `1eb4abaa3a3ad5bb7bbc9a8b758488639f4db1c7`，插件工作树含本轮及并行运行时修改，未提交；DAS `15c7204b7a3b6edaa222cff80018d8e5f2b2ad0e`、官方 `baa9befa381511cd4d56f83980951e5a45fffc6d`，来源只读 |
 | 依赖与下一步 | 运行时领域补 GLM 五个专用模块及 Muse kernels/layers/config/processor 后，模型侧更新 import 对应并复验完整导入；599 项严格 loader 尚无本轮通过证据；GPU/模型 A/B 由独立测试负责人统一执行 |
 | 证据与交接 | [模型开发记录](hcu-sglang-development.md#2026-11-05-glm5-next-与-muse-spark-owned-模型迁入)、[V4 修复记录](hcu-sglang-development.md#2026-11-05-v4-平台类与方法同步模型侧)、[交付边界](delivery-validation.md#2026-11-05-模型侧阶段记录)；来源及状态见执行台账，不宣称全模块迁移完成 |
+## 6. HCU KV 与 GDN 单流策略（2026-11-04）
+
+ID：hcu-single-stream-kv-gdn；负责人：本次提交作者；状态：in-progress（提交评审，未合入）。用户本轮明确授权推送并创建 PR；第 5 节“不推送”仅适用于其历史迁移任务。
+
+行为与接受条件：保留 HCU KV 布局、有效 original 链和数学实现；KV 写入与 Qwen3.5 GDN 投影使用当前流；验证构造签名、非 HCU 回退、数值/变输入 Graph、TP2 真实输出及 MTP 预热 A/B。基线、依赖、分支及未覆盖范围见 [本次开发记录](hcu-sglang-development.md#2026-11-04-kv-与-gdn-单流提交验证)，实际复验见 [交付记录](delivery-validation.md#2026-11-04-hcu-kv-与-gdn-单流策略)。后续：评审后按仓库 squash-only 策略合入；本轮只创建 PR。
