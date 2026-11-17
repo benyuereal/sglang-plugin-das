@@ -2874,3 +2874,75 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+## 2026-11-17 GDN B+ commit 链与 lightop.gdn 适配：SGLang 0.5.22
+
+用途：verify 只写被接受那一步的 SSM 快照，commit 只重放被截断的 slot，
+避免每步 6 GiB 的整状态拷贝。内核与绑定归 lightop，plugin 只保留框架适配；
+判定依据：内核属算子库（规范 §9）。
+
+### 代码与组合边界
+
+- plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；内核真源为
+  lightop 分支 `qwen3.8-27b-perf-gdn` @ `35c7e60dd4074be8f87c919efff645700425ca8a`
+  （repo `benyuereal/lightop`），本仓不再携带 `.hip`。
+- `gdn_commit.py`：单行快照、stash 重放（只重放被截断的 slot）与 multi-layer 一次 launch；
+  `gdn_source.py`：prefill 交还上游、target verify 走 B+/HIP、HCU conv；
+  `gdn_recurrent.py`：薄适配层，`from lightop import gdn`。
+- 适配层与交付内核不是同一个加载路径：交付候选使用旧 cffi loader 与预编译 `.so`，
+  本 PR 使用 `lightop.gdn`。两者数值关系见下。
+
+### 已有设备与模型证据（2026-11-17）
+
+- 绑定与交付 aicc `.so` **逐位一致**：`gdn_verify` maxdiff 0.0；norm_pass 四个 buffer
+  `torch.equal=True`（单卡 gfx938，n=40/T=5/HV=48/K=128）。
+- 交付候选 `e7a0da6`：HumanEval 163/164；9×4 复跑 29/36。
+- 交付候选 40/40：**1300.07 tok/s / Mean TPOT 23.34 ms**（`logs/bench_final_e7a0da6.log`）。
+- 关闭全部 HIP 开关且无 lightop 的对照臂：**1061.67 tok/s / TPOT 28.02**
+  （`logs/bench_no_hip.log`），相对交付 −18.3%——B+ 是主要性能路径，回退 Triton
+  可用但慢；其中 HIP conv ≈ +2.4 ms、B+/HIP verify ≈ +2.3 ms。
+- L0 passed。
+
+- HumanEval 精度报告（evalscope，2026-11-16 15:44:08）：
+
+  | Model | Dataset | Metric | Subset | Num | Score |
+  |---|---|---|---|---:|---:|
+  | Qwen3.8-27B | HumanEval | Accuracy ↑ | openai_humaneval | 163 | 99.4% |
+  | Qwen3.8-27B | HumanEval | Pass@k ↑ · k 1 | openai_humaneval | 163 | 99.4% |
+
+  运行记录：`Evaluating[humaneval] 100%| 164/164 [1:00:39]`，
+  `predictions complete, aggregating scores...`，Accuracy 163/164 = 99.4%。
+
+### 测试方法与本 PR 的贡献
+
+- 40/40 复现命令：`PORT=9160 TAG=<tag> bash /workspace/clean-stack/bench_verified.sh`
+  （内部调用 `vllm_bench_driver.py --backend openai --base-url http://localhost:9160
+  --endpoint /v1/completions --model /data/Qwen3.8-27B --dataset-name random
+  --random-input-len 2048 --random-output-len 2048 --num-prompts 40
+  --max-concurrency 40 --ignore-eos --seed 42 --temperature 0`；
+  脚本在 40/40 全部成功前拒绝出数）。
+- 关闭 B+/HIP 的对照臂：1061.67 / TPOT 28.02 vs 交付 1300.07 / 23.34，即 B+/HIP 贡献
+  **+22.5%** 吞吐（移除损失 18.3%）、TPOT **−4.68 ms**；同负载 aicc vs hipcc 另为
+  **+8.2%**（1300.61 vs 1201.88，accept 0.946 vs 0.890）。
+
+### 依赖、回退及证据
+
+- 依赖 lightop wheel 携带 `lib/_gdn*.so`（`scripts/build_gdn.sh`，aicc 构建并断言 8 个导出
+  符号）；设备证据同交付分支 `qwen3.8-27b-perf` @ `e7a0da6`。
+- 回退：`SGLANG_GDN_HIP=0` 回到上游 Triton；lightop 缺失时同一开关不生效。旧的
+  分项变量已废弃，设置时进程只打一条告警并忽略。`=1` 只有一种模式：plain B+
+  （verify 写全接受（最后一步）的快照行、commit 只重放被截断的 slot）+ HIP conv + prenorm。
+- radix cache 开启：commit 额外重放 extra_buffer 的间跨检查点行（上游 scatter 读
+  `intermediate_ssm[snap_row, track_step]`），启动需带 upstream 的 opt-in
+  `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1`。decode 期间前缀节点上的 mamba state 已
+  COW 到请求自己的 slot，跳过这把锁后每个 running 请求少占一个 slot，mamba 池的
+  槽位比从 5 降到 4：`--max-mamba-cache-size 160` 下并发上限从 `160 // 5 = 32`
+  提到 `160 // 4 = 40`。配套 `--mem-fraction-static 0.89`；该变量默认关闭，关掉即
+  回到全锁 + 原比例；radix 关闭时不需要。
+  证据（`logs/bench_gdn_merge_radix_m160.log`）：40/40，**1193.87 tok/s / Mean
+  TPOT 25.95 ms**，服务端 `#running-req: 40 / #queue-req: 0`；多轮 decode 前缀
+  复用探针三轮逐字节一致；错题 9×4 复跑已完成的 34 次里 28 次通过（77.8%），与
+  无 radix 基线 29/36 同档（`#145` 两条线上均 0/4）。
+- 未验证：PP/多卡、mamba dtype 变体；
+  `SGLANG_GDN_HIP=0` 时若 `SGLANG_USE_CAUSAL_CONV1D=1`，conv 仍走 HCU twin，
+  干净的上游对照需同时关闭它和 `SGLANG_HCU_FUSE_QKVZBA_VERIFY` /
+  `SGLANG_GDN_ZBA_STRIDED`。
