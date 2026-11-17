@@ -390,7 +390,8 @@ class _KdaMethods:
                 ]
             )
             if (
-                self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
+                self.kernel_dispatcher is not None
+                and self.kernel_dispatcher.extend_kernel.uses_state_checkpoints
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0

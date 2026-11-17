@@ -24,6 +24,7 @@ _NATIVE_INFO = [N.MLPSyncBatchInfo]
 
 @dataclass
 class ScheduleBatch(_NativeScheduleBatch):
+    dp_pure_prefill: bool = False
     global_cp_num_tokens: Optional[List[int]] = None
     orig_seq_lens_cpu: Optional[List[int]] = None
     loc_tensor: Optional[N.torch.Tensor] = None
@@ -671,6 +672,7 @@ class ScheduleBatch(_NativeScheduleBatch):
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
+            dp_pure_prefill=self.dp_pure_prefill,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
@@ -1213,7 +1215,7 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
 
     if batch_to_gather is not None:
-        _update_gather_batch(
+        N._update_gather_batch(
             batch_to_gather,
             mlp_sync_info,
             N.require_mlp_tp_gather,

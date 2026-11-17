@@ -29,6 +29,13 @@ class V4ExecutionTests(unittest.TestCase):
         self.assertIs(self.decoder_alias,C.DeepseekV4PlatformDecoderLayer)
 
     def test_hcu_model_uses_live_pp_group_and_five_streams(self):
+        self.check_hcu_model_constructor(mock_platform=True)
+
+    @unittest.skipUnless(C._is_hcu, 'requires HCU hardware')
+    def test_hcu_model_constructor_with_actual_platform_dispatch(self):
+        self.check_hcu_model_constructor(mock_platform=False)
+
+    def check_hcu_model_constructor(self, *, mock_platform):
         config=SimpleNamespace(hidden_size=8,vocab_size=16,rms_norm_eps=1e-6,num_hidden_layers=1,hc_mult=4,hc_eps=1e-5,hc_pre_from_prev_sublayer=False,model_type='deepseek_v4',vision_n_layers=0)
         pp=SimpleNamespace(is_first_rank=True,is_last_rank=True);streams=[];calls=[];factory_signature=inspect.signature(C.make_pp_layers)
         def stream():
@@ -40,7 +47,8 @@ class V4ExecutionTests(unittest.TestCase):
         obj=object.__new__(C.NativeDeepseekV4Model)
         with ExitStack() as stack:
             stack.enter_context(patch.object(C.NativeDeepseekV4Model,'__init__',side_effect=AssertionError('old parent constructor was invoked')))
-            stack.enter_context(patch.object(C,'_is_cuda',False));stack.enter_context(patch.object(C,'_is_hcu',True))
+            if mock_platform:
+                stack.enter_context(patch.object(C,'_is_cuda',False));stack.enter_context(patch.object(C,'_is_hcu',True))
             stack.enter_context(patch.object(C,'get_parallel',return_value=SimpleNamespace(pp_group=pp)))
             stack.enter_context(patch.object(C,'is_dp_attention_enabled',return_value=False))
             stack.enter_context(patch.object(C,'VocabParallelEmbedding',side_effect=embedding))
@@ -50,6 +58,8 @@ class V4ExecutionTests(unittest.TestCase):
             with self.assertRaises(ConstructionStopped):self.public_model_init(obj,config)
         self.assertIs(obj.pp_group,pp);self.assertEqual(len(streams),5)
         self.assertEqual(obj.alt_streams,streams);self.assertEqual(len(calls),1)
+        self.assertIsNone(calls[0][1]['final_read'])
+        self.assertIsNone(calls[0][1]['stage_facts'])
         self.assertIs(C.DeepseekV4DecoderLayer,C.DeepseekV4PlatformDecoderLayer)
 
     def test_native_model_public_forward_reaches_owned_body(self):

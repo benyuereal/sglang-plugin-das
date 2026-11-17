@@ -2,11 +2,33 @@
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Optional, Union
 
 import torch
 
 from hcu_sglang.utils.detection import is_hcu, is_hcu_native_fp8_supported
+
+
+def _note_fa(kind: str) -> None:
+    path = os.environ.get("HCU_ATTN_TRACE")
+    if not path:
+        return
+    counts = _note_fa.counts
+    n = counts.get(kind, 0) + 1
+    counts[kind] = n
+    if n != 1 and n % 200 != 0:
+        return
+    line = json.dumps({"pid": os.getpid(), "kind": kind, "n": n}, ensure_ascii=False) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
+
+
+_note_fa.counts = {}
 
 
 def _layout_enabled() -> bool:
@@ -52,34 +74,12 @@ def _restore_hcu_cache_layout(k_cache: torch.Tensor, v_cache: torch.Tensor):
     _, value_page_size, value_heads, value_dim = v_cache.shape
     if page_size != value_page_size or num_heads != value_heads:
         return k_cache, v_cache
+    # Uniform BHSD. The NHD carrier is only a view; both caches go back to
+    # [pages, heads, page, dim] before the wheel call with layout="bhsd".
     return (
         k_cache.view(num_pages, num_heads, page_size, head_dim),
-        v_cache.view(num_pages, value_heads, value_dim, value_page_size),
+        v_cache.view(num_pages, value_heads, page_size, value_dim),
     )
-
-
-def _is_hnd(t) -> bool:
-    """True for sglang's [pages, page_size, heads, dim] view of an HND pool.
-
-    paged_kv_view() swaps head and page dims of a physical
-    [pages, heads, page_size, dim] buffer; the resulting stride-1 head dim is
-    head_dim, unlike a contiguous NHD pool whose token stride is heads*head_dim.
-    """
-    return (
-        t.dim() == 4
-        and t.shape[-2] > 1
-        and t.stride(1) == t.shape[-1]
-        and t.stride(2) == t.shape[-3] * t.shape[-1]
-    )
-
-
-def _to_hnd_buffers(k_cache, v_cache):
-    """Undo paged_kv_view's permute: the physical [pages, heads, page, dim] view."""
-    k = k_cache.permute(0, 2, 1, 3)
-    v = v_cache.permute(0, 2, 1, 3)
-    if not (k.is_contiguous() and v.is_contiguous()):
-        k, v = k.contiguous(), v.contiguous()
-    return k, v
 
 
 def flash_attn_with_kvcache(
@@ -128,25 +128,12 @@ def flash_attn_with_kvcache(
     layout=None,
 ):
     from flash_attn import (
-        flash_attn_varlen_func as fa3_varlen_func,
-        vllm_flash_attn_varlen_func,
+        flash_attn_varlen_func as hcu_flash_attn_varlen_func,
+        flash_attn_with_kvcache as hcu_flash_attn_with_kvcache,
         vllm_flash_attn_with_kvcache,
     )
 
-    # SGLANG_USE_HND_KVCACHE pools are physically [pages, heads, page, dim].
-    # get_paged_mha_kv_cache() hands us the permuted NHD view; take it back to
-    # the physical HND buffers and let the wheel read them with layout="bhsd".
-    # The NHD/HND choice is read off the strides so a plain pool stays on the
-    # existing path untouched.
-    hnd_layout = (
-        not _layout_enabled()
-        and _is_hnd(k_cache)
-        and _is_hnd(v_cache)
-    )
-    if hnd_layout:
-        k_cache, v_cache = _to_hnd_buffers(k_cache, v_cache)
-    else:
-        k_cache, v_cache = _restore_hcu_cache_layout(k_cache, v_cache)
+    k_cache, v_cache = _restore_hcu_cache_layout(k_cache, v_cache)
 
     # Varlen calls (prefill / MTP verify carry cu_seqlens_q) must go
     # through the wheel's varlen entry for both KV layouts: the paged
@@ -155,7 +142,7 @@ def flash_attn_with_kvcache(
     # kernel then faults). The varlen entry takes the pool plus
     # block_table directly and handles both page layouts (pa_layout).
     if cu_seqlens_q is not None:
-        if hnd_layout or _layout_enabled():
+        if _layout_enabled():
             page_size = k_cache.shape[2]  # [NP, H, PS, D]
         else:
             page_size = k_cache.shape[1]  # [NP, PS, H, D]
@@ -166,42 +153,61 @@ def flash_attn_with_kvcache(
             if max_seqlen_k is None and page_table is not None
             else max_seqlen_k
         )
-        if q_descale is None and q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            q_descale = torch.ones(1, dtype=torch.float32, device=q.device)
-        varlen_kwargs = dict(
+        # The wheel takes both page layouts; declare the one actually
+        # carried: BHSD pages with the HCU layout flag ([NP, H, PS, D]),
+        # BSHD pages on the default official pool ([NP, PS, H, D]). A
+        # hard-coded "bhsd" mislabels the page and head axes on the
+        # default path ([4,64,2,16] read as 64 heads / page 2) and the
+        # kernel then attends to wrong keys/positions.
+        kv_layout = "bhsd" if _layout_enabled() else "bshd"
+        _note_fa("fa_varlen_" + kv_layout)
+        result = hcu_flash_attn_varlen_func(
             q=q,
             k=k_cache,
             v=v_cache,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            seqused_k=cache_seqlens,
             max_seqlen_k=page_capacity,
+            seqused_k=cache_seqlens,
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=window_size,
             block_table=page_table,
+            fa_version=2,
             softcap=softcap,
             s_aux=sinks,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
-            return_softmax_lse=return_softmax_lse,
+            layout=kv_layout,
         )
-        if hnd_layout:
-            # bhsd is HND K/V with the page tokens contiguous per head; the
-            # vllm wrapper hardcodes "custom" (transposed V), which this pool
-            # is not, so the varlen entry is the only correct route here.
-            result = fa3_varlen_func(layout="bhsd", **varlen_kwargs)
-        else:
-            # The wheel's layout choice is replaced at import by
-            # hcu_sglang.compat.flash_attn.
-            result = vllm_flash_attn_varlen_func(fa_version=2, **varlen_kwargs)
         return _apply_out(result, out, return_softmax_lse)
 
     q_4d = q
     if q.ndim == 3:
         q_4d = q.contiguous().view(-1, 1, q.shape[-2], q.shape[-1])
-    result = vllm_flash_attn_with_kvcache(
+    if _layout_enabled():
+        _note_fa("fa_decode_bhsd")
+        result = vllm_flash_attn_with_kvcache(
+            q=q_4d,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=page_table,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            return_softmax_lse=return_softmax_lse,
+            num_splits=num_splits,
+            layout=1,
+        )
+        return _apply_out(result, out, return_softmax_lse)
+
+    if not is_native_fp8(k_cache.dtype):
+        k_cache = k_cache.to(q.dtype)
+        v_cache = v_cache.to(q.dtype)
+    result = hcu_flash_attn_with_kvcache(
         q=q_4d,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -212,9 +218,7 @@ def flash_attn_with_kvcache(
         window_size=window_size,
         softcap=softcap,
         return_softmax_lse=return_softmax_lse,
-        s_aux=sinks,
         num_splits=num_splits,
-        layout=1 if hnd_layout else 0,
     )
     return _apply_out(result, out, return_softmax_lse)
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -128,6 +129,41 @@ _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE = (
     and use_deepep
     and "quant_type" in inspect.signature(Buffer.low_latency_dispatch).parameters
 )
+
+
+def deepep_ll_dispatch_abi_error() -> Optional[str]:
+    """Say which term disabled the vendor quant_type low-latency ABI.
+
+    Returns None when the ABI is available. Callers that already know the ABI
+    is missing use this to name the cause instead of leaving users to guess
+    between host detection, the deep_ep import, and the wheel's signature.
+    """
+    if not _is_hcu:
+        return "this host is not detected as an HCU device"
+    if not use_deepep:
+        return f"deep_ep failed to import: {_deepep_import_error!r}"
+    if "quant_type" in inspect.signature(Buffer.low_latency_dispatch).parameters:
+        return None
+
+    deep_ep = sys.modules.get("deep_ep")
+    where = getattr(deep_ep, "__file__", "unknown path")
+    version = getattr(deep_ep, "__version__", "unknown version")
+    dispatch = Buffer.low_latency_dispatch
+    # The adapter's HCU_DEEPEP_BRIDGE (on by default, HCU_ADAPTER_HOST=sglang)
+    # rewrites the vendor function with an upstream-shaped wrapper, so the wheel
+    # is right and only the signature is hidden. Name that case separately:
+    # telling users to "install the vendor wheel" would send them the wrong way.
+    if getattr(dispatch, "__module__", "").startswith("hcu_adapter."):
+        return (
+            "the HCU adapter's HCU_DEEPEP_BRIDGE wrapper "
+            f"({dispatch.__module__}) replaced low_latency_dispatch and hides "
+            f"quant_type (deep_ep from {where}); set HCU_DEEPEP_BRIDGE=0"
+        )
+    return (
+        "the imported deep_ep exposes the upstream use_fp8 dispatch ABI, not the "
+        f"BW1100 quant_type ABI (deep_ep {version} from {where}); install the "
+        "vendor deep_ep wheel that accepts quant_type"
+    )
 
 
 def _low_latency_dispatch_compat(
@@ -882,6 +918,15 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+    def set_quant_config(self, quant_config: dict) -> None:
+        if _is_hcu and quant_config.get("hcu_slimquant_w4a8_contiguous_hipc", False):
+            quant_config = {
+                **quant_config,
+                "normal_dispatcher_output_dtype": "int8",
+                "hcu_w4a8_int8_dispatch": True,
+            }
+        super().set_quant_config(quant_config)
+
     dispatch_mode = DeepEPMode.NORMAL
 
     def __init__(self, async_finish: bool, **kwargs):
@@ -1034,8 +1079,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         needs_256_alignment = self.quant_config.get("normal_expert_alignment") == 256 or _hcu_deepgemm_is_selected() or (
             use_groupgemm
             and (
-                get_model().quantization
-                in ("slimquant_marlin", "slimquant_w4a8_marlin")
+                self.quant_config.get("hcu_slimquant_w4a8_contiguous_hipc", False)
+                or get_model().quantization in ("slimquant_marlin", "slimquant_w4a8_marlin")
                 or _use_fp8_w8a8_moe
                 or _use_marlin_w16a16_moe
                 or self.quant_config.get("preserve_input_dtype", False)
@@ -1165,6 +1210,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self._combine_input_ready_event_pending = False
 
     def set_quant_config(self, quant_config: dict) -> None:
+        if _is_hcu and quant_config.get("hcu_slimquant_w4a8_masked_hipc", False):
+            quant_config = {
+                **quant_config,
+                "low_latency_dispatcher_output_dtype": "int8",
+                "hcu_w4a8_int8_dispatch": True,
+                "hcu_legacy_groupgemm": True,
+            }
         super().set_quant_config(quant_config)
         if _is_hcu and quant_config.get("hcu_w4a8_int8_dispatch", False):
             self.return_recv_hook = True

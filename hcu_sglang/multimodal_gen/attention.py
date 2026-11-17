@@ -31,8 +31,7 @@ def around_rocm_backend_selection(
         and importlib.util.find_spec("flash_attn") is not None
     ):
         return (
-            "sglang.multimodal_gen.runtime.layers.attention.backends."
-            "flash_attn_2.FlashAttention2Backend"
+            "hcu_sglang.multimodal_gen.flash_attn_2.HcuFlashAttention2Backend"
         )
     return original(cls, selected_backend, head_size, dtype)
 
@@ -117,8 +116,10 @@ def around_minimal_a2a_forward(
     return original(attention_op, query, key, value, *args, **kwargs)
 
 
-def register_hooks() -> None:
+def register_hooks(registry=None) -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+    if registry is not None:
+        HookRegistry = registry
 
     HookRegistry.register(
         "sglang.multimodal_gen.runtime.platforms.rocm."

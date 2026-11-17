@@ -286,6 +286,7 @@ class ForwardBatchMethods:
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
+            dp_pure_prefill=getattr(batch, "dp_pure_prefill", False),
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
@@ -399,6 +400,8 @@ class ForwardBatchMethods:
 
         if ret.forward_mode.is_idle():
             ret.positions = N.torch.empty((0,), dtype=N.torch.int64, device=device)
+            if model_runner.model_config.model_is_mrope:
+                ret.mrope_positions = ret.positions.new_empty((3, 0))
             if model_runner.lora_manager is not None:
                 model_runner.lora_manager.reset_lora_batch()
             return ret
@@ -656,6 +659,11 @@ class ForwardBatchMethods:
         dp_padding_mode = N.DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )
+        from hcu_sglang.models.qwen.qwen4_exp import compact_layout
+        compact = compact_layout(self, model_runner, global_num_tokens)
+        if compact is not None:
+            global_num_tokens = compact
+            dp_padding_mode = N.DpPaddingMode.SUM_LEN
         if N._elastic_should_preserve_local_token_counts(
             model_runner=model_runner,
             dp_padding_mode=dp_padding_mode,
@@ -690,7 +698,7 @@ class ForwardBatchMethods:
         # Read once here, where dp_padding_mode is final: the idle-row branch
         # below runs after another arm may have rewritten self.forward_mode.
         materializes_dummy_extend = mega_moe_idle_materialize or (
-            self.is_extend_in_batch and dp_padding_mode.is_max_len()
+            self.is_extend_in_batch and (dp_padding_mode.is_max_len() or self.qwen4_compact_prefill)
         )
 
         if dp_padding_mode.is_max_len():
@@ -736,6 +744,7 @@ class ForwardBatchMethods:
             )
             if (
                 hybrid_ssm
+                and not self.qwen4_compact_prefill
                 and self.spec_info is not None
                 and not self.spec_info.is_draft_input()
             ):

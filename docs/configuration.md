@@ -51,6 +51,25 @@ set +a
 
 本仓 `hcu_sglang` 已包含来源插件的配置开关和 `hcu` 入口；具体以当前代码为准，不假定存在统一的 `HCU_DISABLE_OPS` 或额外配置服务。
 
+### 当前 Qwen4 运行时配置
+
+以下字段由 `hcu_sglang/environ.py` 注册到官方 typed `Envs`，在服务启动前设置并继承给 worker；更改后重启服务。默认关闭的性能路径需按支持条件显式启用，checkpoint/INT8 PLE 支持不依赖这些性能开关。
+
+| 名称 | 类型 / 默认 | 行为与支持条件 |
+|---|---|---|
+| `SGLANG_QWEN4_COMPACT_PREFILL` | bool / false | 纯 EXTEND/IDLE 使用 SUM_LEN，idle rank 保留一行；TP=DP=EP、attention TP/CP=1、Gatherv、无 A2A/TBO、disabled prefill Graph |
+| `SGLANG_QWEN4_LOCAL_ROUTING` | bool / false | compact prefill 在量化前的本 rank BF16 输入上选专家；要求非融合 shared expert |
+| `SGLANG_QWEN4_ROUTED_INT8` | bool / false | 局部 routing 后传输 INT8 codes/scales，直接交给支持预量化的 AITER moe_c 一次 |
+| `SGLANG_ENABLE_DP_GATHER_INT8` | bool / false | Qwen4 FFN 的独立 INT8 transport 入口；SUM_LEN/Gatherv、支持预量化的 quant method |
+| `SGLANG_MOE_C_NATIVE_SORT` | bool / false | E129/top-k10、HIP、支持的 block size 使用保留 drop-route 的 native sort；依赖 AITER sorting/conversion API |
+| `SGLANG_QWEN4_SPLIT_HC_MIX` | bool / false | gfx936/BF16、1–16 行、HC4/hidden2560/lowrank320 的分阶段 HC mix；保留确定性模式守卫 |
+| `SGLANG_QWEN4_FLAT_STATE_SCATTER` | bool / false | gfx936、36 层 FP32 48×128×128、1–16 条 metadata 的连续状态回写；保留 scratch 源行映射 |
+| `SGLANG_QWEN4_PREFILL_DIAGNOSTICS` | bool / false | 首次 compact 布局输出 rank/counts，和 routing 日志一起诊断实际路径 |
+| `SGLANG_PLE_ETP_REDUCE_SCATTER` | bool / true | 支持的 PLE 分片布局采用 reduce-scatter；其他布局保留 all-reduce + scatter |
+| `SGLANG_PLE_ETP_REDUCE_SCATTER_MIN_TOKENS` | int / 2048 | 小于阈值时使用 all-reduce + scatter |
+
+关闭相应性能开关或超出窄形状门控时调用当前有效基线，不绕过 adapter。显式启用 INT8 transport 而缺少必要量化/通信合同，或启用 native sort 却缺少 vendor API 时明确报错。`SGLANG_DP_USE_GATHERV`、Graph、并行与 MoE 后端属于官方配置，按其接口设置；adapter 的 `qsa_mqa` 快关参见 `adapter-das` 仓 `docs/env-vars.md`，不由插件重复定义。完整支持范围与已测组合见 [开发记录](hcu-sglang-development.md#2026-11-04-qwen4-exp-w4a8-与-int8-ple-适配)。
+
 ## 3. 新增配置的设计检查
 
 | 检查项 | 要给出的答案 |

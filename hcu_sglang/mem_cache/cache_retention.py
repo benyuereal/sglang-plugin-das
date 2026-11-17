@@ -46,7 +46,7 @@ def around_build_kv_cache(original, **kwargs):
     scheduler = _SCHEDULER.get()
     if 'draft_swa_window' not in kwargs and scheduler is not None:
         draft = scheduler.draft_worker
-        kwargs['draft_swa_window'] = draft.draft_swa_window if draft is not None else 0
+        kwargs['draft_swa_window'] = getattr(draft, 'draft_swa_window', 0)
     return build_kv_cache(**kwargs)
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import types
 import dis
 import builtins
+import inspect
 from dataclasses import replace
 from contextlib import contextmanager, nullcontext, ExitStack
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context, speculative_moe_a2a_backend_context
@@ -30,6 +31,19 @@ from hcu_sglang.models.deepseek.current_v4.execution.platform_stage import NonCu
 from hcu_sglang.models.deepseek.current_v4.dspark import DSparkAttention
 from hcu_sglang.utils.detection import is_hcu
 _is_hcu = is_hcu()
+
+def build_verify_generation_result(target_verify, **fields):
+    return GenerationBatchResult(
+        expert_distribution_metrics=getattr(target_verify, "expert_distribution_metrics", None),
+        **fields,
+    )
+
+def build_verify_epilogue(factory, *, simulate_fold, **kwargs):
+    if "simulate_fold" in inspect.signature(factory).parameters:
+        return factory(simulate_fold=simulate_fold, **kwargs)
+    if simulate_fold:
+        raise NotImplementedError("The installed DSpark epilogue does not support simulate_fold")
+    return factory(**kwargs)
 
 def build_ring_commit_inject_layout(
     *,
@@ -368,7 +382,7 @@ class _ModelMethods:
         )
         with (
             layer_stack(final_read=hc_boundary.FinalRead())
-            if _is_cuda
+            if _is_cuda and not _is_hcu
             else nullcontext()
         ):
             self.stages = nn.ModuleList(
@@ -588,7 +602,7 @@ class _ModelMethods:
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
-        if not _is_cuda:
+        if _is_hcu or not _is_cuda:
             return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
         try:
             return self._forward_impl(input_ids, positions, forward_batch, input_embeds)
@@ -600,16 +614,16 @@ class _ModelMethods:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
-        if _is_cuda:
+        if _is_cuda and not _is_hcu:
             residual_batch.start(forward_batch)
         # Draft stages do not have recorder layer indices.
         with get_global_expert_distribution_recorder().disable_this_region():
             for stage in self.stages:
-                if _is_cuda:
+                if _is_cuda and not _is_hcu:
                     x = stage(positions, x, forward_batch)
                 else:
                     x, pre = stage(positions, x, forward_batch, pre)
-        if _is_cuda:
+        if _is_cuda and not _is_hcu:
             x = residual_batch.read_output(
                 x, forward_batch, hc_boundary.FinalRead(), None
             )
@@ -1350,7 +1364,8 @@ class _WorkerMethods:
             and self._decode_graph_allowed
             and (is_cuda() or (is_cuda_alike() and target_is_dsv41))
         ):
-            self._verify_epilogue = DsparkVerifyEpilogue(
+            self._verify_epilogue = build_verify_epilogue(
+                DsparkVerifyEpilogue,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
@@ -2096,7 +2111,9 @@ class _WorkerMethods:
                 target_verify = self._verify_executor.run_idle_participation(
                     batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
                 )
-                expert_distribution_metrics = target_verify.expert_distribution_metrics
+                expert_distribution_metrics = getattr(
+                    target_verify, "expert_distribution_metrics", None
+                )
             return self._decode_idle_result(
                 on_publish=on_publish,
                 expert_distribution_metrics=expert_distribution_metrics,
@@ -2201,12 +2218,12 @@ class _WorkerMethods:
             # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
             and (
                 simulate_bonus_sampling_info is None
-                or self._verify_executor.verify_epilogue.simulate_fold
+                or getattr(self._verify_executor.verify_epilogue, "simulate_fold", False)
             )
             and not batch.has_grammar
         )
         self._verify_executor.begin_simulated_step()
-        if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
+        if fold_eligible and getattr(self._verify_executor.verify_epilogue, "simulate_fold", False):
             self._verify_executor.verify_epilogue.begin_sim_bonus(
                 bs,
                 (
@@ -2360,8 +2377,8 @@ class _WorkerMethods:
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
-        return GenerationBatchResult(
-            expert_distribution_metrics=target_verify.expert_distribution_metrics,
+        return build_verify_generation_result(
+            target_verify,
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,

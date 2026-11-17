@@ -99,8 +99,8 @@ class MHATokenToKVPoolHostHCU(_host_base()):
             self.page_num,
             self.layer_num,
             self.head_num,
-            self.head_dim,
             self.page_size,
+            self.head_dim,
         )
         self.token_stride_size = (
             self.page_size * self.head_num * self.head_dim * self.dtype.itemsize
@@ -218,7 +218,7 @@ class MHATokenToKVPoolHostHCU(_host_base()):
 
     def get_dummy_flat_data_page(self):
         k_shape = (1, self.layer_num, self.head_num, self.page_size, self.head_dim)
-        v_shape = (1, self.layer_num, self.head_num, self.head_dim, self.page_size)
+        v_shape = (1, self.layer_num, self.head_num, self.page_size, self.head_dim)
         kwargs = dict(dtype=self.dtype, device=self.device, pin_memory=self.pin_memory)
         return (
             torch.zeros(k_shape, **kwargs).flatten(),
@@ -242,8 +242,8 @@ class MHATokenToKVPoolHostHCU(_host_base()):
                 1,
                 self.layer_num,
                 self.head_num,
-                self.head_dim,
                 self.page_size,
+                self.head_dim,
             )
         )
 

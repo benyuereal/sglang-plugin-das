@@ -177,6 +177,25 @@ def _matches_abort_rid(recv_req, rid: str) -> bool:
     return bool(getattr(recv_req, "abort_all", False) or rid.startswith(recv_req.rid))
 
 
+def _accepted_metadata_kwargs(receiver, kwargs: dict) -> dict:
+    """Drop metadata kwargs the receiver's send_metadata does not declare.
+
+    The HCU receiver overrides accept `spec_metadata` and `device_kv_indices`;
+    upstream's FakeKVReceiver (used for the server warmup request) accepts
+    neither, and FakeKVReceiver.send_metadata ignores its payload entirely.
+    Passing them unconditionally raised TypeError inside the decode loop.
+    """
+    import inspect
+
+    try:
+        parameters = inspect.signature(receiver.send_metadata).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in parameters}
+
+
 class DecodeReqToTokenPool(ReqToTokenPool):
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -670,6 +689,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_len: int,
         preallocated_reqs: List[DecodeRequest],
     ) -> bool:
+        # Guard before touching DSV4-only pool attributes. With a decode-side
+        # radix cache enabled on a non-DSV4 model (e.g. Qwen3.8 QSA pools),
+        # `self.token_to_kv_pool` has no `compression_ratios`, and this path is
+        # reached on every prealloc once the cache is on. `_dsv4_inflight_prompt_reqs`
+        # already returns early in that case; this function must too, or
+        # `_dsv4_singleflight_min_prefix_len` raises AttributeError.
+        if not self._uses_dsv4_decode_radix_cache():
+            return False
         min_prefix_len = self._dsv4_singleflight_min_prefix_len()
         for inflight_req in self._dsv4_inflight_prompt_reqs(preallocated_reqs):
             if inflight_req is req:
@@ -2429,7 +2456,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices,
             decode_req.metadata_buffer_index,
             state_indices,
-            **metadata_kwargs,
+            **_accepted_metadata_kwargs(decode_req.kv_receiver, metadata_kwargs),
         )
         if (
             decode_req.is_rebootstrap
@@ -4431,6 +4458,7 @@ _METHODS["DecodePreallocQueue.abort_matching"] = DecodePreallocQueue.abort_match
 _METHODS["DecodePreallocQueue._match_prefix_and_lock"] = DecodePreallocQueue._match_prefix_and_lock
 _METHODS["DecodePreallocQueue._create_receiver_and_enqueue"] = DecodePreallocQueue._create_receiver_and_enqueue
 _METHODS["DecodePreallocQueue.pop_preallocated"] = DecodePreallocQueue.pop_preallocated
+_METHODS["DecodePreallocQueue._send_kv_metadata"] = DecodePreallocQueue._send_kv_metadata
 _METHODS["DecodePreallocQueue._pre_alloc"] = DecodePreallocQueue._pre_alloc
 DecodePreallocQueue = _NATIVE.DecodePreallocQueue
 _generate_fake_prefill_handoff_output_id = _NATIVE._generate_fake_prefill_handoff_output_id
@@ -4472,6 +4500,7 @@ def register_hooks():
     HookRegistry.register("sglang.srt.disaggregation.decode.DecodePreallocQueue._match_prefix_and_lock", _METHODS["DecodePreallocQueue._match_prefix_and_lock"], HookType.REPLACE)
     HookRegistry.register("sglang.srt.disaggregation.decode.DecodePreallocQueue._create_receiver_and_enqueue", _METHODS["DecodePreallocQueue._create_receiver_and_enqueue"], HookType.REPLACE)
     HookRegistry.register("sglang.srt.disaggregation.decode.DecodePreallocQueue.pop_preallocated", _METHODS["DecodePreallocQueue.pop_preallocated"], HookType.REPLACE)
+    HookRegistry.register("sglang.srt.disaggregation.decode.DecodePreallocQueue._send_kv_metadata", _METHODS["DecodePreallocQueue._send_kv_metadata"], HookType.REPLACE)
     HookRegistry.register("sglang.srt.disaggregation.decode.DecodePreallocQueue._pre_alloc", _METHODS["DecodePreallocQueue._pre_alloc"], HookType.REPLACE)
     HookRegistry.register("sglang.srt.disaggregation.decode.DecodeTransferQueue.__init__", _METHODS["DecodeTransferQueue.__init__"], HookType.REPLACE)
     HookRegistry.register("sglang.srt.disaggregation.decode.DecodeTransferQueue._commit_transfer_to_req", _METHODS["DecodeTransferQueue._commit_transfer_to_req"], HookType.REPLACE)

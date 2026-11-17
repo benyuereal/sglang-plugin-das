@@ -17,3 +17,5 @@ class ForwardBatch(_OfficialForwardBatch):
     global_late_layer_num_tokens_cpu: Optional[List[int]] = None
     encoder_swa_row_floor: Optional[torch.Tensor] = None
     encoder_swa_compress_rows: Optional[torch.Tensor] = None
+    dp_pure_prefill: bool = False
+    qwen4_compact_prefill: bool = False

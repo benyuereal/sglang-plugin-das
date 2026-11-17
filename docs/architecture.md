@@ -172,3 +172,10 @@ flowchart LR
 - 是否能从需求找到目录、Skill、命令、测试和交付记录？
 
 下一步：设计接口读 [governance](governance.md)，开始开发读 [plugins](plugins.md)，参与协作读 [contributing](contributing.md)。
+
+## MiniMax-H3 diffusion 入口的当前边界
+
+本仓通过 `sglang.multimodal_gen.plugins` 的 `hcu_diffusion` 入口向独立
+diffusion registry 注册 MiniMax/QK-Norm/RoPE Hook；原有 SRT registry 保持
+原样，adapter 提供平台底座。启用与核验见
+[安装说明](installation.md#minimax-h3-的-diffusion-入口)。
