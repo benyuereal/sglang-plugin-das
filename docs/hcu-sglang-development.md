@@ -2905,7 +2905,7 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   相对交付 −18.3%——B+ 是主要性能路径。
 - aicc vs hipcc 同负载 A/B：1300.61 vs 1201.88 tok/s；accept rate 0.946 vs 0.890。
   hipcc 改变核数值（max diff 3.8e-6）并降低投机接受率，故内核必须 aicc。
-- L0 passed；单测 14 failures / 3 errors / 17 skipped（本分支基线）。
+- L0 passed；单测 14 failures / 3 errors / 17 skipped：与干净 `main` 相比仅多 `test_qwen3_5_hook_removed` 一项（草稿头模块名触发其过宽断言；拆出的 `-draft` PR 已改为按 hook target 断言，失败数回到 13）。其余为既有外部快照/来源缺失用例，不在交付范围。
 
 - 原始精度产物（各分支共用同一组）：`/workspace/eval/he_bitwise2/20261115_235141/`
   （`predictions/`、`reviews/`、`reports/`）、`/workspace/clean-stack/logs/evalscope_bitwise2.log`、
