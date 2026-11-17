@@ -3001,3 +3001,73 @@ faulting kernel 为 torch `index_copy`（4 字节元素），`origin ptr ... siz
 - radix off 的 40/40 复跑用于隔离 radix 开销（同 build），未再改 handoff 逻辑。
 - PP stable rows 组合：verify 侧直接回落 plain（本机 `pp_size=1`，未在 PP 设备验证）。
 - 运行期 handoff→plain 回落路径只有失败注入才能触发，本轮未做设备注入。
+
+## 2026-11-17 GDN handoff commit 性能修复：只重放被截断行
+
+前一轮把 radix off 的 850.13 tok/s 归因为「lightop handoff 路径本身」。本轮的隔离探针
+把它拆成三个独立因素：一是 handoff 的 commit 重放没有按「被截断」过滤，二是 `verify_step`
+每个 GDN 层都重建一遍本拍索引张量，三是当时的测试树没有 GEMM PR（无
+`hcu_sglang/layers/gemm/*`，bf16 线性走 hipBLASLt 而不是 hbird）——绝对目标 1210/1300
+必须带上 GEMM PR，干净 A/B 必须在同一棵含 GEMM 的树上做。
+
+### 根因与证据
+
+- `gdn_commit.compensate_from_stash` 的 h0 行改用 `live`（已 seed 且已提交）而不是
+  `trunc`（被截断）过滤；而 `store_step` 只对截断行 >= 0。lookup 内核对 `store_step < 0`
+  的行不会写快照，但会把 T 步递推跑完（`disable_state_update=1`，无任何写出），等于每步
+  对所有活跃行重放一遍完整 recurrence。隔离探针（40 行 × T=5 × 48 层，同内核入口）：
+  - 40 行全 live、无 store：**10.441 ms/step**
+  - 只有 2 行被截断（正确 mask）：**0.687 ms/step**
+  - 无 live 行：0.464 ms/step
+- `verify_step` 每层调用 `request_rows()` 生成新的 `snap_idx` 张量，`shared_step_values`
+  以 data_ptr 做键 → 每层都重建 `s64/gather/prev/store/h0/store_row`。抓图后这些重建内核
+  每拍重放 48 次；小内核探针 4 个 kernel ≈ 4 µs，~15 kernel × 48 层 ≈ 3 ms/step。
+  改为按本拍（`step_gen`）缓存一次。
+- verify 内核本身不是回归点：同一 `gdn_verify`（prenorm）入口、同一数据量下，plain 布局
+  （h0=temporal[slot]，快照写 batch 行）0.257 ms/层，handoff 布局（h0=intermediate[row,prev]，
+  快照写 `(prev+1)%D`）0.254 ms/层（48 层 ≈ 12.2 vs 12.3 ms/forward）。
+- radix off 时 `mamba_extra_buffer_enabled()` 为 False，`batch.mamba_track_indices` 与
+  `mamba_steps_to_track` 均为 None；`_scatter_track_rows` 首行即返回，commit 计时里
+  track_scatter=0.007 ms。不是回归来源。
+
+### 改动范围
+
+- `hcu_sglang/layers/attention/linear/gdn_commit.py`
+  - `compensate_from_stash`：提交态重放用 `trunc` mask 的 h0（`h0_trunc_by_stride`）；
+    track 重放仍用 `live` 行，radix on 行为不变。
+  - `verify_step`：`snap_idx` 按 `(step_gen, n, capacity, req_rows.data_ptr())` 缓存，
+    一个 verify forward 只建一次；`shared_step_values` 的指针缓存随之命中。
+- `tests/test_gdn_commit_step_shared.py`：新增 `CompensateMaskTest`（只有截断行带 h0）
+  与 `VerifyRowCacheTest`（同 forward 共享、跨 forward 重建）。
+- 不改 `gdn_source.py` / `gdn_commit.state()` 的对外接口；fork-point pin 不涉及
+  `gdn_commit.py`，无需更新。
+
+### 验证结果
+
+同栈 A/B（GPU7 / 9164，`--disable-radix-cache`，`max_mamba_cache_size=48`，40 并发，
+TEMP=0，无 rejection sampling，40×2048 in / 40×2048 out）：
+
+| 测试树 | verify 路径 | tok/s | Mean TPOT |
+|---|---|---|---|
+| integration（含 GEMM PR）+ handoff 原样 | handoff | 1177.28 | 26.30 |
+| integration（含 GEMM PR）+ handoff 修复 | handoff | **1307.62** | **23.10** |
+| integration（含 GEMM PR） | plain B+ | 1219.76 | 25.35 |
+| 本分支树（无 GEMM PR）+ handoff 原样 | handoff | 850.13 | 37.58 |
+| 本分支树（无 GEMM PR）+ handoff 修复 | handoff | 934.74 | 34.26 |
+
+- 修复本身（无 GEMM 树）：850.13 → 934.74（+10.0%）；同栈对照里再叠加 hbird GEMM /
+  fp8 draft head：→ 1307.62（+53.8%）。同栈 handoff 修复 vs plain 为 +7.2%。
+- 日志：`logs/bench_9164_H_gemm.log`、`logs/bench_9164_P_plain.log`、
+  `logs/bench_9164_Horig_gemm.log`、`logs/bench_9164_Fix_nogemm.log`、
+  `logs/server_9164_*.log`；commit 分段计时 `logs/server_9164_handoff_fix_diag.log`
+  （`comp≈0.8 ms`、`commit_prev≈0.1 ms`、`conv_scatter≈0.2 ms`、`track_scatter≈0.007 ms`）。
+- 测试：`python3 -m unittest tests.test_gdn_commit_step_shared`（24 项）通过；
+  `tests/test_gdn_source_fork_point.py` 通过。
+
+### 未验证 / 边界
+
+- radix on 的 track 冲突处理由另一 agent 在本文件同一区域继续修改，本修复只钉
+  「提交态重放只走截断行」；两边合并时 `h0_idx`（live）与 `h0_trunc` 需同时保留。
+- 同树 c=1 逐字节输出对照未做；本轮只有单测与 40/40 吞吐/accept 观察。
+- GPU7 上 no-GEMM 复跑与原始 850（GPU4）不同卡，绝对数受卡间差异影响；同栈 A/B
+  四臂均在同一张 GPU7 上完成。

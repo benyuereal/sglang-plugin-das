@@ -376,5 +376,115 @@ class CommitPrevTest(unittest.TestCase):
         self.assertEqual(int(st.prev[0]), -1)
 
 
+class CompensateMaskTest(unittest.TestCase):
+    """Only truncated rows replay: a live row with no accepted step would run
+    the whole recurrence for a snapshot write it never makes."""
+
+    def setUp(self):
+        env = patch.dict(os.environ, {"SGLANG_GDN_HIP": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.rows = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        self.prev = torch.tensor([-1, 0, 2, 0, 3][:SCRATCH_ROWS]
+                                 + [-1] * (SCRATCH_ROWS - 5),
+                                 dtype=torch.int32)
+        inter = torch.zeros(SCRATCH_ROWS, DRAFT, 2)
+        ent = {
+            "dims": gdn_commit.HeadDims(1, 2, 1, 2, 1, 2),
+            "q": torch.zeros(BATCH * DRAFT, 2),
+            "k": torch.zeros(BATCH * DRAFT, 2),
+            "v": torch.zeros(BATCH * DRAFT, 2),
+            "a": torch.zeros(BATCH * DRAFT, 1),
+            "b": torch.zeros(BATCH * DRAFT, 1),
+            "out": torch.zeros(1, 1, 1, 2),
+            "A_log": torch.zeros(1), "dt_bias": torch.zeros(1),
+            "layer_cache": types.SimpleNamespace(
+                intermediate_ssm=inter, temporal=torch.zeros(SCRATCH_ROWS, 1, 2)),
+        }
+        self.backend = types.SimpleNamespace()
+        self.st = gdn_commit.state(self.backend)
+        self.st.prev = self.prev
+        self.st.stash = {0: ent}
+        self.st.step_ok = True
+        self.st.commit_failed = False
+        self.st.capture_T = DRAFT
+        self.st.live_T = DRAFT
+
+    def test_only_truncated_rows_carry_an_h0(self):
+        captured = {}
+
+        def fake_compensate(*args, **kwargs):
+            captured["h0"] = args[8]
+            captured["store_step"] = args[12]
+
+        with patch.object(gdn_recurrent, "has_multi", lambda: False), patch.object(
+                gdn_recurrent, "compensate", fake_compensate):
+            ok = gdn_commit.compensate_from_stash(
+                self.backend, self.rows,
+                torch.tensor([DRAFT - 1, 1, DRAFT - 1, 0], dtype=torch.int32))
+        self.assertTrue(ok)
+        h0 = captured["h0"]
+        # Rows 1 and 3 were truncated; 0 and 2 fully accepted.
+        self.assertEqual([int(x) for x in h0], [-1, 1 * DRAFT + 0, -1, 3 * DRAFT + 0])
+        self.assertEqual([int(x) for x in captured["store_step"]], [-1, 1, -1, 0])
+
+
+class VerifyRowCacheTest(unittest.TestCase):
+    """The batch-row map is rebuilt once per verify forward, not per layer."""
+
+    def setUp(self):
+        env = patch.dict(os.environ, {"SGLANG_GDN_HIP": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.backend = types.SimpleNamespace(
+            req_to_token_pool=types.SimpleNamespace(
+                size=POOL_ROWS, _alloc_size=POOL_ROWS + 1))
+        self.st = gdn_commit.state(self.backend)
+        self.st.prev = torch.zeros(SCRATCH_ROWS, dtype=torch.int32)
+        self.st.disabled = False
+        self.st.geometry = None
+        self.st.step_lid = -1
+        self.st.step_cache = None
+        self.req_rows = torch.tensor([3, 5], dtype=torch.int32)
+        self.mamba_cache = _params()
+        self.seen = []
+
+    def _verify(self, layer_id):
+        captured = {}
+
+        def fake_verify(*args, **kwargs):
+            captured["snap_idx"] = args[11]
+
+        layer = types.SimpleNamespace(layer_id=layer_id, A_log=None, dt_bias=None)
+        q = torch.zeros(1, 2 * DRAFT, 1, 2)
+        v = torch.zeros(1, 2 * DRAFT, 1, 2)
+        with patch.object(gdn_commit, "stash", lambda *a, **k: True), patch.object(
+                gdn_recurrent, "verify", fake_verify):
+            out = gdn_commit.verify_step(
+                backend=self.backend, layer=layer, q=q, k=q, v=v, a=q, b=q,
+                draft_token_num=DRAFT, n=2,
+                snap_cache=self.mamba_cache.intermediate_ssm,
+                cache_indices=torch.zeros(2, dtype=torch.int32),
+                mamba_cache=self.mamba_cache,
+                query_start_loc=torch.arange(0, 2 * DRAFT + 1, DRAFT,
+                                             dtype=torch.int32),
+                req_rows=self.req_rows)
+        self.assertIsNotNone(out)
+        return captured["snap_idx"]
+
+    def test_rows_are_shared_inside_one_forward(self):
+        first = self._verify(1)
+        second = self._verify(2)
+        self.assertIs(first, second)
+        self.assertEqual([int(x) for x in first], [3, 5])
+
+    def test_a_new_forward_rebuilds_the_rows(self):
+        first = self._verify(1)
+        # Same layer id again: begin_verify_step rotates the step cache.
+        second = self._verify(1)
+        self.assertIsNot(first, second)
+        self.assertEqual([int(x) for x in second], [3, 5])
+
+
 if __name__ == "__main__":
     unittest.main()
