@@ -2874,3 +2874,37 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
 - `_inflight_held_since` 采用首次访问惰性初始化，未在 `init_disaggregation` 中预置；与 `no-getattr-defensive` 风格建议不一致，保留原 patch 写法。
 
 **与健康探针改动的关系**：同目录 `修改方案.md` 的改动 A/B/C 处理 `health_generate` 超时不下发 abort、以及 scheduler 忙时丢弃探针 abort 的问题，本次 patch 不包含；本次只处理 inflight 队列的 rank 一致性与假 sender 回收。两者互补，不能互相替代。
+## 2026-11-17 GDN B+ commit 链与 lightop.gdn 适配：SGLang 0.5.22
+
+用途：verify 只写被接受那一步的 SSM 快照，commit 只移动行指针或重放 stash，
+避免每步 6 GiB 的整状态拷贝。内核与绑定归 lightop，plugin 只保留框架适配；
+判定依据：内核属算子库（规范 §9）。
+
+### 代码与组合边界
+
+- plugin 基线 `main` @ `534f9bea10c34e04e9fcc4a1d27e4601d71cfce5`；内核真源为
+  lightop 分支 `qwen3.8-27b-perf-gdn` @ `35c7e60dd4074be8f87c919efff645700425ca8a`
+  （repo `benyuereal/lightop`），本仓不再携带 `.hip`。
+- `gdn_commit.py`：单行快照、stash 重放、handoff 指针移动与 multi-layer 一次 launch；
+  `gdn_source.py`：prefill 交还上游、target verify 走 B+/HIP、HCU conv；
+  `gdn_recurrent.py`：152 行薄适配层，`from lightop import gdn`。
+- 适配层与交付内核不是同一个加载路径：交付候选使用旧 cffi loader 与预编译 `.so`，
+  本 PR 使用 `lightop.gdn`。两者数值关系见下。
+
+### 已有设备与模型证据（2026-11-17）
+
+- 绑定与交付 aicc `.so` **逐位一致**：`gdn_verify` maxdiff 0.0；norm_pass 四个 buffer
+  `torch.equal=True`（单卡 gfx938，n=40/T=5/HV=48/K=128）。
+- 交付候选 `e7a0da6`：HumanEval 163/164；9×4 复跑 29/36。
+- 关闭全部 HIP 开关且无 lightop 的对照臂：**1061.67 tok/s / TPOT 28.02**
+  （`logs/bench_no_hip.log`），相对交付 −18.3%——B+ 是主要性能路径，回退 Triton
+  可用但慢；其中 HIP conv ≈ +2.4 ms、B+/HIP verify ≈ +2.3 ms。
+- L0 passed；单测 13F/3E/17。
+
+### 依赖、回退及证据
+
+- 依赖 lightop wheel 携带 `lib/_gdn*.so`（`scripts/build_gdn.sh`，aicc 构建并断言 8 个导出
+  符号）；本 PR 分支与 lightop 适配层的端到端 40/40 + 精度尚未重跑，不把交付候选的
+  结果当成本候选通过。
+- 回退：`SGLANG_GDN_HIP_BPLUS/HANDOFF/PRENORM/PRENORM_GATE/CONV` 任一置 0，或 lightop
+  缺失，verify/conv 全部回上游 Triton。
