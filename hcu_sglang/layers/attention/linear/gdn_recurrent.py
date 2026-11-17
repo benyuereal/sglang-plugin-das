@@ -6,25 +6,37 @@ for bit. The three K=128 fp32 reductions (l2norm, delta, o) and the 1/sqrt
 norm reciprocal reproduce the production Triton kernel
 (sglang.kernels.ops.attention.fla), not aiter's tl.rsqrt variant.
 """
+import fcntl
+import hashlib
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import torch
 from cffi import FFI
 
-# The B+ entries (single-layer and the one-launch multi) live in this build;
-# GDN_HIP_SO overrides it when a deployment ships the object elsewhere.
-_DEFAULT_SO = os.path.normpath(
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..", "..", "..", "csrc", "gdn", "build", "gdn_recurrent.so",
-    )
-)
 # ABI source of truth: the same prototypes gdn_recurrent.hip exports.  cffi
 # checks the argument count and types at every call, so a wrong header or a
 # wrong call fails immediately instead of reinterpreting positional values.
-_HEADER = Path(__file__).resolve().parents[3] / "csrc" / "gdn" / "gdn_recurrent.h"
+_HERE = Path(__file__).resolve().parents[3]
+_HEADER = _HERE / "csrc" / "gdn" / "gdn_recurrent.h"
+_SOURCE = _HERE / "csrc" / "gdn" / "gdn_recurrent.hip"
+# The aicc flags the shipping kernel is tuned with; keep them in one place.
+_BUILD_FLAGS = (
+    "-O3", "-fPIC", "--shared",
+    "-mllvm=-enable-latency-hack=true",
+    "-mllvm=-mmac-latency=5",
+    "-mllvm=-ds-load-store-latency=6",
+    "-mllvm=-disable-machine-sink=True",
+    "-mllvm=-check-valu-data-forward-hazards=0",
+    "-mllvm=-disable-cluster-lds-memops=true",
+    "-mllvm=-amdgpu-disable-backoff-barrier=false",
+    "-mllvm=-support-768-vgprs=true",
+    "-mllvm=-hcu-update-wait-by-reverse-search=true",
+    "-mllvm=-hcu-pre-emit-load-store-opt=false",
+)
 _BV = 32  # 与 gdn_recurrent.hip 的 BV 一致
 # softplus(beta * x + threshold) literals the recurrent kernel expects; they
 # must match gdn_recurrent.hip.
@@ -133,14 +145,56 @@ class _Library:
             entries[name] = entry
         return entry
 
+def _compiler() -> str:
+    """The toolkit compiler, aicc first (the flags are tuned for it)."""
+    for name in (os.environ.get("AICC"), "/opt/dtk/bin/aicc", shutil.which("aicc")):
+        if name and os.path.isfile(name) and os.access(name, os.X_OK):
+            return name
+    hipcc = os.environ.get("HIPCC") or shutil.which("hipcc")
+    if hipcc:
+        return hipcc
+    raise RuntimeError(
+        "gdn_recurrent: no aicc/hipcc found; build the kernel and set GDN_HIP_SO"
+    )
+
+def _build_so() -> str:
+    """Build once per (source, flags, arch, compiler) and cache the object."""
+    compiler = _compiler()
+    flags = ("--offload-arch=" + os.environ.get("GDN_HIP_ARCH", "gfx938"),
+             *_BUILD_FLAGS)
+    key = hashlib.sha256(
+        _SOURCE.read_bytes() + repr((compiler, flags)).encode()
+    ).hexdigest()[:20]
+    root = Path(os.environ.get(
+        "GDN_HIP_CACHE", str(Path.home() / ".cache/sglang/gdn_recurrent")
+    ))
+    build = root / key
+    build.mkdir(parents=True, exist_ok=True)
+    binary = build / "gdn_recurrent.so"
+    with (build / "build.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not binary.is_file():
+            temporary = build / f"module.{os.getpid()}.so"
+            result = subprocess.run(
+                [compiler, *flags, str(_SOURCE), "-o", str(temporary)],
+                capture_output=True, text=True,
+            )
+            (build / "build.log").write_text(result.stdout + result.stderr)
+            if result.returncode:
+                raise RuntimeError(
+                    "gdn_recurrent build failed: " + result.stderr[-4000:]
+                )
+            temporary.replace(binary)
+    return str(binary)
+
 def lib():
     global _LIB, _ERR, _FFI
     if _LIB is not None:
         return _LIB
     if _ERR is not None:
         raise RuntimeError(_ERR)
-    path = os.environ.get("GDN_HIP_SO", _DEFAULT_SO)
     try:
+        path = os.environ.get("GDN_HIP_SO") or _build_so()
         ffi = FFI()
         ffi.cdef(_header_text())
         raw = ffi.dlopen(path)
