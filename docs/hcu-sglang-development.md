@@ -3023,3 +3023,23 @@ FA wheel 的 varlen 布局选择属 flash-attention-das。
 
   运行记录：`Evaluating[humaneval] 100%| 164/164 [1:00:39]`，
   `predictions complete, aggregating scores...`，Accuracy 163/164 = 99.4%。
+
+### 测试方法与各 PR 的性能贡献
+
+- 40/40 复现命令：`PORT=9160 TAG=<tag> bash /workspace/clean-stack/bench_verified.sh`
+  （内部调用 `vllm_bench_driver.py --backend openai --base-url http://localhost:9160
+  --endpoint /v1/completions --model /data/Qwen3.8-27B --dataset-name random
+  --random-input-len 2048 --random-output-len 2048 --num-prompts 40
+  --max-concurrency 40 --ignore-eos --seed 42 --temperature 0`；
+  脚本在 40/40 全部成功前拒绝出数）。
+- 早期同卡 c40/2k2k A/B（`PERF_RECORD.md`、`perf/c40_step*.txt`）：hbird lm_head 快路径
+  **+5.0%**（677.90→711.80 tok/s），线性层打包 **+16.4%**（相对 step2，累计 **+24.6%**）；
+  交付整栈对产线 0.5.18 为 **+5.1%**（1300.07 vs 1236.93 tok/s，TPOT −0.86 ms）。
+- fp8 草稿头隔离 A/B（fp8 KV、splitkv 臂）：bf16 头 1091.55 / TPOT 26.26 vs fp8 头
+  **1133.35 / 25.48**，即 **+3.8%** 吞吐、TPOT **−0.78 ms**。
+- 关闭 B+/HIP 的对照臂：1061.67 / TPOT 28.02 vs 交付 1300.07 / 23.34，即 B+/HIP 贡献
+  **+22.5%** 吞吐（移除损失 18.3%）、TPOT **−4.68 ms**；同负载 aicc vs hipcc 另为
+  **+8.2%**（1300.61 vs 1201.88，accept 0.946 vs 0.890）。
+- paged bshd vs splitkv 同臂 A/B（fp8 头）：1133.35 / 25.48 vs **1185.45 / 25.03**，
+  即 **+4.6%** 吞吐、TPOT **−0.45 ms**；wheel varlen layout 补丁缺失时另多约 1.9 ms/步。
+
