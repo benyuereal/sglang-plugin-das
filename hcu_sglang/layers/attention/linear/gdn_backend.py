@@ -7,6 +7,7 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 import torch
 
 from sglang.srt.utils import is_cpu, is_npu
+from hcu_sglang.layers.attention.linear import gdn_source
 from hcu_sglang.utils.module_patch import get_original_attr
 
 
@@ -28,7 +29,7 @@ def register() -> None:
     )
     HookRegistry.register(
         f"{_GDN_BACKEND_MODULE}.GDNAttnBackend._convolve_prefill",
-        around_convolve_prefill, HookType.AROUND,
+        _convolve_prefill, HookType.AROUND,
     )
     for target, hook in hooks:
         logger.info("[hcu_sglang] register REPLACE hook: %s", target)
@@ -66,20 +67,25 @@ def _load_sglang_gdn_symbols():
 
 
 def replacement_forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
-    from hcu_sglang.layers.attention.linear import gdn_source
     if not gdn_source._is_hcu:
-        original = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_decode")
-        return original(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+        upstream = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_decode")
+        return upstream(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
     return gdn_source.forward_decode(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
 
 
 def replacement_forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs):
-    original = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
-    return original(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
-
-
-def around_convolve_prefill(original, self, *args, **kwargs):
-    from hcu_sglang.layers.attention.linear import gdn_source
     if not gdn_source._is_hcu:
-        return original(self, *args, **kwargs)
-    return gdn_source._convolve_prefill(self, *args, **kwargs)
+        upstream = get_original_attr(_GDN_BACKEND_MODULE, "GDNAttnBackend.forward_extend")
+        return upstream(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+    return gdn_source.forward_extend(self, layer, forward_batch, mixed_qkv, a, b, **kwargs)
+
+
+def _convolve_prefill(
+    wrapped, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
+):
+    if not gdn_source._is_hcu:
+        return wrapped(self, layer, forward_batch, mixed_qkv, conv_states,
+                       cache_indices)
+    return gdn_source._convolve_prefill(
+        wrapped, self, layer, forward_batch, mixed_qkv, conv_states, cache_indices
+    )

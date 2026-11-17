@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import types
 import dis
 import builtins
@@ -7,6 +8,7 @@ from typing import Optional, Tuple, Union
 import sglang.srt.layers.attention.linear.kda_backend as K
 import sglang.srt.layers.attention.hybrid_linear_attn_backend as H
 import sglang.srt.layers.attention.mamba.mamba2_metadata as MD
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 globals().update({name: value for name, value in vars(K).items() if not name.startswith("__")})
 globals().update({name: value for name, value in vars(H).items() if not name.startswith("__")})
@@ -1648,6 +1650,31 @@ class _BaseMethods:
                 replayssm_force_flush=replayssm_force_flush,
             )
 
+
+def _scatter_conv_windows(mamba_caches, state_indices, last_correct):
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        _conv_multi_eligible,
+        fused_conv_window_scatter_multi,
+    )
+
+    pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
+    if not pairs:
+        return
+    if _conv_multi_eligible(pairs):
+        fused_conv_window_scatter_multi(
+            pairs, state_indices, last_correct, None, None
+        )
+        return
+    for conv_states, intermediate_conv_window in pairs:
+        fused_conv_window_scatter_with_mask(
+            conv_states,
+            intermediate_conv_window,
+            state_indices,
+            last_correct,
+            None,
+        )
+
+
 class _HybridMethods:
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
@@ -1821,14 +1848,30 @@ class _HybridMethods:
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
+        linear = self.linear_attn_backend
+        from hcu_sglang.layers.attention.linear import gdn_commit
+
+        gdn_commit.compensate_from_stash(
+            linear, state_indices_tensor, last_correct_step_indices
         )
+        if self._handoff_committed(
+            linear, mamba_caches, state_indices_tensor, last_correct_step_indices,
+            src_indices_raw,
+        ):
+            # Verify already wrote the committed rows, so the 6 GiB ssm copy is
+            # skipped and only the conv windows still need the accept rollback.
+            _scatter_conv_windows(
+                mamba_caches, state_indices_tensor, last_correct_step_indices
+            )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,
@@ -1836,6 +1879,30 @@ class _HybridMethods:
             mamba_track_indices,
             mamba_steps_to_track,
             src_indices_raw,
+        )
+
+    def _handoff_committed(
+        self, linear, mamba_caches, state_indices, last_correct, src_indices_raw
+    ) -> bool:
+        """B+ handoff: the commit only moves the row pointer, not the state."""
+        from hcu_sglang.layers.attention.linear import gdn_commit
+
+        # Pipeline-parallel rows are request-pool indices; the pointer
+        # arithmetic below assumes the forward's own row layout.
+        if not gdn_commit.handoff_enabled() or src_indices_raw is not None:
+            return False
+        # Host int on purpose: .item() would serialize the CPU behind the
+        # verify every decode step; the captured width is the fallback.
+        state = gdn_commit.state(linear)
+        steps = int(state.live_T or state.capture_T)
+        if steps <= 1:
+            return False
+        return gdn_commit.commit_prev(
+            linear,
+            state_indices,
+            last_correct,
+            steps,
+            int(mamba_caches.intermediate_ssm.shape[2]),
         )
 
 class _MetadataMethods:
@@ -1982,6 +2049,31 @@ def _bind(raw, module, owner, name, decorators):
     return fn
 
 
+def _track_skip_enabled() -> bool:
+    """Radix-off serving never consumes the per-step mamba track checkpoints."""
+    return os.environ.get("SGLANG_GDN_TRACK_SKIP") == "1"
+
+
+def _set_mamba_track_indices(wrapped, batch, track_positions=None):
+    if not _track_skip_enabled():
+        return wrapped(batch, track_positions)
+    if track_positions is None:
+        track_positions = [
+            (
+                req.kv.mamba_next_track_idx
+                if req.kv.mamba_next_track_idx is not None
+                else 0
+            )
+            for req in batch.reqs
+        ]
+    # Keep the host-side list (finished-request bookkeeping reads it) but skip
+    # the pinned tensor + device gather: with --disable-radix-cache nothing
+    # consumes the track checkpoints every step.
+    batch.mamba_track_buffer_indices = list(track_positions)
+    batch.mamba_track_indices = None
+    return None
+
+
 def register_hooks():
     global _REGISTERED
     if not is_hcu():
@@ -1994,16 +2086,25 @@ def register_hooks():
     K._hcu_causal_conv1d_update = _hcu_causal_conv1d_update
     K._run_causal_conv1d_fn = _run_causal_conv1d_fn
     K._run_causal_conv1d_update = _run_causal_conv1d_update
+    # The upstream module resolves this global at call time and expects the
+    # platform to override it; our wrapper falls back to the original.
+    K.causal_conv1d_update = _run_causal_conv1d_update
     for name, decorators in [('__init__', [])]:
         setattr(K.KDAKernelDispatcher, name, _bind(vars(_DispatcherMethods)[name], K, K.KDAKernelDispatcher, name, decorators))
     for name, decorators in [('__init__', []), ('init_forward_metadata', []), ('forward_decode', []), ('forward_extend', []), ('_hcu_forward_decode', []), ('_hcu_forward_extend', [])]:
         setattr(K.KDAAttnBackend, name, _bind(vars(_KdaMethods)[name], K, K.KDAAttnBackend, name, decorators))
     for name, decorators in [('__init__', []), ('_forward_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('_replay_metadata', [])]:
         setattr(H.MambaAttnBackendBase, name, _bind(vars(_BaseMethods)[name], H, H.MambaAttnBackendBase, name, decorators))
-    for name, decorators in [('get_indexer_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('forward', []), ('update_mamba_state_after_mtp_verify', [])]:
+    for name, decorators in [('get_indexer_metadata', []), ('init_forward_metadata_capture_cpu_graph', []), ('forward', []), ('update_mamba_state_after_mtp_verify', []), ('_handoff_committed', [])]:
         setattr(H.HybridLinearAttnBackend, name, _bind(vars(_HybridMethods)[name], H, H.HybridLinearAttnBackend, name, decorators))
     for name, decorators in [('prepare_mixed', ['classmethod'])]:
         setattr(MD.Mamba2Metadata, name, _bind(vars(_MetadataMethods)[name], MD, MD.Mamba2Metadata, name, decorators))
     from hcu_sglang import speculative_kda
     speculative_kda.register_hooks()
+    if _track_skip_enabled():
+        HookRegistry.register(
+            "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
+            _set_mamba_track_indices,
+            HookType.AROUND,
+        )
     _REGISTERED = True
