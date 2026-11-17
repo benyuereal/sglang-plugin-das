@@ -105,9 +105,9 @@ def selected_name() -> str:
 
 
 def quant_head_name() -> str:
-    """The quantized-head backend; defaults to the GEMM backend."""
+    """The quantized-head backend; ``auto`` tries every adapter."""
     value = os.environ.get("SGLANG_QUANT_HEAD_BACKEND", "").strip().lower()
-    return value or selected_name()
+    return value or "auto"
 
 def enabled() -> bool:
     return selected_name() not in _DISABLED
@@ -153,8 +153,9 @@ def provider():
     return _provider_for(selected_name())
 
 def quant_head_provider():
-    """The quantized-head backend, or None; chosen independently."""
-    return _provider_for(quant_head_name())
+    """The provider whose packed tiles serve the head; the GEMM one for auto."""
+    name = quant_head_name()
+    return _provider_for(selected_name() if name == "auto" else name)
 
 def install_shim() -> bool:
     """Install the backend's linear-layer seam; False when none is selected."""

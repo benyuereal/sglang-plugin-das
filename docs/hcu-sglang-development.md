@@ -2888,7 +2888,8 @@ Channel FP8 依赖配套 adapter 的 DeepEP 量化粒度透传。上述环境还
   `lm_head_linear`、`prepare_quant_head`、`install_shim`，日志统一 `[gemm]`。
 - 选择按能力拆分：`SGLANG_GEMM_BACKEND` 管 bf16 linear 与未量化 lm_head
   （legacy `HBIRD_GEMM_SGLANG=1` 等价 hbird）；`SGLANG_QUANT_HEAD_BACKEND` 管量化草稿头，
-  缺省跟随前者。`quant_lm_head.py` 收敛为薄壳，hbird 实现集中在 `providers/hbird.py`。
+  缺省 `auto`，即其 packed-tile provider 跟随 `SGLANG_GEMM_BACKEND`。
+  `quant_lm_head.py` 收敛为薄壳，hbird 实现集中在 `providers/hbird.py`。
 
 ### 已有设备与模型证据（2026-11-17）
 
