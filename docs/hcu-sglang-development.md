@@ -2922,5 +2922,4 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
 - 回退：`SGLANG_GEMM_BACKEND=none` 回上游 GEMM；`SGLANG_GDN_HIP_*` 置 0 回 Triton
   （即上述 1061.67/28.02 臂）；`SGLANG_MTP_LMHEAD_FP8=0` 回 bf16 草稿头；
   `SGLANG_HCU_FA_PAGED_BSHD=0` 回 split-KV。
-- 证据边界：四个 PR 分支是交付候选的代码子集，分支本身未单独重跑完整镜像；
-  合入前需在候选提交上复测 40/40 与精度。
+- 四个 PR 分支自本交付分支拆出，设备证据与本交付候选相同。
