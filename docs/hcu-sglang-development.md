@@ -3071,3 +3071,76 @@ TEMP=0，无 rejection sampling，40×2048 in / 40×2048 out）：
 - 同树 c=1 逐字节输出对照未做；本轮只有单测与 40/40 吞吐/accept 观察。
 - GPU7 上 no-GEMM 复跑与原始 850（GPU4）不同卡，绝对数受卡间差异影响；同栈 A/B
   四臂均在同一张 GPU7 上完成。
+
+## 2026-11-17（四）handoff 改基到 32d34e8：radix 单波 A/B 与逐字节对拍
+
+### 改动范围
+
+- `perf/gdn-handoff-replay-fix` 从 `41ae8ce` 改基到 `32d34e8`（plain GDN 基线：conv
+  verify fallback、legacy 开关告警、plain radix track replay / stash 清理）。handoff
+  的四个提交保留，冲突按「plain track 修复作基线、handoff 语义在其上」合并。
+- `gdn_commit.py`：32d34e8 的 plain track 修复完整保留为 `compensate_plain_from_stash`
+  （`_track_replay_rows` / `_drop_layer_entry` / `stash` 失败的 finally 清理 / DEBUG 计数）；
+  新增 `handoff_ready` 分流：handoff 提交态有效时走请求 scratch 行重放，否则自动回落到
+  plain 版本。radix 的 track 快照在 interval 交叉步由 stash 补写，`_scatter_track_rows`
+  的 SSM 源行用请求行；`h0_idx`（live）与 `h0_trunc`（只重放截断行）同时保留。
+- `gdn_source.py`：`_VerifyPlan.req_rows` 每层取静态 per-bs 请求行缓冲；prefill 后按请求
+  行 seed handoff 状态。
+- 恢复 baseline 的 `tests/test_gdn_commit_skip_full_plain.py` 与
+  `tests/test_gdn_commit_track_and_stash.py`；handoff 的
+  `tests/test_gdn_commit_step_shared.py` 适配 `_gdn`/`StashEntry`。
+- 单测：GDN 五个模块（commit_step_shared 24、commit_track_and_stash 8、
+  commit_skip_full_plain、conv_fallback、overlay_gate、fork_point）全部通过；
+  `unittest discover` 全量 305 项中 13 fail + 5 error 均在 tool/provenance 模块
+  （runtime_triage、hybrid_pool_closure、hcu_runtime、runtime_owned_sources、
+  tool_contracts），文件不在本分支 diff 内；`tool_contracts` 的 JSON 解析失败可用
+  adapter 启动 INFO 写 stdout 复现，属运行环境而非 GDN 代码。未在 baseline 树复跑全量
+  作为对照（见「未验证」）。
+
+### 正确性：greedy TEMP=0、c=1 串行、radix ON
+
+- 两臂各跑固定 8 条 prompt（`artifacts/gdn-handoff-rebase/compare_outputs.py`），先发一条
+  warmup 丢弃（新 server 首请求输出不稳定），再逐条串行取 `/v1/completions` 文本。
+- handoff（本分支）vs plain（`32d34e8` 导出树 `/tmp/pr-gdn-plain-32d34e8`）：
+  **8/8 逐字节相同**（`artifacts/gdn-handoff-rebase/correctness_compare_r2.txt`，
+  原始响应 `correct_handoff_r2.json` / `correct_plain_r2.json`）。
+- 两臂服务启动日志均确认 `max_running_requests is capped to 40 ... 4 state slots per
+  request`，`max_total_num_tokens=581248`，`available_gpu_mem=17.16/17.20 GB`。
+
+### 性能：radix ON、40 请求 2k2k 单波、TEMP=0
+
+同栈顺序跑（不与其他 bench 并发），每臂 40/40 成功、`Peak concurrent requests: 40.00`；
+服务端稳态日志均为 `Decode batch ... #running-req: 40 ... #queue-req: 0`（各 13 条），
+非两波/排队：
+
+| 臂 | tok/s | Mean TPOT | Mean TTFT | 产物 |
+|---|---:|---:|---:|---|
+| handoff（本分支） | **902.11** | **35.18 ms** | 12479 ms | `artifacts/gdn-handoff-rebase/bench_handoff_r2_summary.txt`、`bench_gdn_handoff_r2.log`、`server_handoff_r2_bench_window.log` |
+| plain（32d34e8） | 869.29 | 37.29 ms | 12329 ms | `artifacts/gdn-handoff-rebase/bench_plain_r2_summary.txt`、`bench_gdn_plain_r2.log`、`server_plain_r2_bench_window.log` |
+
+- handoff vs plain：吞吐 **+3.8%**，TPOT **−2.11 ms**；与 0d5a0f0 在 radix-off 上
+  「handoff 快于 plain」的方向一致。
+- 绝对吞吐停在 ~900 档，与本文档此前 no-GEMM 树的 934.74 一致；目标 ≥1200 需要 GEMM
+  栈在模型 worker 内生效（见阻塞点）。
+
+### 阻塞点：hbird bf16 GEMM 与 1..40 decode CUDA graph 抓图
+
+- 本栈的 hbird sitecustomize finder 在 adapter bootstrap 预加载 linear/unquant 后不再
+  触发，模型 worker 实际未装 hook（r2 两臂均无 `routed to hbird-gemm` 行）。用 boot
+  sitecustomize 在 worker 内补装后，抓图阶段 OOM：hbird 的 prefill/按 shape workspace
+  进入每张 captured graph 的私有显存池，40 个 bs 桶各占一份。
+- 证据：`server_handoff_r3.log`（mem 0.89，prefill on）、`server_handoff_r4.log`
+  （mem 0.87）、`server_handoff_r5.log`（mem 0.80）、`server_handoff_r6.log`
+  （prefill off、decode only）均在 `Capture target verify CUDA graph` 阶段
+  `CUDA out of memory`；对照产线 9164 的日志走的是 `packed-only` 路径
+  （W12/`convert_model`），本分支未接 W12 packed 权重。
+- 下一步：在 worker 内先 `hbird_sglang.convert_model(model)` 转 packed-only（或缩小
+  capture 桶集合），再验证 M=200 verify GEMM 的 hbird 路由与抓图显存。
+
+### 未验证 / 边界
+
+- 未在 32d34e8 baseline 树复跑全量 unittest 作为失败基线对照；上述 18 项失败均落在
+  本分支未改的文件。
+- hbird packed/W12 路径、c40 绝对 ≥1200 目标未达成。
+- 本轮 A/B 在 GPU5/9162 顺序完成，但机器上仍有其他 GPU（0/4）的服务常驻；绝对数受
+  共享主机资源影响，两臂相对差在同一次会话内可比。
