@@ -2907,11 +2907,15 @@ NEXTN steps=4 adaptive、decode graph 批次 1..40、`--disable-radix-cache`。
   hipcc 改变核数值（max diff 3.8e-6）并降低投机接受率，故内核必须 aicc。
 - L0 passed；单测 14 failures / 3 errors / 17 skipped：与干净 `main` 相比仅多 `test_qwen3_5_hook_removed` 一项（草稿头模块名触发其过宽断言；拆出的 `-draft` PR 已改为按 hook target 断言，失败数回到 13）。其余为既有外部快照/来源缺失用例，不在交付范围。
 
-- 原始精度产物（各分支共用同一组）：`/workspace/eval/he_bitwise2/20261115_235141/`
-  （`predictions/`、`reviews/`、`reports/`）、`/workspace/clean-stack/logs/evalscope_bitwise2.log`、
-  `/workspace/eval/he_bitwise2/humaneval_9175.log`；9×4 复跑：
-  `/workspace/llm-adaptation/qwen3.8-27b-bf16/he_wrong/results/rerun_final.log`、
-  `wrong_rerun_20261117_104134.json`、`wrong_rerun_20261117_104134.csv`。
+- HumanEval 精度报告（evalscope，2026-11-16 15:44:08）：
+
+  | Model | Dataset | Metric | Subset | Num | Score |
+  |---|---|---|---|---:|---:|
+  | Qwen3.8-27B | HumanEval | Accuracy ↑ | openai_humaneval | 163 | 99.4% |
+  | Qwen3.8-27B | HumanEval | Pass@k ↑ · k 1 | openai_humaneval | 163 | 99.4% |
+
+  运行记录：`Evaluating[humaneval] 100%| 164/164 [1:00:39]`，
+  `predictions complete, aggregating scores...`，Accuracy 163/164 = 99.4%。
 
 ### 依赖、回退及证据
 
