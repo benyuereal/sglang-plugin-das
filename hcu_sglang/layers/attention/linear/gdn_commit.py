@@ -28,7 +28,6 @@ import logging
 from typing import NamedTuple
 
 import torch
-from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 
 from hcu_sglang.layers.attention.linear import gdn_recurrent
 
@@ -492,6 +491,9 @@ def verify_step(*, backend, layer, q, k, v, a, b, draft_token_num, n, snap_cache
     st = state(backend)
     # Pipeline-parallel stable rows are request rows, but their commit needs
     # the plain scatter; keep the whole path on one row space.
+    from sglang.srt.layers.attention.linear.utils import (
+        pp_spec_stable_rows_enabled,
+    )
     if st.disabled or pp_spec_stable_rows_enabled():
         return None
     flat = snap_cache.reshape(-1, *snap_cache.shape[2:])
