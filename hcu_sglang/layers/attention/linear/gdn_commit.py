@@ -670,6 +670,26 @@ def _replay_rows(st, rows, n, D, m, h0_rows, store_step, snap32) -> bool:
     return True
 
 
+def _layer_replay_src(backend, st, lid, ent):
+    """One stashed layer's replay buffers, or None when it has no state.
+
+    Both replay paths resolve the cache lazily; a missing
+    ``intermediate_ssm`` marks the commit failed and drops this layer.
+    """
+    layer_cache = ent.layer_cache
+    if layer_cache is None:
+        layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
+        ent.layer_cache = layer_cache
+    inter = layer_cache.intermediate_ssm
+    if inter is None:
+        st.commit_failed = True
+        return None
+    flat = ent.flat
+    if flat is None:
+        flat = ent.flat = inter.reshape(-1, *inter.shape[2:])
+    return layer_cache, flat, int(inter.shape[1])
+
+
 def compensate_plain_from_stash(backend, state_indices, last_correct,
                                 mamba_track_indices=None,
                                 mamba_steps_to_track=None) -> bool:
@@ -713,18 +733,10 @@ def compensate_plain_from_stash(backend, state_indices, last_correct,
         rows = []
         for lid, ent in st.stash.items():
             try:
-                layer_cache = ent.layer_cache
-                if layer_cache is None:
-                    layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
-                    ent.layer_cache = layer_cache
-                inter = layer_cache.intermediate_ssm
-                if inter is None:
-                    st.commit_failed = True
+                src = _layer_replay_src(backend, st, lid, ent)
+                if src is None:
                     continue
-                flat = ent.flat
-                if flat is None:
-                    flat = ent.flat = inter.reshape(-1, *inter.shape[2:])
-                stride = int(inter.shape[1])
+                layer_cache, flat, stride = src
                 # Plain rows are slot-indexed temporal state; the snapshot
                 # rows are the verify's batch positions.
                 rows.append((ent, layer_cache.temporal, flat, stride, lid))
@@ -803,18 +815,10 @@ def compensate_from_stash(backend, rows, last_correct,
         track_h0_by_stride = {}
         for lid, ent in st.stash.items():
             try:
-                layer_cache = ent.layer_cache
-                if layer_cache is None:
-                    layer_cache = backend.req_to_token_pool.mamba2_layer_cache(lid)
-                    ent.layer_cache = layer_cache
-                inter = layer_cache.intermediate_ssm
-                if inter is None:
-                    st.commit_failed = True
+                src = _layer_replay_src(backend, st, lid, ent)
+                if src is None:
                     continue
-                flat = ent.flat
-                if flat is None:
-                    flat = ent.flat = inter.reshape(-1, *inter.shape[2:])
-                stride = int(inter.shape[1])
+                _layer_cache, flat, stride = src
                 h0_idx = h0_by_stride.get(stride)
                 if h0_idx is None:
                     h0_idx = step_h0(backend, row32, stride)
